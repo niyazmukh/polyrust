@@ -1,0 +1,36 @@
+[package]
+name = "minirust"
+version = "0.0.1"
+edition = "2021"
+publish = false
+description = "Rust port of the minimal Polymarket/Binance bot. Phase 1+2: types and order-body canonicalization."
+
+[lib]
+name = "minirust"
+path = "src/lib.rs"
+
+[dependencies]
+# Phase 1+2 (types + canonical body math) is pure stdlib by design.
+# Phase 3a (L2 auth, HMAC-SHA256) adds the three crates below.
+# Phase 3b (EIP-712 signing) will add: secp256k1, sha3.
+# Phase 4 (HTTP submit) will add: hyper / hyper-rustls / http-body-util / serde_json.
+# Phase 5 (WSS feeds) will add: tokio + tokio-tungstenite + simd-json.
+# Each dependency must justify itself against an in-tree bench, not faith.
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+
+[dev-dependencies]
+# Phase 1+2 tests are pure stdlib.
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+opt-level = 3
+debug = false
+strip = "symbols"
+
+[profile.dev]
+opt-level = 0
+debug = true
