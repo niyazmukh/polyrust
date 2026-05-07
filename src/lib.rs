@@ -17,6 +17,7 @@ pub mod auth;
 pub mod config;
 pub mod logline;
 pub mod orders;
+pub mod signing;
 pub mod types;
 
 /// Crate-wide error type for Phase 1+2.
@@ -29,6 +30,7 @@ pub enum Error {
     Config(config::ConfigError),
     BuyCanonical(orders::BuyCanonicalError),
     Auth(auth::AuthError),
+    Signing(signing::SigningError),
 }
 
 impl std::fmt::Display for Error {
@@ -37,6 +39,7 @@ impl std::fmt::Display for Error {
             Error::Config(e) => write!(f, "config: {e}"),
             Error::BuyCanonical(e) => write!(f, "buy_canonical: {e}"),
             Error::Auth(e) => write!(f, "auth: {e}"),
+            Error::Signing(e) => write!(f, "signing: {e}"),
         }
     }
 }
@@ -58,5 +61,11 @@ impl From<orders::BuyCanonicalError> for Error {
 impl From<auth::AuthError> for Error {
     fn from(value: auth::AuthError) -> Self {
         Error::Auth(value)
+    }
+}
+
+impl From<signing::SigningError> for Error {
+    fn from(value: signing::SigningError) -> Self {
+        Error::Signing(value)
     }
 }

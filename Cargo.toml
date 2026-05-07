@@ -10,15 +10,26 @@ name = "minirust"
 path = "src/lib.rs"
 
 [dependencies]
-# Phase 1+2 (types + canonical body math) is pure stdlib by design.
-# Phase 3a (L2 auth, HMAC-SHA256) adds the three crates below.
-# Phase 3b (EIP-712 signing) will add: secp256k1, sha3.
-# Phase 4 (HTTP submit) will add: hyper / hyper-rustls / http-body-util / serde_json.
-# Phase 5 (WSS feeds) will add: tokio + tokio-tungstenite + simd-json.
-# Each dependency must justify itself against an in-tree bench, not faith.
+# Phase 1+2 (types + canonical body math): pure stdlib.
+# Phase 3a (L2 auth): hmac/sha2/base64 below.
 hmac = "0.12"
 sha2 = "0.10"
 base64 = "0.22"
+
+# Phase 3b (order construction + EIP-712 signing): use the official
+# Polymarket Rust SDK rather than reimplementing the schema. The SDK owns
+# the canonical Order struct, the EIP-712 domain separator, and the
+# signature recovery path used by the on-chain CTFExchange contract.
+# Reimplementing that schema would be a monkey job.
+polymarket_client_sdk_v2 = { version = "0.6.0-canary.1", default-features = false, features = ["clob"] }
+# Pin alloy to the SDK's resolved version so we share a single c-kzg link.
+alloy = { version = "=1.6.3", default-features = false, features = [
+    "signer-local",
+    "signers",
+] }
+rust_decimal = "1"
+serde_json = "1"
+tokio = { version = "1", default-features = false, features = ["rt", "macros"] }
 
 [dev-dependencies]
 # Phase 1+2 tests are pure stdlib.

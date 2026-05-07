@@ -81,15 +81,40 @@ gating:
 
 | Phase | Status | Adds |
 |---|---|---|
-| 1 — types/config/logline skeleton | ✅ this commit | `types.rs`, `config.rs`, `logline.rs` |
-| 2 — order body canonicalization | ✅ this commit | `orders.rs` + golden tests |
-| 3 — EIP-712 signing + L2 auth | ⬜ | `secp256k1`, `sha3`, fixture-locked signed bodies |
-| 4 — direct HTTP submitter | ⬜ | `hyper`/`reqwest`, response classifier |
-| 5 — WSS parsers + inventory | ⬜ | `tokio-tungstenite`, `inventory.rs` |
+| 1 — types/config/logline skeleton | ✅ | `types.rs`, `config.rs`, `logline.rs` |
+| 2 — order body canonicalization | ✅ | `orders.rs` + golden tests |
+| 3a — L2 auth headers | ✅ | `auth.rs` (HMAC-SHA256, golden vs Python) |
+| 3b — EIP-712 order signing | ✅ via `polymarket_client_sdk_v2` | `signing.rs` |
+| 4 — direct HTTP submitter | ⬜ | classifier, pooled client, body validator |
+| 5 — WSS parsers + inventory | ⬜ | `inventory.rs`, market/user feeds |
 | 6 — Binance feed + signal | ⬜ | `binance.rs`, `signal.rs` |
 | 7 — runtime hot path | ⬜ | `runtime.rs`, `main.rs` |
 | 8 — shadow mode on EC2 | ⬜ | live feeds, no submits |
 | 9 — controlled live run | ⬜ | runtime-only deploy |
+
+### Phase 3b note: SDK over re-implementation
+
+We use the official `polymarket_client_sdk_v2` crate (crates.io) for
+EIP-712 typed-data signing rather than reimplementing the schema. The
+Order struct, domain separator, and signature recovery path live on the
+on-chain `CTFExchange` contract; the SDK is the canonical Rust binding
+to that schema. Reimplementing it would be a monkey job and would
+silently drift if Polymarket revs the contract.
+
+### Running live signing tests
+
+The `signing::tests::signs_fak_buy_against_live_clob` test is `#[ignore]`
+because the SDK's order builder calls `tick_size`, `fee_rate_bps`, and
+`resolve_version` against the CLOB at sign time. To run:
+
+```powershell
+$env:POLYMARKET_PRIVATE_KEY = "0x..."
+$env:POLY_API_KEY           = "uuid"
+$env:POLY_API_SECRET        = "url-safe-b64"
+$env:POLY_API_PASSPHRASE    = "..."
+$env:POLY_TEST_TOKEN_ID     = "decimal-u256-token"
+cargo test signing -- --ignored
+```
 
 Each phase commits independently. No phase ships without the validators
 listed in the plan.
