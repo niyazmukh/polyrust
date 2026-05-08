@@ -84,7 +84,7 @@ gating:
 | 1 — types/config/logline skeleton | ✅ | `types.rs`, `config.rs`, `logline.rs` |
 | 2 — order body canonicalization | ✅ | `orders.rs` + golden tests |
 | 3a — L2 auth headers | ✅ | `auth.rs` (HMAC-SHA256, golden vs Python) |
-| 3b — EIP-712 order signing | ✅ via `polymarket_client_sdk_v2` | `signing.rs` |
+| 3b — EIP-712 order signing | ✅ inline (k256 + sha3 + primitive-types) | `signing.rs` |
 | 4 — direct HTTP submitter | ⬜ | classifier, pooled client, body validator |
 | 5 — WSS parsers + inventory | ⬜ | `inventory.rs`, market/user feeds |
 | 6 — Binance feed + signal | ⬜ | `binance.rs`, `signal.rs` |
@@ -92,29 +92,31 @@ gating:
 | 8 — shadow mode on EC2 | ⬜ | live feeds, no submits |
 | 9 — controlled live run | ⬜ | runtime-only deploy |
 
-### Phase 3b note: SDK over re-implementation
+### Phase 3b note: signing inline, no SDK at runtime
 
-We use the official `polymarket_client_sdk_v2` crate (crates.io) for
-EIP-712 typed-data signing rather than reimplementing the schema. The
-Order struct, domain separator, and signature recovery path live on the
-on-chain `CTFExchange` contract; the SDK is the canonical Rust binding
-to that schema. Reimplementing it would be a monkey job and would
-silently drift if Polymarket revs the contract.
+The official `polymarket_client_sdk_v2` crate exists but its order
+builder calls `tick_size`, `fee_rate_bps`, and `resolve_version`
+against the live CLOB *before* producing a signable body. That defeats
+this bot's pre-signing architecture (Binance tick → cached signed body
+→ submit, with the EIP-712 + secp256k1 cost paid off the hot path).
 
-### Running live signing tests
+We instead read the V2 schema from the SDK source as a reference (the
+schema is fixed by the on-chain `CTFExchange` V2 contract; copying it
+from a published Rust crate is reading a datasheet, not deconstruction
+of a wrapper) and compute the typehash, domain separator, struct hash,
+and ECDSA signature locally and synchronously using only:
 
-The `signing::tests::signs_fak_buy_against_live_clob` test is `#[ignore]`
-because the SDK's order builder calls `tick_size`, `fee_rate_bps`, and
-`resolve_version` against the CLOB at sign time. To run:
+* `k256` — secp256k1 ECDSA, prehash signing, recovery.
+* `sha3` — Keccak256.
+* `primitive-types` — U256 / H160 / H256.
 
-```powershell
-$env:POLYMARKET_PRIVATE_KEY = "0x..."
-$env:POLY_API_KEY           = "uuid"
-$env:POLY_API_SECRET        = "url-safe-b64"
-$env:POLY_API_PASSPHRASE    = "..."
-$env:POLY_TEST_TOKEN_ID     = "decimal-u256-token"
-cargo test signing -- --ignored
-```
+The signing path takes no `await` and makes no network call. Runtime
+dep tree is 9 direct crates and ~99 transitive nodes.
+
+`signing::tests::signature_recovers_to_signer_address_*` exercises the
+full digest + sign + recover pipeline on canonical BUY and SELL bodies
+with a deterministic test private key (`0x0...001`) — fully offline,
+no `#[ignore]` gate.
 
 Each phase commits independently. No phase ships without the validators
 listed in the plan.

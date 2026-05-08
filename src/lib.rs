@@ -1,17 +1,17 @@
 //! `minirust` — Rust port of the minimal Polymarket/Binance bot.
 //!
-//! Scope of the current build (Phase 1+2 of `docs/RUST_SOTA_ARCHITECTURE_REFACTOR_PLAN.md`):
+//! Phase coverage of `docs/RUST_SOTA_ARCHITECTURE_REFACTOR_PLAN.md`:
 //!
 //! * `types`   — fixed-point integer newtypes; no `f64` in venue-facing math.
 //! * `orders`  — canonical BUY/SELL parameter selection that matches the
-//!               Python reference in `fast_order_submitter.py` byte-for-byte.
+//!   Python reference in `fast_order_submitter.py` byte-for-byte.
+//! * `auth`    — L2 auth headers (HMAC-SHA256), golden-locked vs Python.
+//! * `signing` — synchronous offline EIP-712 V2 order signing.
 //! * `config`  — typed startup config with fail-closed validators.
 //! * `logline` — structured key=value line logger for the hot path.
 //!
-//! Phases 3–9 (EIP-712 signing, REST submit, WSS feeds, runtime, shadow
-//! mode, live deploy) intentionally do not exist yet. The plan starts here
-//! because the highest harmful-event risk is invalid signed venue bodies,
-//! and that risk is isolated from feed/runtime plumbing.
+//! Phases 4–9 (REST submit, WSS feeds, inventory, Binance/signal, runtime,
+//! shadow mode, live deploy) intentionally do not exist yet.
 
 pub mod auth;
 pub mod config;

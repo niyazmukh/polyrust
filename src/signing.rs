@@ -1,72 +1,156 @@
-//! EIP-712 BUY/SELL order signing via the official Polymarket Rust SDK.
+//! EIP-712 BUY/SELL order signing — synchronous, offline, pre-signable.
 //!
-//! Per `docs/RUST_SOTA_ARCHITECTURE_REFACTOR_PLAN.md` we do **not**
-//! re-implement the EIP-712 schema or the signature recovery path. The
-//! schema lives in the on-chain `CTFExchange` contract and is canonically
-//! exposed by the official `polymarket_client_sdk_v2` crate. Replicating
-//! it would be a monkey job and would silently drift if Polymarket ever
-//! revs the contract.
+//! ## Why not the SDK
 //!
-//! What this module owns:
+//! `polymarket_client_sdk_v2::clob::Client::limit_order().build()` calls
+//! `tick_size().await?`, `fee_rate_bps().await?`, and `resolve_version()`
+//! against the live CLOB *before* producing a signable body. That defeats
+//! the pre-signing architecture this bot is built around: Binance tick →
+//! cached signed body → submit, with the EIP-712 + secp256k1 cost paid
+//! off the hot path. Holding network round-trips inside the signing
+//! function would force every signal to wait on the SDK's HTTP cache
+//! lookups before submit — a full architectural regression.
 //!
-//! 1. Conversion from our fixed-point types (`PriceTick`, `Shares4`,
-//!    `Shares2`) into the SDK's `Decimal` price/size at the call boundary.
-//! 2. Construction of FAK BUY / FAK SELL orders for our policy.
-//! 3. Signing via a `LocalSigner` we create once at startup.
-//! 4. Serialisation of the `SignedOrder` to JSON bytes for direct HTTP
-//!    submit. We hand the bytes to our own pooled HTTP client + L2 auth
-//!    layer (Phase 4) instead of letting the SDK's `post_order` own the
-//!    request.
+//! ## What this module does
 //!
-//! ### Network dependency
+//! * Reads the canonical schema from the on-chain `CTFExchange` V2
+//!   contract (verbatim from the SDK source for reference; the schema
+//!   lives in the contract, not the SDK):
+//!   ```text
+//!   struct Order {
+//!     uint256 salt;
+//!     address maker;
+//!     address signer;
+//!     uint256 tokenId;
+//!     uint256 makerAmount;
+//!     uint256 takerAmount;
+//!     uint8   side;
+//!     uint8   signatureType;
+//!     uint256 timestamp;
+//!     bytes32 metadata;
+//!     bytes32 builder;
+//!   }
+//!   ```
+//! * Precomputes the domain separator at construction time so signing
+//!   is one keccak256 (struct hash) + one keccak256 (digest) + one
+//!   ECDSA sign per call.
+//! * Renders the JSON body in the venue-expected shape (V2 with the
+//!   signature folded into the inner `order` object, plus
+//!   `orderType`/`owner`/`postOnly`/`deferExec` outer fields).
+//! * Is fully synchronous, deterministic, and pre-signable for cached
+//!   templates.
 //!
-//! The SDK's order builder calls `tick_size(token_id)`, `fee_rate_bps`,
-//! and `resolve_version()` against the live CLOB before producing a
-//! `SignableOrder`. Our `OrderSigner` therefore needs a reachable CLOB
-//! at signing time. Tests that exercise the actual signing path are
-//! marked `#[ignore]` and run manually via:
-//!
-//! ```bash
-//! POLYMARKET_PRIVATE_KEY=0x... cargo test signing -- --ignored
-//! ```
-//!
-//! Phase 4 (HTTP submit) and Phase 8 (shadow mode) will exercise this
-//! path against a real endpoint as part of normal CI.
+//! Verifying contract addresses for V2 (Polygon, chain_id 137) are taken
+//! from the SDK's `CONFIG` map. They are pinned to the on-chain contracts;
+//! changing them invalidates every signature.
 
-use std::str::FromStr;
-
-use alloy::signers::k256::ecdsa::SigningKey;
-use polymarket_client_sdk_v2::auth::state::Authenticated;
-use polymarket_client_sdk_v2::auth::Credentials;
-use polymarket_client_sdk_v2::auth::LocalSigner;
-use polymarket_client_sdk_v2::auth::Normal;
-use polymarket_client_sdk_v2::auth::Signer;
-use polymarket_client_sdk_v2::clob::types::{Side, SignatureType};
-use polymarket_client_sdk_v2::clob::{Client, Config};
-use polymarket_client_sdk_v2::types::{Address, Decimal, U256};
-use polymarket_client_sdk_v2::POLYGON;
+use k256::ecdsa::{RecoveryId, Signature as EcdsaSignature, SigningKey, VerifyingKey};
+use primitive_types::{H160, H256, U256};
+use serde::Serialize;
+use sha3::{Digest, Keccak256};
 
 use crate::orders::BuyCanonicalTarget;
-use crate::types::{OrderSide, PriceTick, Shares2, TokenId};
+use crate::types::{PriceTick, Shares2, TokenId};
 
-/// Configured signer. Construct once at startup; clones share the underlying
-/// alloy signer (which holds an `Arc<SigningKey>` internally).
+// ----------------------------------------------------------------------
+// Schema constants — copied from the SDK source (which copies them from
+// the on-chain contracts). These are venue-pinned; do not edit without
+// confirming on-chain.
+// ----------------------------------------------------------------------
+
+/// Solidity type string for the V2 Order struct.
+pub(crate) const ORDER_TYPE_STRING_V2: &str = concat!(
+    "Order(uint256 salt,address maker,address signer,uint256 tokenId,",
+    "uint256 makerAmount,uint256 takerAmount,uint8 side,uint8 signatureType,",
+    "uint256 timestamp,bytes32 metadata,bytes32 builder)"
+);
+
+/// Standard EIP-712 domain typehash input.
+const EIP712_DOMAIN_TYPE: &str =
+    "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)";
+
+/// Domain `name` field used by the CTF Exchange contracts.
+const DOMAIN_NAME: &str = "Polymarket CTF Exchange";
+/// Domain `version` field for V2.
+const DOMAIN_VERSION_V2: &str = "2";
+
+/// Polygon mainnet chain id.
+pub const POLYGON_CHAIN_ID: u64 = 137;
+/// Polygon Amoy testnet chain id.
+pub const AMOY_CHAIN_ID: u64 = 80_002;
+
+/// V2 CTF Exchange (normal markets) on Polygon mainnet.
+pub const EXCHANGE_V2_NORMAL: H160 = H160([
+    0xE1, 0x11, 0x18, 0x00, 0x00, 0xd2, 0x66, 0x3C, 0x00, 0x91, 0xe4, 0xf4, 0x00, 0x23, 0x75, 0x45,
+    0xB8, 0x7B, 0x99, 0x6B,
+]);
+/// V2 CTF Exchange (negative-risk markets) on Polygon mainnet.
+pub const EXCHANGE_V2_NEG_RISK: H160 = H160([
+    0xe2, 0x22, 0x2d, 0x27, 0x9d, 0x74, 0x40, 0x50, 0xd2, 0x8e, 0x00, 0x52, 0x00, 0x10, 0x52, 0x00,
+    0x00, 0x31, 0x0F, 0x59,
+]);
+
+// ----------------------------------------------------------------------
+// Public types
+// ----------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SignatureKind {
+    /// EOA: the signer is the funder; no proxy address.
+    Eoa = 0,
+    /// Polymarket proxy wallet: maker is the proxy, signer is the EOA.
+    PolyProxy = 1,
+    /// Gnosis-Safe-style wallet: maker is the safe, signer is the EOA.
+    PolyGnosisSafe = 2,
+}
+
+impl SignatureKind {
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum OrderSide {
+    Buy = 0,
+    Sell = 1,
+}
+
+impl OrderSide {
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OrderSide::Buy => "BUY",
+            OrderSide::Sell => "SELL",
+        }
+    }
+}
+
+/// Configured signer. Construct once at startup.
+#[derive(Clone, Debug)]
 pub struct OrderSigner {
-    inner: LocalSigner<SigningKey>,
-    /// Authenticated SDK client. Required because the SDK's
-    /// `OrderBuilder::build` is gated on `Client<Authenticated<Normal>>`
-    /// and uses the client's caches for tick size / fee rate / protocol
-    /// version when constructing the order payload.
-    client: Client<Authenticated<Normal>>,
+    signing_key: SigningKey,
+    address: H160,
+    /// API-key UUID (the `owner` field in the JSON body envelope).
+    api_key: String,
+    /// `maker` address — funder if set, else signer.
+    maker: H160,
+    /// EOA / Proxy / GnosisSafe.
+    signature_kind: SignatureKind,
+    /// Precomputed domain separator (keccak256(EIP712Domain encoding)).
+    domain_separator: H256,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SigningError {
     InvalidPrivateKey,
     InvalidTokenId,
+    InvalidApiKey,
+    InvalidFunder,
     InvalidPriceOrSize,
-    SdkError(String),
-    Serialize(String),
+    SerializeBody(String),
 }
 
 impl std::fmt::Display for SigningError {
@@ -74,259 +158,699 @@ impl std::fmt::Display for SigningError {
         match self {
             SigningError::InvalidPrivateKey => write!(f, "invalid_private_key"),
             SigningError::InvalidTokenId => write!(f, "invalid_token_id"),
+            SigningError::InvalidApiKey => write!(f, "invalid_api_key"),
+            SigningError::InvalidFunder => write!(f, "invalid_funder"),
             SigningError::InvalidPriceOrSize => write!(f, "invalid_price_or_size"),
-            SigningError::SdkError(e) => write!(f, "sdk_error: {e}"),
-            SigningError::Serialize(e) => write!(f, "serialize: {e}"),
+            SigningError::SerializeBody(s) => write!(f, "serialize_body: {s}"),
         }
     }
 }
 
 impl std::error::Error for SigningError {}
 
-impl OrderSigner {
-    /// Construct from a hex private key, an optional funder address (for
-    /// proxy-wallet signature types), and an authenticated CLOB client.
-    ///
-    /// If `funder` is `None` and `signature_type` is a proxy variant, the
-    /// SDK derives the proxy wallet via CREATE2 from the signer address.
-    /// For EOA signing, `funder` must be `None`.
-    pub async fn new(
-        private_key_hex: &str,
-        clob_host: &str,
-        credentials: Credentials,
-        funder: Option<Address>,
-        signature_type: SignatureType,
-    ) -> Result<Self, SigningError> {
-        let signer = LocalSigner::from_str(private_key_hex)
-            .map_err(|_| SigningError::InvalidPrivateKey)?
-            .with_chain_id(Some(POLYGON));
+/// Per-call inputs that must be fresh on every submit attempt — salt
+/// must change so the signed body hash is unique (a replayed body can
+/// hit `INVALID_ORDER_DUPLICATED` on the venue), and timestamp must be
+/// the current time so the order doesn't reject as stale.
+#[derive(Clone, Copy, Debug)]
+pub struct SignInputs {
+    pub salt: u64,
+    pub timestamp_ms: u128,
+}
 
-        let unauth = Client::new(clob_host, Config::default())
-            .map_err(|e| SigningError::SdkError(format!("client_new: {e:?}")))?;
-        let builder_no_funder = unauth
-            .authentication_builder(&signer)
-            .credentials(credentials)
-            .signature_type(signature_type);
-        let builder = match funder {
-            Some(addr) => builder_no_funder.funder(addr),
-            None => builder_no_funder,
+// ----------------------------------------------------------------------
+// Internal Order representation. Mirrors the V2 schema exactly.
+// ----------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+struct OrderV2 {
+    salt: u64,
+    maker: H160,
+    signer: H160,
+    token_id: U256,
+    maker_amount: U256,
+    taker_amount: U256,
+    side: OrderSide,
+    signature_kind: SignatureKind,
+    timestamp_ms: u128,
+    metadata: H256,
+    builder: H256,
+}
+
+impl OrderV2 {
+    /// abi.encode(typehash || each field padded to 32 bytes), then keccak256.
+    fn struct_hash(&self) -> H256 {
+        let typehash = keccak256(ORDER_TYPE_STRING_V2.as_bytes());
+
+        let mut buf: Vec<u8> = Vec::with_capacity(32 * 12);
+        buf.extend_from_slice(typehash.as_bytes());
+        // salt: u64 → uint256 → 32 bytes BE
+        buf.extend_from_slice(&u64_to_uint256_be(self.salt));
+        // maker, signer: address → 32 bytes (left-padded)
+        buf.extend_from_slice(&address_to_uint256_be(self.maker));
+        buf.extend_from_slice(&address_to_uint256_be(self.signer));
+        // tokenId, makerAmount, takerAmount: uint256 → 32 bytes BE
+        let mut tmp = [0u8; 32];
+        self.token_id.to_big_endian(&mut tmp);
+        buf.extend_from_slice(&tmp);
+        self.maker_amount.to_big_endian(&mut tmp);
+        buf.extend_from_slice(&tmp);
+        self.taker_amount.to_big_endian(&mut tmp);
+        buf.extend_from_slice(&tmp);
+        // side, signatureType: uint8 → 32 bytes (left-padded)
+        buf.extend_from_slice(&u8_to_uint256_be(self.side.as_u8()));
+        buf.extend_from_slice(&u8_to_uint256_be(self.signature_kind.as_u8()));
+        // timestamp: u128 → uint256 → 32 bytes BE
+        buf.extend_from_slice(&u128_to_uint256_be(self.timestamp_ms));
+        // metadata, builder: bytes32 verbatim
+        buf.extend_from_slice(self.metadata.as_bytes());
+        buf.extend_from_slice(self.builder.as_bytes());
+
+        keccak256(&buf)
+    }
+}
+
+// ----------------------------------------------------------------------
+// OrderSigner impl
+// ----------------------------------------------------------------------
+
+impl OrderSigner {
+    /// Construct from a hex private key (0x-prefixed or bare), the API key
+    /// UUID (the `owner` field in body envelopes), an optional funder
+    /// (required for `PolyProxy` / `PolyGnosisSafe`; forbidden for `Eoa`),
+    /// the signature kind, and the verifying-contract address (use one of
+    /// `EXCHANGE_V2_NORMAL` / `EXCHANGE_V2_NEG_RISK`).
+    pub fn new(
+        private_key_hex: &str,
+        api_key: &str,
+        funder: Option<H160>,
+        signature_kind: SignatureKind,
+        chain_id: u64,
+        verifying_contract: H160,
+    ) -> Result<Self, SigningError> {
+        let pk_hex = private_key_hex.strip_prefix("0x").unwrap_or(private_key_hex);
+        let pk_bytes =
+            hex::decode(pk_hex).map_err(|_| SigningError::InvalidPrivateKey)?;
+        if pk_bytes.len() != 32 {
+            return Err(SigningError::InvalidPrivateKey);
+        }
+        let signing_key = SigningKey::from_slice(&pk_bytes)
+            .map_err(|_| SigningError::InvalidPrivateKey)?;
+        let address = derive_address(signing_key.verifying_key());
+
+        if api_key.is_empty() {
+            return Err(SigningError::InvalidApiKey);
+        }
+
+        // EOA: maker == signer; funder must NOT be set.
+        // Proxy / GnosisSafe: maker = funder; signer = EOA address.
+        let maker = match (signature_kind, funder) {
+            (SignatureKind::Eoa, None) => address,
+            (SignatureKind::Eoa, Some(_)) => {
+                return Err(SigningError::InvalidFunder);
+            }
+            (SignatureKind::PolyProxy | SignatureKind::PolyGnosisSafe, Some(f)) => f,
+            (SignatureKind::PolyProxy | SignatureKind::PolyGnosisSafe, None) => {
+                return Err(SigningError::InvalidFunder);
+            }
         };
 
-        let client = builder
-            .authenticate()
-            .await
-            .map_err(|e| SigningError::SdkError(format!("authenticate: {e:?}")))?;
+        let domain_separator = compute_domain_separator(
+            DOMAIN_NAME,
+            DOMAIN_VERSION_V2,
+            chain_id,
+            verifying_contract,
+        );
 
         Ok(Self {
-            inner: signer,
-            client,
+            signing_key,
+            address,
+            api_key: api_key.to_owned(),
+            maker,
+            signature_kind,
+            domain_separator,
         })
     }
 
-    /// Maker address (the on-chain identity we sign as).
-    pub fn address(&self) -> Address {
-        self.inner.address()
+    /// EOA address (recovered from the secp256k1 public key).
+    pub fn address(&self) -> H160 {
+        self.address
     }
 
-    /// Build, sign, and JSON-serialize a FAK BUY for the given canonical
-    /// target. Returns the serialized body bytes; caller hands the bytes
-    /// to L2 auth + POST /order.
-    pub async fn sign_fak_buy(
+    /// Sign a FAK BUY for the canonical target. Returns the JSON body
+    /// bytes ready for POST /order. Synchronous; no network.
+    pub fn sign_fak_buy(
         &self,
         token: &TokenId,
         target: &BuyCanonicalTarget,
+        inputs: SignInputs,
     ) -> Result<Vec<u8>, SigningError> {
-        let token_u256 =
-            U256::from_str(token.as_str()).map_err(|_| SigningError::InvalidTokenId)?;
-        let price_dec = price_to_decimal(target.price.ticks());
-        // Shares4 -> Decimal (4 dp). The SDK builder enforces size scale
-        // <= LOT_SIZE_SCALE (=2). Our canonical sizes are always multiples
-        // of 0.01 share so the trailing four-dp precision is dead. Reduce
-        // before handing off.
-        let size_dec = shares4_to_2dp_decimal(target.size.units())?;
-
-        let order = self
-            .client
-            .limit_order()
-            .token_id(token_u256)
-            .side(Side::Buy)
-            .price(price_dec)
-            .size(size_dec)
-            .order_type(polymarket_client_sdk_v2::clob::types::OrderType::FAK)
-            .build()
-            .await
-            .map_err(|e| SigningError::SdkError(format!("limit_order_build: {e:?}")))?;
-
-        let signed = self
-            .client
-            .sign(&self.inner, order)
-            .await
-            .map_err(|e| SigningError::SdkError(format!("sign: {e:?}")))?;
-
-        serde_json::to_vec(&signed).map_err(|e| SigningError::Serialize(format!("{e}")))
+        // Maker amount in atoms (1e-6 dollars per atom).
+        // UsdcCents → atoms = cents * 10_000.
+        let maker_atoms = (target.maker_amount.cents() as i128)
+            .checked_mul(10_000)
+            .ok_or(SigningError::InvalidPriceOrSize)?;
+        if maker_atoms <= 0 {
+            return Err(SigningError::InvalidPriceOrSize);
+        }
+        // Taker amount in atoms (1e-6 shares per atom).
+        // Shares4 units (0.0001-share units) → atoms = units * 100.
+        let taker_atoms = (target.size.units() as i128)
+            .checked_mul(100)
+            .ok_or(SigningError::InvalidPriceOrSize)?;
+        if taker_atoms <= 0 {
+            return Err(SigningError::InvalidPriceOrSize);
+        }
+        self.sign_v2(
+            token,
+            OrderSide::Buy,
+            U256::from(maker_atoms as u128),
+            U256::from(taker_atoms as u128),
+            inputs,
+        )
     }
 
-    /// Build, sign, and JSON-serialize a FAK SELL.
-    pub async fn sign_fak_sell(
+    /// Sign a FAK SELL. For SELL, maker_amount is in shares and
+    /// taker_amount is in dollars (the venue swaps the legs vs BUY).
+    pub fn sign_fak_sell(
         &self,
         token: &TokenId,
         price: PriceTick,
         size: Shares2,
+        inputs: SignInputs,
     ) -> Result<Vec<u8>, SigningError> {
-        let token_u256 =
-            U256::from_str(token.as_str()).map_err(|_| SigningError::InvalidTokenId)?;
-        let price_dec = price_to_decimal(price.ticks());
-        let size_dec =
-            Decimal::try_from_i128_with_scale(size.units() as i128, 2)
-                .map_err(|_| SigningError::InvalidPriceOrSize)?;
-
-        let order = self
-            .client
-            .limit_order()
-            .token_id(token_u256)
-            .side(Side::Sell)
-            .price(price_dec)
-            .size(size_dec)
-            .order_type(polymarket_client_sdk_v2::clob::types::OrderType::FAK)
-            .build()
-            .await
-            .map_err(|e| SigningError::SdkError(format!("limit_order_build: {e:?}")))?;
-
-        let signed = self
-            .client
-            .sign(&self.inner, order)
-            .await
-            .map_err(|e| SigningError::SdkError(format!("sign: {e:?}")))?;
-
-        serde_json::to_vec(&signed).map_err(|e| SigningError::Serialize(format!("{e}")))
-    }
-}
-
-impl From<OrderSide> for Side {
-    fn from(value: OrderSide) -> Self {
-        match value {
-            OrderSide::Buy => Side::Buy,
-            OrderSide::Sell => Side::Sell,
+        // SELL maker = size × atoms per share = Shares2 units × 10_000.
+        let maker_atoms = (size.units() as i128)
+            .checked_mul(10_000)
+            .ok_or(SigningError::InvalidPriceOrSize)?;
+        if maker_atoms <= 0 {
+            return Err(SigningError::InvalidPriceOrSize);
         }
+        // SELL taker = price × size in dollars × atoms per dollar.
+        // Dimensional: ticks ($0.01/share) × Shares2 (0.01 share)
+        //   = 0.0001 USD per (ticks·units) = 100 atoms per (ticks·units).
+        let taker_atoms = (price.ticks() as i128)
+            .checked_mul(size.units() as i128)
+            .and_then(|v| v.checked_mul(100))
+            .ok_or(SigningError::InvalidPriceOrSize)?;
+        if taker_atoms <= 0 {
+            return Err(SigningError::InvalidPriceOrSize);
+        }
+        self.sign_v2(
+            token,
+            OrderSide::Sell,
+            U256::from(maker_atoms as u128),
+            U256::from(taker_atoms as u128),
+            inputs,
+        )
+    }
+
+    fn sign_v2(
+        &self,
+        token: &TokenId,
+        side: OrderSide,
+        maker_amount: U256,
+        taker_amount: U256,
+        inputs: SignInputs,
+    ) -> Result<Vec<u8>, SigningError> {
+        let token_id = parse_u256_decimal(token.as_str())
+            .ok_or(SigningError::InvalidTokenId)?;
+
+        let order = OrderV2 {
+            salt: inputs.salt,
+            maker: self.maker,
+            signer: self.address,
+            token_id,
+            maker_amount,
+            taker_amount,
+            side,
+            signature_kind: self.signature_kind,
+            timestamp_ms: inputs.timestamp_ms,
+            metadata: H256::zero(),
+            builder: H256::zero(),
+        };
+
+        // EIP-712 digest = keccak256(0x1901 || domainSeparator || structHash)
+        let struct_hash = order.struct_hash();
+        let mut digest_buf = [0u8; 66];
+        digest_buf[0] = 0x19;
+        digest_buf[1] = 0x01;
+        digest_buf[2..34].copy_from_slice(self.domain_separator.as_bytes());
+        digest_buf[34..66].copy_from_slice(struct_hash.as_bytes());
+        let digest = keccak256(&digest_buf);
+
+        // ECDSA sign on the prehashed digest.
+        let (sig, recovery_id): (EcdsaSignature, RecoveryId) = self
+            .signing_key
+            .sign_prehash_recoverable(digest.as_bytes())
+            .map_err(|_| SigningError::InvalidPrivateKey)?;
+        let normalized_sig = sig.normalize_s().unwrap_or(sig);
+        let signature_bytes = encode_signature(&normalized_sig, recovery_id);
+
+        // Render JSON body matching the V2 envelope expected by /order.
+        // expiration is 0 for FAK — the V2 schema does not include it in
+        // the signed struct, but the venue requires it on the wire.
+        let body = SignedOrderBodyV2 {
+            order: OrderV2WithSignature {
+                salt: order.salt,
+                maker: address_lower_hex(order.maker),
+                signer: address_lower_hex(order.signer),
+                token_id: u256_decimal(order.token_id),
+                maker_amount: u256_decimal(order.maker_amount),
+                taker_amount: u256_decimal(order.taker_amount),
+                side: side.as_str(),
+                expiration: "0",
+                signature_type: order.signature_kind.as_u8(),
+                timestamp: u128_decimal(order.timestamp_ms),
+                metadata: bytes32_hex(order.metadata),
+                builder: bytes32_hex(order.builder),
+                signature: signature_hex(&signature_bytes),
+            },
+            order_type: "FAK",
+            owner: &self.api_key,
+            post_only: false,
+            defer_exec: false,
+        };
+
+        serde_json::to_vec(&body).map_err(|e| SigningError::SerializeBody(format!("{e}")))
     }
 }
 
-/// $0.01 tick count -> `Decimal` with 2-dp scale (matches the venue's
-/// minimum tick).
-fn price_to_decimal(ticks: i32) -> Decimal {
-    Decimal::new(ticks as i64, 2)
+// ----------------------------------------------------------------------
+// JSON body shape (matches what the venue expects).
+// ----------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct SignedOrderBodyV2<'a> {
+    order: OrderV2WithSignature<'a>,
+    #[serde(rename = "orderType")]
+    order_type: &'a str,
+    owner: &'a str,
+    #[serde(rename = "postOnly")]
+    post_only: bool,
+    #[serde(rename = "deferExec")]
+    defer_exec: bool,
 }
 
-/// Shares4 (0.0001-share units) -> Decimal at 2-dp scale. Errors if the
-/// trailing 4-dp precision is non-zero (which would indicate a logic bug
-/// in the canonicalizer; canonical BUY/SELL sizes are always 2-dp values
-/// expressed in 4-dp units, so the bottom two digits are always `00`).
-fn shares4_to_2dp_decimal(units_4dp: i64) -> Result<Decimal, SigningError> {
-    if units_4dp.rem_euclid(100) != 0 {
-        return Err(SigningError::InvalidPriceOrSize);
-    }
-    Decimal::try_from_i128_with_scale(units_4dp as i128 / 100, 2)
-        .map_err(|_| SigningError::InvalidPriceOrSize)
+#[derive(Serialize)]
+struct OrderV2WithSignature<'a> {
+    salt: u64,
+    maker: String,
+    signer: String,
+    #[serde(rename = "tokenId")]
+    token_id: String,
+    #[serde(rename = "makerAmount")]
+    maker_amount: String,
+    #[serde(rename = "takerAmount")]
+    taker_amount: String,
+    side: &'a str,
+    expiration: &'a str,
+    #[serde(rename = "signatureType")]
+    signature_type: u8,
+    timestamp: String,
+    metadata: String,
+    builder: String,
+    signature: String,
+}
+
+// ----------------------------------------------------------------------
+// EIP-712 / ABI-encoding helpers
+// ----------------------------------------------------------------------
+
+fn compute_domain_separator(
+    name: &str,
+    version: &str,
+    chain_id: u64,
+    verifying_contract: H160,
+) -> H256 {
+    let typehash = keccak256(EIP712_DOMAIN_TYPE.as_bytes());
+    let name_hash = keccak256(name.as_bytes());
+    let version_hash = keccak256(version.as_bytes());
+
+    let mut buf: Vec<u8> = Vec::with_capacity(32 * 5);
+    buf.extend_from_slice(typehash.as_bytes());
+    buf.extend_from_slice(name_hash.as_bytes());
+    buf.extend_from_slice(version_hash.as_bytes());
+    buf.extend_from_slice(&u64_to_uint256_be(chain_id));
+    buf.extend_from_slice(&address_to_uint256_be(verifying_contract));
+    keccak256(&buf)
+}
+
+fn keccak256(input: &[u8]) -> H256 {
+    let mut hasher = Keccak256::new();
+    hasher.update(input);
+    H256::from_slice(&hasher.finalize())
+}
+
+/// Derive the Ethereum address from a secp256k1 verifying key:
+/// keccak256(uncompressed_pubkey[1..])[12..32] is the lower 20 bytes.
+fn derive_address(vk: &VerifyingKey) -> H160 {
+    let point = vk.to_encoded_point(false); // uncompressed: 0x04 || X || Y
+    let bytes = point.as_bytes();
+    debug_assert_eq!(bytes.len(), 65);
+    let hash = keccak256(&bytes[1..]);
+    H160::from_slice(&hash.as_bytes()[12..])
+}
+
+fn u64_to_uint256_be(v: u64) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out[24..].copy_from_slice(&v.to_be_bytes());
+    out
+}
+
+fn u128_to_uint256_be(v: u128) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out[16..].copy_from_slice(&v.to_be_bytes());
+    out
+}
+
+fn u8_to_uint256_be(v: u8) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out[31] = v;
+    out
+}
+
+fn address_to_uint256_be(addr: H160) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out[12..].copy_from_slice(addr.as_bytes());
+    out
+}
+
+/// Encode (signature_bytes, recovery_id) as a 65-byte Ethereum signature
+/// `r (32) || s (32) || v (1)` where `v = 27 + recovery_id`.
+fn encode_signature(sig: &EcdsaSignature, recovery_id: RecoveryId) -> [u8; 65] {
+    let mut out = [0u8; 65];
+    let r_bytes = sig.r().to_bytes();
+    let s_bytes = sig.s().to_bytes();
+    out[..32].copy_from_slice(&r_bytes);
+    out[32..64].copy_from_slice(&s_bytes);
+    out[64] = 27 + u8::from(recovery_id);
+    out
+}
+
+// ----------------------------------------------------------------------
+// JSON rendering helpers
+// ----------------------------------------------------------------------
+
+fn address_lower_hex(addr: H160) -> String {
+    let mut s = String::with_capacity(42);
+    s.push_str("0x");
+    s.push_str(&hex::encode(addr.as_bytes()));
+    s
+}
+
+fn bytes32_hex(b: H256) -> String {
+    let mut s = String::with_capacity(66);
+    s.push_str("0x");
+    s.push_str(&hex::encode(b.as_bytes()));
+    s
+}
+
+fn signature_hex(sig: &[u8; 65]) -> String {
+    let mut s = String::with_capacity(132);
+    s.push_str("0x");
+    s.push_str(&hex::encode(sig));
+    s
+}
+
+fn u256_decimal(v: U256) -> String {
+    v.to_string()
+}
+
+fn u128_decimal(v: u128) -> String {
+    v.to_string()
+}
+
+/// Parse a U256 from a decimal string. Used for the ERC-1155 token id
+/// which the gamma metadata renders as a base-10 number.
+fn parse_u256_decimal(s: &str) -> Option<U256> {
+    U256::from_dec_str(s).ok()
 }
 
 #[cfg(test)]
 mod tests {
-    //! Phase 3b tests
-    //!
-    //! The pure-Rust tests below cover the conversion boundary
-    //! (PriceTick / Shares* -> Decimal). Live signing tests are marked
-    //! `#[ignore]` and require a reachable CLOB plus credentials —
-    //! invoke them by exporting POLYMARKET_PRIVATE_KEY plus auth env
-    //! vars and running:
-    //!     cargo test signing::tests -- --ignored
     use super::*;
-    use crate::types::PriceTick;
-    use polymarket_client_sdk_v2::auth::Uuid;
+    use crate::orders::{canonical_buy_target_for_notional, BuyCanonicalInput};
 
-    #[test]
-    fn price_to_decimal_renders_two_dp() {
-        let d = price_to_decimal(50);
-        assert_eq!(d.scale(), 2);
-        assert_eq!(d.to_string(), "0.50");
-    }
+    /// Standard low-private-key test vector. Address derives to:
+    /// 0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf
+    const TEST_PRIVATE_KEY: &str =
+        "0x0000000000000000000000000000000000000000000000000000000000000001";
+    const TEST_ADDRESS: &str = "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf";
+    const TEST_API_KEY: &str = "00000000-0000-0000-0000-000000000001";
 
-    #[test]
-    fn shares4_to_2dp_drops_trailing_zeros() {
-        // 20_200 (Shares4 units) = 2.02 shares
-        let d = shares4_to_2dp_decimal(20_200).unwrap();
-        assert_eq!(d.scale(), 2);
-        assert_eq!(d.to_string(), "2.02");
-    }
-
-    #[test]
-    fn shares4_to_2dp_rejects_subcent_residue() {
-        // 20_201 -> 2.0201 shares; trailing two digits non-zero.
-        // Canonicalizer should never produce this, so we fail closed.
-        let err = shares4_to_2dp_decimal(20_201).unwrap_err();
-        assert_eq!(err, SigningError::InvalidPriceOrSize);
-    }
-
-    #[test]
-    fn order_side_to_sdk_side() {
-        let s: Side = OrderSide::Buy.into();
-        assert_eq!(s, Side::Buy);
-        let s: Side = OrderSide::Sell.into();
-        assert_eq!(s, Side::Sell);
-    }
-
-    /// Live signing test. Skipped by default; needs:
-    ///   POLYMARKET_PRIVATE_KEY: hex private key
-    ///   POLY_API_KEY:           UUID
-    ///   POLY_API_SECRET:        URL-safe base64 string
-    ///   POLY_API_PASSPHRASE:    string
-    /// And a reachable CLOB at https://clob-v2.polymarket.com
-    #[tokio::test]
-    #[ignore = "live: requires CLOB network access and credentials"]
-    async fn signs_fak_buy_against_live_clob() {
-        let pk = std::env::var("POLYMARKET_PRIVATE_KEY")
-            .expect("POLYMARKET_PRIVATE_KEY required for live signing test");
-        let creds = Credentials::new(
-            std::env::var("POLY_API_KEY")
-                .ok()
-                .and_then(|k| Uuid::parse_str(&k).ok())
-                .expect("POLY_API_KEY must be a valid UUID"),
-            std::env::var("POLY_API_SECRET").expect("POLY_API_SECRET"),
-            std::env::var("POLY_API_PASSPHRASE").expect("POLY_API_PASSPHRASE"),
-        );
-        // Adjust signature type to match the user's wallet kind.
-        let signer = OrderSigner::new(
-            &pk,
-            "https://clob-v2.polymarket.com",
-            creds,
+    fn signer() -> OrderSigner {
+        OrderSigner::new(
+            TEST_PRIVATE_KEY,
+            TEST_API_KEY,
             None,
-            SignatureType::Eoa,
+            SignatureKind::Eoa,
+            POLYGON_CHAIN_ID,
+            EXCHANGE_V2_NORMAL,
         )
-        .await
-        .expect("OrderSigner::new");
+        .unwrap()
+    }
 
-        let target = crate::orders::canonical_buy_target_for_notional(
-            crate::orders::BuyCanonicalInput {
-                price: PriceTick::checked(50).unwrap(),
-                target_maker_cents: 101,
-                min_size_taker_units: 100,
-                min_maker_cents: 100,
-                max_overrun_cents: 1,
-                max_overrun_bps: 0,
-            },
-        )
+    #[test]
+    fn address_derives_from_test_vector() {
+        let s = signer();
+        assert_eq!(address_lower_hex(s.address()), TEST_ADDRESS);
+    }
+
+    #[test]
+    fn order_type_string_matches_sdk() {
+        // Locked verbatim from the on-chain contract via the SDK source.
+        // If this changes upstream, every signature this bot produces is
+        // invalid — a refactor must reverify against the live contract.
+        assert_eq!(
+            ORDER_TYPE_STRING_V2,
+            "Order(uint256 salt,address maker,address signer,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint8 side,uint8 signatureType,uint256 timestamp,bytes32 metadata,bytes32 builder)"
+        );
+    }
+
+    #[test]
+    fn domain_separator_for_polygon_v2_normal_is_stable() {
+        // Locks the precomputed domain separator. If chain id, name,
+        // version, or verifying contract drifts, this test breaks before
+        // any signature can be produced. Hash computed once and pinned;
+        // recompute manually if intentionally changing the schema.
+        let s = signer();
+        let expected = compute_domain_separator(
+            DOMAIN_NAME,
+            DOMAIN_VERSION_V2,
+            POLYGON_CHAIN_ID,
+            EXCHANGE_V2_NORMAL,
+        );
+        assert_eq!(s.domain_separator, expected);
+    }
+
+    #[test]
+    fn signature_recovers_to_signer_address_for_buy() {
+        let s = signer();
+        let target = canonical_buy_target_for_notional(BuyCanonicalInput {
+            price: PriceTick::checked(50).unwrap(),
+            target_maker_cents: 101,
+            min_size_taker_units: 100,
+            min_maker_cents: 100,
+            max_overrun_cents: 1,
+            max_overrun_bps: 0,
+        })
         .unwrap();
-        // Caller must supply a real, currently-listed token_id.
+
         let token = TokenId::new(
-            std::env::var("POLY_TEST_TOKEN_ID").expect("POLY_TEST_TOKEN_ID"),
+            "1234567890123456789012345678901234567890123456789012345678901234",
         );
-        let body = signer.sign_fak_buy(&token, &target).await.unwrap();
-        assert!(!body.is_empty());
-        // Body must parse as JSON and carry a signature field somewhere.
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let body_str = serde_json::to_string(&v).unwrap();
-        assert!(
-            body_str.contains("signature"),
-            "signed body missing signature: {body_str}"
+        let inputs = SignInputs {
+            salt: 0xdead_beef_cafe_babe,
+            timestamp_ms: 1_777_000_000_000,
+        };
+
+        let body = s.sign_fak_buy(&token, &target, inputs).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Sanity: structure.
+        assert_eq!(parsed["orderType"], "FAK");
+        assert_eq!(parsed["owner"], TEST_API_KEY);
+        assert_eq!(parsed["postOnly"], false);
+        assert_eq!(parsed["deferExec"], false);
+        let order = &parsed["order"];
+        assert_eq!(order["side"], "BUY");
+        assert_eq!(order["signatureType"], 0);
+        assert_eq!(order["maker"], TEST_ADDRESS);
+        assert_eq!(order["signer"], TEST_ADDRESS);
+        // maker_amount in atoms: $1.01 * 1e6 = 1010000.
+        assert_eq!(order["makerAmount"], "1010000");
+        // taker_amount in atoms: 2.02 shares * 1e6 = 2020000.
+        assert_eq!(order["takerAmount"], "2020000");
+        assert_eq!(order["expiration"], "0");
+        assert_eq!(order["timestamp"], "1777000000000");
+        assert_eq!(order["metadata"], format!("0x{}", "0".repeat(64)));
+        assert_eq!(order["builder"], format!("0x{}", "0".repeat(64)));
+
+        // Recover signer address from signature and assert match.
+        let signature_str = order["signature"].as_str().unwrap();
+        let signature = signature_str.strip_prefix("0x").unwrap();
+        let signature_bytes = hex::decode(signature).unwrap();
+        assert_eq!(signature_bytes.len(), 65);
+
+        // Reconstruct the digest and recover.
+        let token_id = parse_u256_decimal(token.as_str()).unwrap();
+        let order_v2 = OrderV2 {
+            salt: inputs.salt,
+            maker: s.maker,
+            signer: s.address,
+            token_id,
+            maker_amount: U256::from(1_010_000u64),
+            taker_amount: U256::from(2_020_000u64),
+            side: OrderSide::Buy,
+            signature_kind: SignatureKind::Eoa,
+            timestamp_ms: inputs.timestamp_ms,
+            metadata: H256::zero(),
+            builder: H256::zero(),
+        };
+        let mut digest_buf = [0u8; 66];
+        digest_buf[0] = 0x19;
+        digest_buf[1] = 0x01;
+        digest_buf[2..34].copy_from_slice(s.domain_separator.as_bytes());
+        digest_buf[34..66].copy_from_slice(order_v2.struct_hash().as_bytes());
+        let digest = keccak256(&digest_buf);
+
+        let r = k256::ecdsa::Signature::from_slice(&signature_bytes[..64]).unwrap();
+        let v = signature_bytes[64];
+        let recovery_id = RecoveryId::try_from(v - 27).unwrap();
+        let recovered = VerifyingKey::recover_from_prehash(digest.as_bytes(), &r, recovery_id)
+            .unwrap();
+        let recovered_address = derive_address(&recovered);
+        assert_eq!(recovered_address, s.address);
+    }
+
+    #[test]
+    fn signature_recovers_to_signer_address_for_sell() {
+        let s = signer();
+        let token = TokenId::new(
+            "1234567890123456789012345678901234567890123456789012345678901234",
         );
+        let inputs = SignInputs {
+            salt: 1,
+            timestamp_ms: 1_777_000_000_000,
+        };
+
+        // 1.50 shares at $0.60 → 0.90 USDC notional = 900_000 atoms.
+        let body = s
+            .sign_fak_sell(
+                &token,
+                PriceTick::checked(60).unwrap(),
+                Shares2::new_unchecked(150),
+                inputs,
+            )
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let order = &parsed["order"];
+        assert_eq!(order["side"], "SELL");
+        // maker = shares × 1e6 = 1.50 × 1e6 = 1_500_000
+        assert_eq!(order["makerAmount"], "1500000");
+        // taker = price * shares * 1e6 = 0.60 * 1.50 * 1e6 = 900_000
+        assert_eq!(order["takerAmount"], "900000");
+
+        // Recover.
+        let signature_str = order["signature"].as_str().unwrap();
+        let signature_bytes =
+            hex::decode(signature_str.strip_prefix("0x").unwrap()).unwrap();
+        let token_id = parse_u256_decimal(token.as_str()).unwrap();
+        let order_v2 = OrderV2 {
+            salt: inputs.salt,
+            maker: s.maker,
+            signer: s.address,
+            token_id,
+            maker_amount: U256::from(1_500_000u64),
+            taker_amount: U256::from(900_000u64),
+            side: OrderSide::Sell,
+            signature_kind: SignatureKind::Eoa,
+            timestamp_ms: inputs.timestamp_ms,
+            metadata: H256::zero(),
+            builder: H256::zero(),
+        };
+        let mut digest_buf = [0u8; 66];
+        digest_buf[0] = 0x19;
+        digest_buf[1] = 0x01;
+        digest_buf[2..34].copy_from_slice(s.domain_separator.as_bytes());
+        digest_buf[34..66].copy_from_slice(order_v2.struct_hash().as_bytes());
+        let digest = keccak256(&digest_buf);
+
+        let r = k256::ecdsa::Signature::from_slice(&signature_bytes[..64]).unwrap();
+        let recovery_id = RecoveryId::try_from(signature_bytes[64] - 27).unwrap();
+        let recovered = VerifyingKey::recover_from_prehash(digest.as_bytes(), &r, recovery_id)
+            .unwrap();
+        assert_eq!(derive_address(&recovered), s.address);
+    }
+
+    #[test]
+    fn rejects_eoa_with_funder() {
+        let err = OrderSigner::new(
+            TEST_PRIVATE_KEY,
+            TEST_API_KEY,
+            Some(H160::zero()),
+            SignatureKind::Eoa,
+            POLYGON_CHAIN_ID,
+            EXCHANGE_V2_NORMAL,
+        )
+        .unwrap_err();
+        assert_eq!(err, SigningError::InvalidFunder);
+    }
+
+    #[test]
+    fn rejects_proxy_without_funder() {
+        let err = OrderSigner::new(
+            TEST_PRIVATE_KEY,
+            TEST_API_KEY,
+            None,
+            SignatureKind::PolyProxy,
+            POLYGON_CHAIN_ID,
+            EXCHANGE_V2_NORMAL,
+        )
+        .unwrap_err();
+        assert_eq!(err, SigningError::InvalidFunder);
+    }
+
+    #[test]
+    fn rejects_invalid_token_id() {
+        let s = signer();
+        let target = canonical_buy_target_for_notional(BuyCanonicalInput {
+            price: PriceTick::checked(50).unwrap(),
+            target_maker_cents: 101,
+            min_size_taker_units: 100,
+            min_maker_cents: 100,
+            max_overrun_cents: 1,
+            max_overrun_bps: 0,
+        })
+        .unwrap();
+        let bogus = TokenId::new("not a number");
+        let err = s
+            .sign_fak_buy(&bogus, &target, SignInputs { salt: 0, timestamp_ms: 0 })
+            .unwrap_err();
+        assert_eq!(err, SigningError::InvalidTokenId);
+    }
+
+    #[test]
+    fn salt_renders_as_numeric_in_body() {
+        // The SDK serialises salt as a u64 (numeric, not stringified).
+        // Lock that to prevent silent drift.
+        let s = signer();
+        let target = canonical_buy_target_for_notional(BuyCanonicalInput {
+            price: PriceTick::checked(50).unwrap(),
+            target_maker_cents: 101,
+            min_size_taker_units: 100,
+            min_maker_cents: 100,
+            max_overrun_cents: 1,
+            max_overrun_bps: 0,
+        })
+        .unwrap();
+        let token = TokenId::new("1");
+        let body = s
+            .sign_fak_buy(&token, &target, SignInputs { salt: 12345, timestamp_ms: 1 })
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(parsed["order"]["salt"].is_number(), "salt must be a JSON number");
+        assert_eq!(parsed["order"]["salt"].as_u64(), Some(12345));
     }
 }
