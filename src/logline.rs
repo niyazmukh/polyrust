@@ -15,6 +15,8 @@
 
 use std::io::Write;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::mpsc::{sync_channel, SyncSender};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -39,6 +41,21 @@ impl Level {
 // Threshold below which logs are dropped. Stored as a simple atomic so the
 // hot path doesn't lock to read it.
 static LEVEL_THRESHOLD: AtomicU8 = AtomicU8::new(Level::Warn as u8);
+
+static LOG_SENDER: OnceLock<SyncSender<Vec<u8>>> = OnceLock::new();
+
+/// Starts the non-blocking background logger thread to take stderr I/O off the hot path.
+pub fn init_background_logger() {
+    let (tx, rx) = sync_channel(8192);
+    if LOG_SENDER.set(tx).is_ok() {
+        std::thread::spawn(move || {
+            let mut stderr = std::io::stderr();
+            for msg in rx {
+                let _ = stderr.write_all(&msg);
+            }
+        });
+    }
+}
 
 pub fn set_level(level: Level) {
     LEVEL_THRESHOLD.store(level as u8, Ordering::Relaxed);
@@ -152,7 +169,11 @@ pub fn log_event(level: Level, event: &str, fields: &[Field<'_>]) {
         let _ = value.write(&mut buf);
     }
     buf.push(b'\n');
-    let _ = std::io::stderr().write_all(&buf);
+    if let Some(tx) = LOG_SENDER.get() {
+        let _ = tx.try_send(buf);
+    } else {
+        let _ = std::io::stderr().write_all(&buf);
+    }
 }
 
 #[cfg(test)]

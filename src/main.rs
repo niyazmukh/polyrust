@@ -38,6 +38,9 @@ use tokio::sync::mpsc;
 
 #[tokio::main]
 async fn main() {
+    // Start the non-blocking background logger immediately.
+    logline::init_background_logger();
+
     // 1. Load .env.poly (idempotent — only sets missing vars).
     let _ = config::load_env_file(".env.poly");
 
@@ -139,6 +142,16 @@ async fn main() {
                 "live_signer_missing",
                 &[Field { key: "reason", value: &"OrderSigner construction failed — check POLY_PK" }],
             );
+        }
+        if let Some(sub) = &submitter {
+            if let Err(e) = sub.verify_flat_start().await {
+                logline::log_event(
+                    Level::Error,
+                    "ensure_flat_start_failed",
+                    &[Field { key: "reason", value: &e }],
+                );
+                std::process::exit(3);
+            }
         }
     }
 

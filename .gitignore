@@ -9,6 +9,7 @@ src/graphify-out/
 # Non-runtime documents
 DEEPSEEK_DELIVERY_REPORT.md
 GEMINI_REVIEW_REPORT.md
+GPT_REVIEW_REPORT.md
 TODO.md
 .graphifyignore
 /docs/

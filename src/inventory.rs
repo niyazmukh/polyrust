@@ -202,7 +202,7 @@ impl Inventory {
 
     pub fn expire_unknowns(&mut self, older_than_ts_us: i64) {
         for p in self.pending.values_mut() {
-            if p.status == SubmitStatus::Unknown && p.updated_ts_us <= older_than_ts_us {
+            if (p.status == SubmitStatus::Unknown || p.status == SubmitStatus::Accepted) && p.updated_ts_us <= older_than_ts_us {
                 p.status = SubmitStatus::ExpiredUnknown;
             }
         }

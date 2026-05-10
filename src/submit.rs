@@ -140,6 +140,37 @@ impl HttpSubmitter {
         })
     }
 
+    /// Retrieve positions to ensure the bot starts with a flat inventory.
+    /// This prevents risk overlap across restarts.
+    pub async fn verify_flat_start(&self) -> Result<(), String> {
+        let ts = (self.now_secs)();
+        let url = format!("{}/positions", self.base_url);
+        let mut req = self.client.get(&url);
+        let headers = self.auth.headers("GET", "/positions", b"", ts);
+        for (name, value) in headers.as_pairs() {
+            req = req.header(name, value);
+        }
+        let resp = req.send().await.map_err(|e| format!("flat_start http: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("flat_start API error: {}", resp.status()));
+        }
+        let body = resp.text().await.map_err(|e| format!("flat_start read: {e}"))?;
+        if let Ok(Value::Array(positions)) = serde_json::from_str::<Value>(&body) {
+            let mut count = 0;
+            for p in positions {
+                if let Some(size) = p.get("size").and_then(|v| v.as_str()) {
+                    if size != "0" && size != "0.0" && size != "0.00" && !size.starts_with('-') {
+                        count += 1;
+                    }
+                }
+            }
+            if count > 0 {
+                return Err(format!("flat_start violation: nonzero positions found"));
+            }
+        }
+        Ok(())
+    }
+
     /// Test-only override for the timestamp source so signatures are
     /// reproducible in fixtures.
     #[doc(hidden)]

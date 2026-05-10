@@ -153,8 +153,8 @@ impl GammaClient {
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())?;
 
-            // Parse clobTokenIds — may be a JSON string or an array.
-            let tokens = parse_clob_tokens(market.get("clobTokenIds")?)?;
+            // Parse clobTokenIds and outcomes
+            let tokens = parse_clob_tokens(market.get("clobTokenIds")?, market.get("outcomes"))?;
             let (yes_tok, no_tok) = select_yes_no(&tokens)?;
 
             // Parse start/end timestamps — Gamma uses ISO-8601 strings.
@@ -198,47 +198,46 @@ impl GammaClient {
 // Token parsing
 // ---------------------------------------------------------------------------
 
-/// Parse `clobTokenIds` from Gamma's JSON representation.
-/// The field may be a JSON array of strings, or a JSON-encoded string
-/// containing an array.
-fn parse_clob_tokens(value: &Value) -> Option<Vec<ClobToken>> {
-    // Case 1: it's already an array of strings.
+/// Parse `clobTokenIds` and `outcomes` from Gamma's JSON representation.
+fn parse_clob_tokens(value: &Value, outcomes: Option<&Value>) -> Option<Vec<ClobToken>> {
+    // try object array first (case 4 logic)
     if let Some(arr) = value.as_array() {
-        return Some(
-            arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_owned()))
-                .map(|id| ClobToken {
-                    token_id: TokenId::new(id),
-                    outcome: String::new(),
-                })
-                .collect(),
-        );
+        if arr.first().and_then(|v| v.as_object()).is_some() {
+            return Some(parse_token_objects(arr));
+        }
     }
-    // Case 2: it's a JSON-encoded string.
     if let Some(raw) = value.as_str() {
-        if let Ok(parsed) = serde_json::from_str::<Vec<String>>(raw) {
-            return Some(
-                parsed
-                    .into_iter()
-                    .map(|id| ClobToken {
-                        token_id: TokenId::new(id),
-                        outcome: String::new(),
-                    })
-                    .collect(),
-            );
-        }
-        // Case 3: it's a JSON-encoded array of objects with `id` and `outcome`.
         if let Ok(parsed) = serde_json::from_str::<Vec<Value>>(raw) {
-            return Some(parse_token_objects(&parsed));
+            if parsed.first().and_then(|v| v.as_object()).is_some() {
+                return Some(parse_token_objects(&parsed));
+            }
         }
     }
-    // Case 4: array of objects directly.
-    if let Some(arr) = value.as_array()
-        && arr.first().and_then(|v| v.as_object()).is_some()
-    {
-        return Some(parse_token_objects(arr));
-    }
-    None
+
+    let parse_str_array = |v: &Value| -> Option<Vec<String>> {
+        if let Some(arr) = v.as_array() {
+            return Some(arr.iter().filter_map(|s| s.as_str().map(|s| s.to_owned())).collect());
+        }
+        if let Some(s) = v.as_str() {
+            if let Ok(p) = serde_json::from_str::<Vec<String>>(s) {
+                return Some(p);
+            }
+        }
+        None
+    };
+
+    let ids = parse_str_array(value)?;
+    let outs = outcomes.and_then(parse_str_array).unwrap_or_default();
+
+    Some(
+        ids.into_iter()
+            .enumerate()
+            .map(|(i, id)| ClobToken {
+                token_id: TokenId::new(id),
+                outcome: outs.get(i).cloned().unwrap_or_default(),
+            })
+            .collect()
+    )
 }
 
 fn parse_token_objects(arr: &[Value]) -> Vec<ClobToken> {

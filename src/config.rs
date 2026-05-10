@@ -51,8 +51,6 @@ pub struct Config {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct LaunchConfig {
-    pub market: MarketContext,
-    pub strike_usd: f64,
     pub binance_ws_url: String,
     pub poly_market_ws_url: String,
     pub poly_user_ws_url: String,
@@ -290,27 +288,6 @@ impl LaunchConfig {
     }
 
     fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Self, ConfigError> {
-        let slug = required_string(&mut lookup, "MINIRUST_MARKET_SLUG")?;
-        let condition_id = ConditionId::new(required_string(&mut lookup, "MINIRUST_CONDITION_ID")?);
-        let yes_token = TokenId::new(required_string(&mut lookup, "MINIRUST_YES_TOKEN_ID")?);
-        let no_token = TokenId::new(required_string(&mut lookup, "MINIRUST_NO_TOKEN_ID")?);
-        let start_ts = required_i64(&mut lookup, "MINIRUST_MARKET_START_TS")?;
-        let end_ts = required_i64(&mut lookup, "MINIRUST_MARKET_END_TS")?;
-        if end_ts <= start_ts {
-            return Err(ConfigError::Invalid {
-                name: "MINIRUST_MARKET_END_TS",
-                reason: format!("lte_start value={end_ts} start={start_ts}"),
-            });
-        }
-        let slug_ts = env_i64_lookup(&mut lookup, "MINIRUST_MARKET_SLUG_TS").unwrap_or(start_ts);
-        let strike_usd = required_f64(&mut lookup, "MINIRUST_STRIKE_USD")?;
-        if strike_usd <= 0.0 {
-            return Err(ConfigError::Invalid {
-                name: "MINIRUST_STRIKE_USD",
-                reason: format!("non_positive value={strike_usd}"),
-            });
-        }
-
         let symbol = required_string(&mut lookup, "MINIRUST_BINANCE_SYMBOL")?.to_ascii_lowercase();
         let binance_ws_url = lookup("MINIRUST_BINANCE_WS_URL")
             .filter(|s| !s.trim().is_empty())
@@ -347,18 +324,6 @@ impl LaunchConfig {
             .unwrap_or_else(|| "https://gamma-api.polymarket.com".to_owned());
 
         Ok(Self {
-            market: MarketContext {
-                slug,
-                condition_id,
-                yes_token,
-                no_token,
-                yes_label: lookup("MINIRUST_YES_LABEL").unwrap_or_else(|| "Up".to_owned()),
-                no_label: lookup("MINIRUST_NO_LABEL").unwrap_or_else(|| "Down".to_owned()),
-                start_ts,
-                end_ts,
-                slug_ts,
-            },
-            strike_usd,
             binance_ws_url,
             poly_market_ws_url,
             poly_user_ws_url,
@@ -595,10 +560,6 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(launch.market.slug, "btc-up-down-1m");
-        assert_eq!(launch.market.yes_token, TokenId::new("yes"));
-        assert_eq!(launch.market.slug_ts, 1_777_000_000);
-        assert_eq!(launch.strike_usd, 100_000.0);
         assert_eq!(
             launch.binance_ws_url,
             "wss://stream.binance.com:9443/ws/btcusdt@bookTicker?timeUnit=MICROSECOND"
