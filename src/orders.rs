@@ -1,14 +1,13 @@
 //! Canonical BUY/SELL parameter selection and signed-body precision.
 //!
-//! Mirrors `fast_order_submitter.canonical_buy_target_for_notional` and
-//! `canonical_order_params` in the Python reference, **byte-for-byte at the
-//! integer level** — Python uses `Decimal`; we use fixed-point `i64`. The
-//! golden tests in `tests/golden_canonical.rs` lock that equivalence.
+//! Chooses venue-valid FAK BUY/SELL body parameters from fixed-point inputs.
 //!
-//! Phase 3 (EIP-712 signing) and Phase 4 (HTTP submit) are out of scope for
-//! this module today. We expose enough to choose a venue-valid `(price,
-//! size, maker_amount)` triple and to construct an unsigned body envelope
-//! ready for a signing layer that will land later.
+//! The golden tests lock known-live venue precision cases, not Python object
+//! structure. Rust owns the runtime design; Python is only a temporary oracle
+//! for body-shape invariants that already survived live probes.
+//!
+//! This module exposes only the `(price, size, maker_amount)` choices needed
+//! by signing and submit code.
 
 use crate::types::{
     buy_size_multiple_taker_units, ceil_to_multiple, floor_to_multiple, maker_cents_for,
@@ -101,13 +100,12 @@ pub struct BuyCanonicalInput {
 
 /// Choose a venue-valid BUY (size, maker) for a target notional.
 ///
-/// Mirrors Python:
-/// 1. `q_price = ceil_to_step(price, tick)` — caller already supplies a
-///    tick-aligned `PriceTick`, so this is a no-op here.
-/// 2. `raw_size = ceil(target / q_price, step=0.01_share)`.
-/// 3. Compute `floor_size`/`ceil_size` aligned to the maker-amount lattice.
-/// 4. Prefer ceil within `[min_maker, target + overrun]`; otherwise floor.
-/// 5. Otherwise reject.
+/// Choose a FAK BUY lattice point:
+/// 1. Caller supplies a tick-aligned `PriceTick`.
+/// 2. Compute the smallest 0.01-share raw size covering target notional.
+/// 3. Snap to the maker-amount lattice so the signed body has exact cents.
+/// 4. Prefer the smallest in-band overshoot; otherwise accept in-band floor.
+/// 5. Reject locally if no venue-valid size satisfies the risk band.
 ///
 /// `max_overrun_cents` and `max_overrun_bps` combine via `max(...)` to match
 /// the Python policy: `max_allowed = target + max(absolute, target * bps/10_000)`.
@@ -158,29 +156,31 @@ pub fn canonical_buy_target_for_notional(
     };
 
     // Prefer ceil (slight overshoot) if within bounds.
-    if let Some(maker) = ceil_maker {
-        if in_band(maker) && ceil_size >= inp.min_size_taker_units {
-            return Ok(BuyCanonicalTarget {
-                price: inp.price,
-                size: Shares4::new_unchecked(ceil_size),
-                maker_amount: maker,
-                raw_size_taker_units,
-                policy: BuyCanonicalPolicy::Ceil,
-            });
-        }
+    if let Some(maker) = ceil_maker
+        && in_band(maker)
+        && ceil_size >= inp.min_size_taker_units
+    {
+        return Ok(BuyCanonicalTarget {
+            price: inp.price,
+            size: Shares4::new_unchecked(ceil_size),
+            maker_amount: maker,
+            raw_size_taker_units,
+            policy: BuyCanonicalPolicy::Ceil,
+        });
     }
 
     // Otherwise accept floor (slight undershoot).
-    if let Some(maker) = floor_maker {
-        if in_band(maker) && floor_size >= inp.min_size_taker_units {
-            return Ok(BuyCanonicalTarget {
-                price: inp.price,
-                size: Shares4::new_unchecked(floor_size),
-                maker_amount: maker,
-                raw_size_taker_units,
-                policy: BuyCanonicalPolicy::Floor,
-            });
-        }
+    if let Some(maker) = floor_maker
+        && in_band(maker)
+        && floor_size >= inp.min_size_taker_units
+    {
+        return Ok(BuyCanonicalTarget {
+            price: inp.price,
+            size: Shares4::new_unchecked(floor_size),
+            maker_amount: maker,
+            raw_size_taker_units,
+            policy: BuyCanonicalPolicy::Floor,
+        });
     }
 
     Err(BuyCanonicalError::NoValidSizeWithinNotionalBounds {
@@ -232,9 +232,8 @@ mod tests {
 
     #[test]
     fn p050_target_101_takes_ceil_to_102_within_overrun() {
-        // Python tests/test_fast_order_submitter.py:585 — price=0.51 in older
-        // tests; equivalent at p=0.50 with target=1.01 lands ceil at 2.02
-        // shares (=$1.01 exactly), policy Ceil.
+        // p=0.50 with target=$1.01 lands at 2.02 shares and $1.01 maker
+        // amount exactly.
         let r = canonical_buy_target_for_notional(input(101, 50, 1)).unwrap();
         assert_eq!(r.price.ticks(), 50);
         assert_eq!(r.size.units(), 20_200);

@@ -1,11 +1,8 @@
 //! Golden BUY-canonicalization fixtures.
 //!
-//! Inputs and outputs are taken from the Python reference
-//! `fast_order_submitter.canonical_buy_target_for_notional`. If a future
-//! Polymarket precision change requires a behavioural update, **also** update
-//! the Python reference and the table below in lockstep — never silently
-//! diverge. The Phase-3 signing layer will rely on these (price, size,
-//! maker_amount) triples being identical to the Python output.
+//! These are venue-body precision fixtures from live-proven Python behavior.
+//! They are temporary oracles for the signed-body lattice only, not a mandate
+//! to recreate the Python runtime graph.
 
 use minirust::orders::{
     canonical_buy_target_for_notional, BuyCanonicalError, BuyCanonicalInput, BuyCanonicalPolicy,

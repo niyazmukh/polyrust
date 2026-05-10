@@ -1,22 +1,22 @@
 [package]
 name = "minirust"
 version = "0.0.1"
-edition = "2021"
+edition = "2024"
 publish = false
-description = "Rust port of the minimal Polymarket/Binance bot. Phase 1+2: types and order-body canonicalization."
+description = "Minimal Rust Polymarket/Binance HFT runtime."
 
 [lib]
 name = "minirust"
 path = "src/lib.rs"
 
 [dependencies]
-# Phase 1+2 (types + canonical body math): pure stdlib.
-# Phase 3a (L2 auth): hmac/sha2/base64.
+# Types + canonical body math: pure stdlib.
+# L2 auth: hmac/sha2/base64.
 hmac = "0.12"
 sha2 = "0.10"
 base64 = "0.22"
 
-# Phase 3b (EIP-712 order signing): primitives only. The SDK's order
+# EIP-712 order signing: primitives only. The SDK's order
 # builder calls tick_size / fee_rate / version over the network *before*
 # producing a signable body — that defeats the entire pre-signing
 # architecture (Binance tick → cached signed body → submit) the plan
@@ -33,8 +33,34 @@ hex = { version = "0.4", default-features = false, features = ["std"] }
 serde = { version = "1", default-features = false, features = ["std", "derive"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 
+# Direct HTTP submit. Reqwest is kept only for the first live-equivalent
+# runtime slice; replacing it with a lower-level client requires measured
+# latency evidence, not aesthetic minimalism.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls-webpki-roots",
+    "http2",
+    "json",
+    "stream",
+] }
+tokio = { version = "1", default-features = false, features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "time",
+    "signal",
+    "sync",   # Delivered by DeepSeek — mpsc channel for feed loop tests.
+] }
+bytes = "1"
+
+# Delivered by DeepSeek — WebSocket feed IO deps for all 3 feeds.
+# Traces to: Python websockets.connect() in market_ws.py, binance_sbe_listener.py,
+# user_channel_ws.py.
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+# Delivered by DeepSeek — StreamExt + SinkExt for WS read/write in feed loops.
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+
 [dev-dependencies]
-# Phase 1+2 tests are pure stdlib.
+wiremock = "0.6"
 
 [profile.release]
 lto = "thin"

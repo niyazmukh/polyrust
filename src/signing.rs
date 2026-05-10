@@ -153,6 +153,20 @@ pub enum SigningError {
     SerializeBody(String),
 }
 
+/// A locally signed, locally validated FAK order body ready for `POST /order`.
+///
+/// The REST submitter accepts this newtype instead of raw bytes so invalid
+/// caller-constructed JSON cannot bypass the signing/validation boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignedFakOrderBody(Vec<u8>);
+
+impl SignedFakOrderBody {
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+}
+
 impl std::fmt::Display for SigningError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -304,7 +318,7 @@ impl OrderSigner {
         token: &TokenId,
         target: &BuyCanonicalTarget,
         inputs: SignInputs,
-    ) -> Result<Vec<u8>, SigningError> {
+    ) -> Result<SignedFakOrderBody, SigningError> {
         // Maker amount in atoms (1e-6 dollars per atom).
         // UsdcCents → atoms = cents * 10_000.
         let maker_atoms = (target.maker_amount.cents() as i128)
@@ -338,7 +352,7 @@ impl OrderSigner {
         price: PriceTick,
         size: Shares2,
         inputs: SignInputs,
-    ) -> Result<Vec<u8>, SigningError> {
+    ) -> Result<SignedFakOrderBody, SigningError> {
         // SELL maker = size × atoms per share = Shares2 units × 10_000.
         let maker_atoms = (size.units() as i128)
             .checked_mul(10_000)
@@ -372,7 +386,7 @@ impl OrderSigner {
         maker_amount: U256,
         taker_amount: U256,
         inputs: SignInputs,
-    ) -> Result<Vec<u8>, SigningError> {
+    ) -> Result<SignedFakOrderBody, SigningError> {
         let token_id = parse_u256_decimal(token.as_str())
             .ok_or(SigningError::InvalidTokenId)?;
 
@@ -432,7 +446,9 @@ impl OrderSigner {
             defer_exec: false,
         };
 
-        serde_json::to_vec(&body).map_err(|e| SigningError::SerializeBody(format!("{e}")))
+        let bytes =
+            serde_json::to_vec(&body).map_err(|e| SigningError::SerializeBody(format!("{e}")))?;
+        Ok(SignedFakOrderBody(bytes))
     }
 }
 
@@ -666,7 +682,7 @@ mod tests {
         };
 
         let body = s.sign_fak_buy(&token, &target, inputs).unwrap();
-        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(body.as_bytes()).unwrap();
 
         // Sanity: structure.
         assert_eq!(parsed["orderType"], "FAK");
@@ -744,7 +760,7 @@ mod tests {
                 inputs,
             )
             .unwrap();
-        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(body.as_bytes()).unwrap();
         let order = &parsed["order"];
         assert_eq!(order["side"], "SELL");
         // maker = shares × 1e6 = 1.50 × 1e6 = 1_500_000
@@ -849,7 +865,7 @@ mod tests {
         let body = s
             .sign_fak_buy(&token, &target, SignInputs { salt: 12345, timestamp_ms: 1 })
             .unwrap();
-        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(body.as_bytes()).unwrap();
         assert!(parsed["order"]["salt"].is_number(), "salt must be a JSON number");
         assert_eq!(parsed["order"]["salt"].as_u64(), Some(12345));
     }

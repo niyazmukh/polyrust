@@ -1,9 +1,8 @@
 //! L2 authentication header generation for Polymarket REST.
 //!
-//! Mirrors `auth.L2Auth.headers` in the Python reference. The signature is
-//! `HMAC-SHA256(secret_bytes, ts || method || path || body)`, base64-url
-//! encoded with no padding stripping (Python's `urlsafe_b64encode` keeps
-//! padding; we do the same so byte-identical signatures appear in tests).
+//! The signature is `HMAC-SHA256(secret_bytes, ts || method || path || body)`,
+//! base64-url encoded with padding. Tests compare against the current live
+//! Python implementation only to lock the wire format.
 //!
 //! Per-request timestamping means we cannot precompute the signature, but
 //! the secret-decoding step (base64-url with padding) is one-shot and
@@ -29,7 +28,7 @@ pub struct L2AuthSigner {
 impl L2AuthSigner {
     /// Construct from the standard Polymarket API credential triple. The
     /// secret is decoded as URL-safe base64 with optional missing padding,
-    /// matching `_b64_urlsafe_decode_padded` in the Python reference.
+    /// matching the credential format used by Polymarket API keys.
     pub fn new(
         api_key: impl Into<String>,
         passphrase: impl Into<String>,

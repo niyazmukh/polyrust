@@ -1,6 +1,6 @@
 //! Fixed-point integer newtypes for venue-facing math.
 //!
-//! Polymarket precision (per `fast_order_submitter.py`):
+//! Venue precision:
 //! * `PRICE_TICK`        = 0.01    (cents per share-price)
 //! * `SIZE_STEP`         = 0.01    (share quantum for SELL)
 //! * `MAKER_AMOUNT_STEP` = 0.01    (USDC quantum in maker amount)
@@ -86,6 +86,15 @@ impl PriceTick {
     pub const fn ticks(self) -> i32 {
         self.0
     }
+
+    /// Parse a venue decimal like "0.59" into a 1-cent tick.
+    /// Fails closed on sub-cent precision instead of rounding.
+    pub fn parse_decimal(raw: &str) -> Result<Self, TypeError> {
+        let ticks = parse_decimal_scaled(raw, PRICE_TICKS_PER_DOLLAR as i64)
+            .ok_or(TypeError::InvalidDecimal)?;
+        let ticks = i32::try_from(ticks).map_err(|_| TypeError::PriceOutOfRange { ticks: -1 })?;
+        Self::checked(ticks)
+    }
 }
 
 impl fmt::Display for PriceTick {
@@ -149,6 +158,12 @@ impl Shares2 {
 
     pub const fn units(self) -> i64 {
         self.0
+    }
+
+    /// Body amount in atoms (1e-6 share units). One Shares2 unit = 0.01
+    /// share = 10_000 atoms.
+    pub const fn to_atoms(self) -> SharesAtoms {
+        SharesAtoms(self.0.saturating_mul(10_000))
     }
 }
 
@@ -214,6 +229,16 @@ pub struct SharesAtoms(pub i64);
 impl SharesAtoms {
     pub const fn atoms(self) -> i64 {
         self.0
+    }
+
+    /// Parse a venue/user-WSS share decimal into 1e-6 share atoms.
+    /// Fails closed on sub-atom precision instead of rounding.
+    pub fn parse_decimal(raw: &str) -> Result<Self, TypeError> {
+        let atoms = parse_decimal_scaled(raw, ATOMS_PER_DOLLAR).ok_or(TypeError::InvalidDecimal)?;
+        if atoms < 0 {
+            return Err(TypeError::NegativeAmount);
+        }
+        Ok(Self(atoms))
     }
 }
 
@@ -331,6 +356,8 @@ impl TsUs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeError {
     PriceOutOfRange { ticks: i32 },
+    InvalidDecimal,
+    NegativeAmount,
 }
 
 impl fmt::Display for TypeError {
@@ -339,6 +366,8 @@ impl fmt::Display for TypeError {
             TypeError::PriceOutOfRange { ticks } => {
                 write!(f, "price_out_of_range ticks={ticks}")
             }
+            TypeError::InvalidDecimal => write!(f, "invalid_decimal"),
+            TypeError::NegativeAmount => write!(f, "negative_amount"),
         }
     }
 }
@@ -369,9 +398,8 @@ pub const fn gcd(mut a: i64, mut b: i64) -> i64 {
 /// produces an integer cent count (i.e., `price * size` is aligned to the
 /// 0.01 USDC maker step).
 ///
-/// Mirrors `_buy_size_multiple_for_amount_precision` in
-/// `fast_order_submitter.py`. With `price_step=0.01`, `taker_step=0.0001`,
-/// `maker_step=0.01`, the denominator is fixed at 10_000.
+/// With `price_step=0.01`, `taker_step=0.0001`, `maker_step=0.01`,
+/// the denominator is fixed at 10_000.
 pub const fn buy_size_multiple_taker_units(price_ticks: i32) -> i64 {
     let denom: i64 = 10_000;
     let g = gcd(price_ticks as i64, denom);
@@ -411,6 +439,58 @@ pub fn maker_cents_for(price_ticks: i32, size_taker_units: i64) -> Option<UsdcCe
     Some(UsdcCents(product / 10_000))
 }
 
+fn parse_decimal_scaled(raw: &str, scale: i64) -> Option<i64> {
+    let raw = raw.trim();
+    if raw.is_empty() || scale <= 0 {
+        return None;
+    }
+    let (sign, body) = match raw.as_bytes()[0] {
+        b'-' => (-1i64, &raw[1..]),
+        b'+' => (1i64, &raw[1..]),
+        _ => (1i64, raw),
+    };
+    let (whole_str, frac_str) = match body.find('.') {
+        Some(i) => (&body[..i], &body[i + 1..]),
+        None => (body, ""),
+    };
+    let whole = if whole_str.is_empty() {
+        0
+    } else {
+        whole_str.parse::<i64>().ok()?
+    };
+    let scale_digits = decimal_scale_digits(scale)?;
+    if frac_str.len() > scale_digits
+        && !frac_str[scale_digits..].chars().all(|c| c == '0')
+    {
+        return None;
+    }
+    let mut frac_padded = String::with_capacity(scale_digits);
+    let keep = frac_str.len().min(scale_digits);
+    frac_padded.push_str(&frac_str[..keep]);
+    while frac_padded.len() < scale_digits {
+        frac_padded.push('0');
+    }
+    let frac = if frac_padded.is_empty() {
+        0
+    } else {
+        frac_padded.parse::<i64>().ok()?
+    };
+    Some(sign * (whole.checked_mul(scale)? + frac))
+}
+
+fn decimal_scale_digits(scale: i64) -> Option<usize> {
+    let mut n = scale;
+    let mut digits = 0usize;
+    while n > 1 {
+        if n % 10 != 0 {
+            return None;
+        }
+        n /= 10;
+        digits += 1;
+    }
+    Some(digits)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,8 +504,8 @@ mod tests {
     }
 
     #[test]
-    fn multiples_match_python_reference() {
-        // Python `_buy_size_multiple_for_amount_precision` with default steps.
+    fn multiples_match_venue_precision_lattice() {
+        // Venue precision lattice with default steps.
         // p=0.50  -> multiple=200 taker units (=0.02 shares)
         // p=0.51  -> multiple=10000 taker units (=1.00 shares)
         // p=0.67  -> multiple=10000 taker units (=1.00 shares)
@@ -462,6 +542,14 @@ mod tests {
         assert!(PriceTick::checked(100).is_err());
         assert!(PriceTick::checked(1).is_ok());
         assert!(PriceTick::checked(99).is_ok());
+    }
+
+    #[test]
+    fn decimal_parsers_fail_closed() {
+        assert_eq!(PriceTick::parse_decimal("0.59"), Ok(PriceTick(59)));
+        assert!(PriceTick::parse_decimal("0.591").is_err());
+        assert_eq!(SharesAtoms::parse_decimal("1.416664"), Ok(SharesAtoms(1_416_664)));
+        assert!(SharesAtoms::parse_decimal("1.4166641").is_err());
     }
 
     #[test]

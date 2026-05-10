@@ -1,7 +1,11 @@
 # minirust
 
-Rust port of the minimal Polymarket/Binance bot. **Phase 1 + Phase 2** of
-`docs/RUST_SOTA_ARCHITECTURE_REFACTOR_PLAN.md` only.
+Minimal Rust Polymarket/Binance HFT runtime. This is not a Python port.
+Current scope covers fixed-point venue math, canonical FAK order sizing, L2
+auth, offline EIP-712 signing, direct REST submit classification,
+user-WSS inventory state, market-WSS quote state, and the narrow parsers
+needed to feed them. The signal model emits `Some(BuyIntent)` only; no BUY
+means `None`, not a separate non-buy event.
 
 ## What's here
 
@@ -14,29 +18,47 @@ minirust/
 │   ├── types.rs          ← fixed-point newtypes, no f64 in venue math
 │   ├── orders.rs         ← canonical_buy_target_for_notional + canonical_sell_params
 │   ├── config.rs         ← typed startup config with fail-closed validators
-│   └── logline.rs        ← compact key=value log writer (parses like Python `log_event`)
+│   ├── auth.rs           ← L2 auth header signing
+│   ├── signing.rs        ← offline EIP-712 FAK order signing
+│   ├── submit.rs         ← direct /order submit + response classifier
+│   ├── inventory.rs      ← WSS trade authority + UNKNOWN submit matching
+│   ├── user.rs           ← user-channel TRADE parser
+│   ├── market.rs         ← market-channel quote/resolution parser
+│   ├── state.rs          ← active market context + latest quotes only
+│   ├── signal.rs         ← pure Binance move + quote edge → optional BUY intent
+│   ├── binance.rs        ← narrow Binance book-ticker parser into signal samples
+│   ├── runtime.rs        ← thin parser/state/signal/inventory integration edges
+│   ├── logline.rs        ← compact key=value log writer
+│   └── main.rs           ← placeholder binary; feed executable pending
 └── tests/
     └── golden_canonical.rs ← BUY canonicalization golden table
 ```
 
-Pure stdlib — no dependencies. EIP-712 signing, REST submit, WSS feeds,
-runtime, and shadow mode are intentionally **not implemented yet** (Phases
-3–9 of the plan).
+`RuntimeCore` now accepts raw Polymarket market frames, raw user trade frames,
+and Binance bookTicker frames. The live WebSocket executable is still pending;
+unvalidated socket dependencies are not kept in the runtime tree.
 
-## Why this is the first concrete deliverable
+## Why These Modules Exist
 
-The plan's "First Concrete Implementation Task" is `types.rs` + `orders.rs`
-+ golden body tests. Reason (verbatim from the plan):
+Each module is present because it protects a live invariant or removes hot-path
+overhead:
 
-> The highest real risk is invalid signed venue bodies. It is isolated from
-> feed plumbing. It proves Rust can replace the Python/SDK signing boundary
-> without monkey patches. It prevents building a fast bot that submits bad
-> orders faster.
-
-Phase 3 (EIP-712 signing) bolts directly onto the canonical (price, size,
-maker_amount) triples produced by `canonical_buy_target_for_notional`.
-Locking those triples against Python first removes the most expensive
-class of bug.
+* `config.rs` parses live env once and builds typed signal/order policies.
+* `types.rs` and `orders.rs` prevent invalid venue bodies.
+* `signing.rs` signs locally without SDK network calls.
+* `submit.rs` submits directly and preserves UNKNOWN outcomes for WSS recovery.
+* `inventory.rs` makes user-WSS trades the only inventory authority.
+* `market.rs` and `state.rs` keep only active-market executable quotes.
+* `signal.rs` emits only actionable BUY intent; non-buy is `None`; the front
+  filter follows the old live Python model's paid-rent parts: 250ms-2s
+  microprice momentum with OFI and imbalance confirmation.
+* `binance.rs` parses only usable book-ticker fields into `BinanceSample`.
+* `runtime.rs` owns `RuntimeCore`, the small in-process owner of state,
+  inventory, signal, BUY policy, and max-position cap. It also connects parser,
+  state, signal, inventory checks, BUY submit lifecycle, and SELL submit
+  lifecycle without sockets or a god orchestrator.
+* `main.rs` is a placeholder binary. Feed IO lands only after the WebSocket
+  crate can be fetched and validated.
 
 ## Build / test
 
@@ -46,53 +68,84 @@ cargo test
 cargo clippy -- -D warnings
 ```
 
-A Rust toolchain (`stable-2024-04` or newer) is required. None was
-installed on the development machine where this scaffold was authored;
-the code is written to compile under stable Rust 1.78+ but has not been
-exercised through `cargo test` yet. **Before merging:** run the test suite
-and address any gaps.
+Rust 2024 edition is required. This is a new low-latency implementation,
+not a compatibility exercise for old compilers.
 
-## What changes vs the Python reference
+Shadow mode requires `.env.poly` plus explicit static market context:
 
-Behavioural identity is the design goal at this layer:
+```powershell
+$env:MINIMAL_DRY_RUN_ORDERS="true"
+$env:MINIRUST_MARKET_SLUG="btc-up-down-1m"
+$env:MINIRUST_CONDITION_ID="0x..."
+$env:MINIRUST_YES_TOKEN_ID="..."
+$env:MINIRUST_NO_TOKEN_ID="..."
+$env:MINIRUST_MARKET_START_TS="1777000000"
+$env:MINIRUST_MARKET_END_TS="1777000060"
+$env:MINIRUST_STRIKE_USD="100000"
+$env:MINIRUST_BINANCE_SYMBOL="BTCUSDT"
+cargo run --release
+```
 
-* `types::buy_size_multiple_taker_units(price_ticks)` matches Python
-  `_buy_size_multiple_for_amount_precision(price)` — verified by ratios
-  (50→200, 51→10000, 67→10000, 40→250).
-* `orders::canonical_buy_target_for_notional` returns the same
-  `(price, size, maker_amount)` tuple Python returns, including the
-  `Ceil`/`Floor` policy.
-* Maker amounts are computed as integer cents
-  (`price_ticks * size_taker_units / 10_000`) with explicit `None` when
-  not aligned, instead of Python's implicit Decimal rounding.
+## Runtime Invariants
+
+The design goal is not behavioural identity with the Python bot. The design
+goal is the smaller live invariant set:
+
+* Venue-facing values are fixed-point integers; no `f64` crosses the signed
+  body boundary.
+* BUY body sizing stays inside the configured notional band and venue minimum.
+* Maker amounts are computed as integer cents with explicit rejection when
+  not aligned.
+* User-WSS trade parsing feeds `Inventory`; HTTP matched submit is not a
+  second inventory ledger.
+* Market-WSS parsing updates `RuntimeState` quotes only for the active YES/NO
+  tokens; bare `price` changes do not become executable bid/ask quotes.
+* Binance book-ticker parsing rejects missing/invalid timestamps, prices, sizes,
+  and update IDs before samples enter the signal ring.
+* Startup config owns all signal thresholds and order sizing policy. Tests use
+  the same env-shaped parser instead of parallel hardcoded runtime defaults.
+* Shadow launch config is explicit and static: market slug, condition ID,
+  YES/NO token IDs, expiry, strike, and Binance symbol. Rust market discovery
+  is not implemented yet, so missing context fails startup instead of guessing.
+* Runtime BUY integration returns `Some(BuyIntent)` or `None`; inactive market,
+  missing quotes, weak signal/OFI/imbalance, existing token exposure, and
+  max-position cap do not become hot-path reason enums.
+* BUY submit lifecycle registers pending exposure before HTTP, maps Accepted /
+  Rejected / Unknown outcomes into inventory state, and keeps UNKNOWN WSS-bindable.
+* SELL submit lifecycle can use WSS-owned inventory or a trusted HTTP matched
+  size hint, floors to venue sellable quantum, signs a fresh FAK SELL at the
+  executable bid, and never predicts local balance.
+* Exit is not a profit gate. After a fill, runtime should fire fresh FAK SELLs
+  at the current executable bid while sellable inventory exists. Expected edge
+  belongs in the BUY decision before exposure is opened.
+* Signal evaluation returns a `BuyIntent` or `None`; non-buys are absence of
+  work, not hot-path log events.
+* Python golden cases remain only as regression oracles for already-live
+  venue-body precision until direct Rust live probes replace them.
 
 ## What is intentionally NOT here
 
-Per `docs/RUST_SOTA_ARCHITECTURE_REFACTOR_PLAN.md` "Non-Goals" and Phase
-gating:
+Per `docs/RUST_SOTA_ARCHITECTURE_REFACTOR_PLAN.md` non-goals:
 
-* No Tokio, no WSS, no HTTP yet.
-* No EIP-712 signing yet (Phase 3).
-* No runtime orchestrator (Phase 7).
+* No user-channel socket runtime yet.
+* No live-submit executable path yet.
 * No analyzer (off-runtime by doctrine).
 * No GTC/GTD support — FAK only by strategy invariant.
 
-## Phase progression
+## Implementation Slices
 
-| Phase | Status | Adds |
+| Slice | Status | Adds |
 |---|---|---|
-| 1 — types/config/logline skeleton | ✅ | `types.rs`, `config.rs`, `logline.rs` |
-| 2 — order body canonicalization | ✅ | `orders.rs` + golden tests |
-| 3a — L2 auth headers | ✅ | `auth.rs` (HMAC-SHA256, golden vs Python) |
-| 3b — EIP-712 order signing | ✅ inline (k256 + sha3 + primitive-types) | `signing.rs` |
-| 4 — direct HTTP submitter | ⬜ | classifier, pooled client, body validator |
-| 5 — WSS parsers + inventory | ⬜ | `inventory.rs`, market/user feeds |
-| 6 — Binance feed + signal | ⬜ | `binance.rs`, `signal.rs` |
-| 7 — runtime hot path | ⬜ | `runtime.rs`, `main.rs` |
-| 8 — shadow mode on EC2 | ⬜ | live feeds, no submits |
-| 9 — controlled live run | ⬜ | runtime-only deploy |
+| Fixed-point venue math | ✅ | `types.rs`, `orders.rs` |
+| Local signing/auth | ✅ | `auth.rs`, `signing.rs` |
+| Direct submit classifier | ✅ partial | `submit.rs`; live submit wiring still pending |
+| WSS parser/state authority | ✅ partial | `inventory.rs`, `user.rs`, `market.rs`, `state.rs` |
+| BUY-intent model | ✅ partial | `signal.rs`, `binance.rs`; Binance socket IO still pending |
+| Runtime hot path | ✅ partial | `runtime.rs`; HTTP submit call and user WSS still pending |
+| Shadow mode on EC2 | ⬜ | WebSocket IO crate fetch/build blocked locally |
+| Controlled live run | ⬜ | runtime-only deploy |
 
-### Phase 3b note: signing inline, no SDK at runtime
+### Signing Inline, No SDK At Runtime
 
 The official `polymarket_client_sdk_v2` crate exists but its order
 builder calls `tick_size`, `fee_rate_bps`, and `resolve_version`
@@ -111,12 +164,12 @@ and ECDSA signature locally and synchronously using only:
 * `primitive-types` — U256 / H160 / H256.
 
 The signing path takes no `await` and makes no network call. Runtime
-dep tree is 9 direct crates and ~99 transitive nodes.
+dep tree is intentionally kept small for the current slice.
 
 `signing::tests::signature_recovers_to_signer_address_*` exercises the
 full digest + sign + recover pipeline on canonical BUY and SELL bodies
 with a deterministic test private key (`0x0...001`) — fully offline,
 no `#[ignore]` gate.
 
-Each phase commits independently. No phase ships without the validators
-listed in the plan.
+No slice ships without `cargo test`, `cargo clippy -- -D warnings`, stale-term
+grep, and a runtime-scoped Graphify update.

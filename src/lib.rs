@@ -1,26 +1,43 @@
-//! `minirust` — Rust port of the minimal Polymarket/Binance bot.
+//! `minirust` — minimal Rust Polymarket/Binance HFT runtime.
 //!
-//! Phase coverage of `docs/RUST_SOTA_ARCHITECTURE_REFACTOR_PLAN.md`:
+//! Current runtime primitives:
 //!
 //! * `types`   — fixed-point integer newtypes; no `f64` in venue-facing math.
-//! * `orders`  — canonical BUY/SELL parameter selection that matches the
-//!   Python reference in `fast_order_submitter.py` byte-for-byte.
+//! * `orders`  — canonical BUY/SELL parameter selection for venue-valid FAK
+//!   bodies.
 //! * `auth`    — L2 auth headers (HMAC-SHA256), golden-locked vs Python.
 //! * `signing` — synchronous offline EIP-712 V2 order signing.
 //! * `config`  — typed startup config with fail-closed validators.
 //! * `logline` — structured key=value line logger for the hot path.
-//!
-//! Phases 4–9 (REST submit, WSS feeds, inventory, Binance/signal, runtime,
-//! shadow mode, live deploy) intentionally do not exist yet.
+//! * `submit`  — direct `/order` POST with L2 headers and typed signed body.
+//! * `user`    — user-channel trade parser feeding WSS-authoritative inventory.
+//! * `market`  — market-channel quote/resolution parser.
+//! * `state`   — active market context and latest quotes only.
+//! * `signal`  — pure Binance move to BUY-intent model; non-buy is `None`.
+//! * `binance` — narrow Binance book-ticker parser into signal samples.
+//! * `runtime` — thin integration edges; no god orchestrator.
 
+// Delivered by DeepSeek — new modules for feed IO, market discovery, anchor resolution.
+pub mod anchor;
 pub mod auth;
+pub mod binance;
 pub mod config;
+pub mod feed;
+pub mod gamma;
+pub mod inventory;
 pub mod logline;
+pub mod market;
 pub mod orders;
+pub mod runtime;
 pub mod signing;
+pub mod signal;
+pub mod state;
+pub mod submit;
 pub mod types;
+pub mod user;
+pub mod ws;
 
-/// Crate-wide error type for Phase 1+2.
+/// Crate-wide error type.
 ///
 /// Submit/feed phases will add their own error variants when introduced; we
 /// resist the urge to pre-design a unified error enum until concrete call
@@ -31,6 +48,8 @@ pub enum Error {
     BuyCanonical(orders::BuyCanonicalError),
     Auth(auth::AuthError),
     Signing(signing::SigningError),
+    Submit(submit::SubmitError),
+    Runtime(runtime::RuntimeError),
 }
 
 impl std::fmt::Display for Error {
@@ -40,6 +59,8 @@ impl std::fmt::Display for Error {
             Error::BuyCanonical(e) => write!(f, "buy_canonical: {e}"),
             Error::Auth(e) => write!(f, "auth: {e}"),
             Error::Signing(e) => write!(f, "signing: {e}"),
+            Error::Submit(e) => write!(f, "submit: {e}"),
+            Error::Runtime(e) => write!(f, "runtime: {e}"),
         }
     }
 }
@@ -67,5 +88,17 @@ impl From<auth::AuthError> for Error {
 impl From<signing::SigningError> for Error {
     fn from(value: signing::SigningError) -> Self {
         Error::Signing(value)
+    }
+}
+
+impl From<submit::SubmitError> for Error {
+    fn from(value: submit::SubmitError) -> Self {
+        Error::Submit(value)
+    }
+}
+
+impl From<runtime::RuntimeError> for Error {
+    fn from(value: runtime::RuntimeError) -> Self {
+        Error::Runtime(value)
     }
 }
