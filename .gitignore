@@ -12,3 +12,6 @@ GEMINI_REVIEW_REPORT.md
 TODO.md
 .graphifyignore
 /docs/
+
+# Tests
+/tests/
