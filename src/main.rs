@@ -130,18 +130,21 @@ async fn main() {
 
     if cfg.allow_live_orders {
         if submitter.is_none() {
-            logline::log_event(
-                Level::Error,
-                "live_submitter_missing",
-                &[Field { key: "reason", value: &"HttpSubmitter construction failed" }],
+            eprintln!(
+                "FATAL: live mode requires valid L2 auth \
+                 (POLY_API_KEY / POLY_API_SECRET / POLY_PASSPHRASE / POLY_ADDRESS)"
             );
+            std::process::exit(2);
         }
         if order_signer.is_none() {
-            logline::log_event(
-                Level::Error,
-                "live_signer_missing",
-                &[Field { key: "reason", value: &"OrderSigner construction failed — check POLY_PK" }],
+            eprintln!("FATAL: live mode requires valid OrderSigner (POLY_PK)");
+            std::process::exit(2);
+        }
+        if poly_api_key.is_empty() || poly_api_secret.is_empty() {
+            eprintln!(
+                "FATAL: live mode requires POLY_API_KEY and POLY_API_SECRET for user WSS"
             );
+            std::process::exit(2);
         }
         if let Some(sub) = &submitter {
             if let Err(e) = sub.verify_flat_start().await {
@@ -275,7 +278,7 @@ async fn main() {
                     let tte_us = market.end_ts.saturating_mul(1_000_000)
                         .saturating_sub(ts.micros());
 
-                    match c.on_binance_book_ticker(&raw, ts, tte_us) {
+                    match c.on_binance_sample(sample, ts, tte_us) {
                         Ok(Some(intent)) => Some(intent),
                         _ => None,
                     }
@@ -298,38 +301,55 @@ async fn main() {
                         );
                     } else {
                         // Live mode: fire-and-forget submit via spawn.
-                        // Traces to: bot_orchestrator.py on_binance_tick →
-                        //   armory.fire_entry() → FastOrderSubmitter.submit().
+                        // P0-2 fix: claim entry BEFORE spawn under the same
+                        // lock scope that will produce the intent check, so a
+                        // second Binance tick cannot pass
+                        // has_entry_exposure_or_pending between lock release
+                        // and the old register_submit inside the spawn.
                         if let (Some(sub), Some(sign)) = (sub.as_ref(), sign.as_ref()) {
+                            let ts_us = ts.micros();
+                            let (claim_id, policy) = {
+                                let mut c = match core.lock() {
+                                    Ok(c) => c,
+                                    Err(_) => return,
+                                };
+                                let policy = c.buy_submit_policy();
+                                // Use SharesAtoms(1) as placeholder — claim
+                                // blocks by token+Entry, not by size.
+                                let claim = c.inventory_mut().claim_entry(
+                                    intent.token.clone(),
+                                    minirust::types::OrderSide::Buy,
+                                    minirust::types::SharesAtoms(1),
+                                    ts_us,
+                                );
+                                (claim, policy)
+                            };
                             let sub = sub.clone();
                             let sign = sign.clone();
                             let core2 = core.clone();
                             let intent2 = intent.clone();
-                            let ts_us = ts.micros();
+                            let claim_id2 = claim_id.clone();
                             tokio::spawn(async move {
-                                let prepared = {
-                                    let mut c = match core2.lock() {
-                                        Ok(c) => c,
-                                        Err(_) => return,
-                                    };
-                                    let policy = c.buy_submit_policy();
-                                    match runtime::prepare_buy_submit(
-                                        &intent2,
-                                        policy,
-                                        &sign,
-                                        SignInputs { salt: id, timestamp_ms: now_ms() },
-                                        c.inventory_mut(),
-                                        ts_us,
-                                    ) {
-                                        Ok(p) => p,
-                                        Err(e) => {
-                                            logline::log_event(
-                                                Level::Error,
-                                                "buy_prepare_failed",
-                                                &[Field { key: "error", value: &e.to_string().as_str() }],
-                                            );
-                                            return;
+                                let prepared = match runtime::prepare_buy_submit(
+                                    &intent2,
+                                    policy,
+                                    &sign,
+                                    SignInputs { salt: id, timestamp_ms: now_ms() },
+                                    claim_id2,
+                                ) {
+                                    Ok(p) => p,
+                                    Err(e) => {
+                                        logline::log_event(
+                                            Level::Error,
+                                            "buy_prepare_failed",
+                                            &[Field { key: "error", value: &e.to_string().as_str() }],
+                                        );
+                                        // Release the claim so this token is
+                                        // unblocked for future BUYs.
+                                        if let Ok(mut c) = core2.lock() {
+                                            c.inventory_mut().release_claim(&claim_id);
                                         }
+                                        return;
                                     }
                                 };
 
@@ -713,25 +733,53 @@ async fn main() {
                             || m.slug != discovered.slug
                     });
                     if is_new {
-                        // Save token IDs for scope release before moving `discovered`.
-                        let yes = discovered.yes_token.clone();
-                        let no = discovered.no_token.clone();
+                        // P0-4: fail-closed if old tokens have nonzero inventory.
+                        // Dropping nonzero inventory blindly could leave unhedged
+                        // positions that the bot doesn't know about.
+                        let can_rotate = if let Some(old_market) = c.state_mut().market() {
+                            let old_yes = old_market.yes_token.clone();
+                            let old_no = old_market.no_token.clone();
+                            let yes_atoms = c.inventory_mut().owned_atoms(&old_yes).atoms();
+                            let no_atoms = c.inventory_mut().owned_atoms(&old_no).atoms();
+                            if yes_atoms > 0 || no_atoms > 0 {
+                                logline::log_event(
+                                    Level::Error,
+                                    "rotation_blocked_nonzero_inventory",
+                                    &[
+                                        Field { key: "yes_atoms", value: &yes_atoms },
+                                        Field { key: "no_atoms", value: &no_atoms },
+                                    ],
+                                );
+                                false
+                            } else {
+                                true
+                            }
+                        } else {
+                            true
+                        };
 
-                        logline::log_event(
-                            Level::Warn,
-                            "minirust_market_context",
-                            &[
-                                Field { key: "slug", value: &discovered.slug.as_str() },
-                                Field { key: "condition_id", value: &discovered.condition_id.as_str() },
-                                Field { key: "end_ts", value: &discovered.end_ts },
-                            ],
-                        );
-                        // Release old-market inventory and pending submits.
-                        // Traces to: bot_orchestrator.py:563 (tracker.release_market_scope).
-                        c.inventory_mut().release_market_scope([&yes, &no]);
-                        // Keep only quotes for the new market's tokens.
-                        c.state_mut().set_market(discovered);
-                        true
+                        if can_rotate {
+                            let yes = discovered.yes_token.clone();
+                            let no = discovered.no_token.clone();
+                            logline::log_event(
+                                Level::Warn,
+                                "minirust_market_context",
+                                &[
+                                    Field { key: "slug", value: &discovered.slug.as_str() },
+                                    Field { key: "condition_id", value: &discovered.condition_id.as_str() },
+                                    Field { key: "end_ts", value: &discovered.end_ts },
+                                ],
+                            );
+                            c.inventory_mut().release_market_scope([&yes, &no]);
+                            // P0-4: clear signal strike so the bot does not
+                            // trade using the previous market's strike until
+                            // the anchor resolves a new one.
+                            c.signal_mut().set_strike(0.0, false);
+                            c.state_mut().set_market(discovered);
+                            true
+                        } else {
+                            false
+                        }
                     } else {
                         false
                     }

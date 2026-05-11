@@ -200,6 +200,26 @@ impl Inventory {
         }
     }
 
+    /// Synchronous BUY claim: register a Pending entry submit before the
+    /// async spawn that does signing + HTTP. This closes the duplicate
+    /// race where intent is produced under lock but `register_submit`
+    /// happened inside the spawned task after lock release.
+    pub fn claim_entry(
+        &mut self,
+        token: TokenId,
+        side: OrderSide,
+        size_atoms: SharesAtoms,
+        now_ts_us: i64,
+    ) -> SubmitId {
+        self.register_submit(SubmitIntent::Entry, token, side, size_atoms, now_ts_us)
+    }
+
+    /// Release a claim on rejection/failure before HTTP submit. Removes
+    /// the pending entry so it no longer blocks same-token BUY.
+    pub fn release_claim(&mut self, id: &SubmitId) {
+        self.pending.remove(id);
+    }
+
     pub fn expire_unknowns(&mut self, older_than_ts_us: i64) {
         for p in self.pending.values_mut() {
             if (p.status == SubmitStatus::Unknown || p.status == SubmitStatus::Accepted) && p.updated_ts_us <= older_than_ts_us {

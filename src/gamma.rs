@@ -35,7 +35,11 @@ impl GammaClient {
             gamma_url: gamma_url.to_owned(),
             slug_fmt: slug_fmt.to_owned(),
             window_s,
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_millis(500))
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap_or_default(),
         }
     }
 

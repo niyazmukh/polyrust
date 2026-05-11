@@ -4,7 +4,7 @@
 //! proven call sites: Binance book-ticker frame -> signal sample -> optional
 //! BUY intent after current state and inventory risk checks.
 
-use crate::binance::{parse_book_ticker, BinanceParseError};
+use crate::binance::BinanceParseError;
 use crate::config::{Config, ConfigError};
 use crate::inventory::{Inventory, SubmitId, SubmitIntent};
 use crate::market::{apply_market_events, parse_market_events, MarketParseError};
@@ -135,14 +135,14 @@ impl RuntimeCore {
         self.max_open_positions
     }
 
-    pub fn on_binance_book_ticker(
+    pub fn on_binance_sample(
         &mut self,
-        raw: &[u8],
+        sample: crate::signal::BinanceSample,
         now: TsUs,
         tte_us: i64,
     ) -> Result<Option<BuyIntent>, RuntimeError> {
-        on_binance_book_ticker(
-            raw,
+        on_binance_sample(
+            sample,
             &mut self.signal,
             &self.state,
             &self.inventory,
@@ -202,8 +202,8 @@ impl RuntimeCore {
     }
 }
 
-pub fn on_binance_book_ticker(
-    raw: &[u8],
+pub fn on_binance_sample(
+    sample: crate::signal::BinanceSample,
     signal: &mut SignalEngine,
     state: &RuntimeState,
     inventory: &Inventory,
@@ -211,12 +211,6 @@ pub fn on_binance_book_ticker(
     tte_us: i64,
     max_open_positions: usize,
 ) -> Result<Option<BuyIntent>, RuntimeError> {
-    let Some(ticker) = parse_book_ticker(raw)? else {
-        return Ok(None);
-    };
-    let Some(sample) = ticker.sample() else {
-        return Ok(None);
-    };
     if !state.trading_active() {
         signal.push(sample);
         return Ok(None);
@@ -247,13 +241,19 @@ pub fn on_binance_book_ticker(
     Ok(Some(intent))
 }
 
+/// Prepare a BUY submit using a pre-claimed `SubmitId`.
+///
+/// The claim must have been registered via `inventory.claim_entry()`
+/// **before** the async spawn, under the same lock that produced the
+/// `BuyIntent`. This closes the duplicate race where a second intent
+/// could pass `has_entry_exposure_or_pending` between the first
+/// intent's lock release and `register_submit` inside the spawn.
 pub fn prepare_buy_submit(
     intent: &BuyIntent,
     policy: BuySubmitPolicy,
     signer: &OrderSigner,
     sign_inputs: SignInputs,
-    inventory: &mut Inventory,
-    now_ts_us: i64,
+    claim_id: SubmitId,
 ) -> Result<PreparedBuySubmit, RuntimeError> {
     let target = canonical_buy_target_for_notional(BuyCanonicalInput {
         price: intent.limit,
@@ -264,15 +264,8 @@ pub fn prepare_buy_submit(
         max_overrun_bps: policy.max_overrun_bps,
     })?;
     let body = signer.sign_fak_buy(&intent.token, &target, sign_inputs)?;
-    let submit_id = inventory.register_submit(
-        SubmitIntent::Entry,
-        intent.token.clone(),
-        OrderSide::Buy,
-        target.size.to_atoms(),
-        now_ts_us,
-    );
     Ok(PreparedBuySubmit {
-        submit_id,
+        submit_id: claim_id,
         target,
         body,
     })

@@ -142,6 +142,15 @@ impl HttpSubmitter {
 
     /// Retrieve positions to ensure the bot starts with a flat inventory.
     /// This prevents risk overlap across restarts.
+    ///
+    /// P0-3 hardening: fail-closed on any response that is not a JSON
+    /// array. Parse both string and numeric `size` values. Reject any
+    /// position whose size parses to a non-zero positive number.
+    ///
+    /// NOTE: This does NOT check open orders (`GET /data/orders`).
+    /// A resting limit order from a prior session could fill after this
+    /// check passes. Live operators should manually cancel open orders
+    /// before starting the bot.
     pub async fn verify_flat_start(&self) -> Result<(), String> {
         let ts = (self.now_secs)();
         let url = format!("{}/positions", self.base_url);
@@ -155,18 +164,40 @@ impl HttpSubmitter {
             return Err(format!("flat_start API error: {}", resp.status()));
         }
         let body = resp.text().await.map_err(|e| format!("flat_start read: {e}"))?;
-        if let Ok(Value::Array(positions)) = serde_json::from_str::<Value>(&body) {
-            let mut count = 0;
-            for p in positions {
-                if let Some(size) = p.get("size").and_then(|v| v.as_str()) {
-                    if size != "0" && size != "0.0" && size != "0.00" && !size.starts_with('-') {
-                        count += 1;
-                    }
+        let value: Value = serde_json::from_str(&body)
+            .map_err(|e| format!("flat_start json parse: {e}"))?;
+
+        // P0-3: fail-closed if response is not a JSON array.
+        let positions = match value {
+            Value::Array(arr) => arr,
+            _ => return Err(format!("flat_start unexpected schema: expected array, got: {}", body.chars().take(200).collect::<String>())),
+        };
+
+        let mut nonzero_count = 0;
+        for p in &positions {
+            let has_nonzero = match p.get("size") {
+                // String: parse as f64 to catch "0.000001" or "1.416664"
+                Some(Value::String(s)) => {
+                    s.parse::<f64>()
+                        .map(|v| v.abs() > 0.0 && v.is_finite())
+                        .unwrap_or(false)
                 }
+                // Numeric: check directly
+                Some(Value::Number(n)) => {
+                    n.as_f64().map(|v| v.abs() > 0.0 && v.is_finite()).unwrap_or(false)
+                }
+                // Missing or other type: not a violation
+                _ => false,
+            };
+            if has_nonzero {
+                nonzero_count += 1;
             }
-            if count > 0 {
-                return Err(format!("flat_start violation: nonzero positions found"));
-            }
+        }
+
+        if nonzero_count > 0 {
+            return Err(format!(
+                "flat_start violation: {} nonzero position(s) found", nonzero_count
+            ));
         }
         Ok(())
     }

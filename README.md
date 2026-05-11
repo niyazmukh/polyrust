@@ -29,14 +29,14 @@ minirust/
 │   ├── binance.rs        ← narrow Binance book-ticker parser into signal samples
 │   ├── runtime.rs        ← thin parser/state/signal/inventory integration edges
 │   ├── logline.rs        ← compact key=value log writer
-│   └── main.rs           ← placeholder binary; feed executable pending
+│   └── main.rs           ← primary binary integrating WS feeds and trading loop
 └── tests/
     └── golden_canonical.rs ← BUY canonicalization golden table
 ```
 
-`RuntimeCore` now accepts raw Polymarket market frames, raw user trade frames,
-and Binance bookTicker frames. The live WebSocket executable is still pending;
-unvalidated socket dependencies are not kept in the runtime tree.
+`RuntimeCore` accepts parsed Polymarket market frames, user trade frames,
+and Binance bookTicker samples. It is driven by the fully integrated feed orchestrator
+in `main.rs`.
 
 ## Why These Modules Exist
 
@@ -54,11 +54,12 @@ overhead:
   microprice momentum with OFI and imbalance confirmation.
 * `binance.rs` parses only usable book-ticker fields into `BinanceSample`.
 * `runtime.rs` owns `RuntimeCore`, the small in-process owner of state,
-  inventory, signal, BUY policy, and max-position cap. It also connects parser,
+  inventory, signal, BUY policy, and max-position cap. It connects parser,
   state, signal, inventory checks, BUY submit lifecycle, and SELL submit
-  lifecycle without sockets or a god orchestrator.
-* `main.rs` is a placeholder binary. Feed IO lands only after the WebSocket
-  crate can be fetched and validated.
+  lifecycle.
+* `main.rs` is the primary executable orchestrating the 3 WebSocket feeds
+  (Polymarket market, user, and Binance ticker), periodic maintenance,
+  and executing submit tasks.
 
 ## Build / test
 
@@ -127,8 +128,6 @@ goal is the smaller live invariant set:
 
 Per `docs/RUST_SOTA_ARCHITECTURE_REFACTOR_PLAN.md` non-goals:
 
-* No user-channel socket runtime yet.
-* No live-submit executable path yet.
 * No analyzer (off-runtime by doctrine).
 * No GTC/GTD support — FAK only by strategy invariant.
 
@@ -138,10 +137,10 @@ Per `docs/RUST_SOTA_ARCHITECTURE_REFACTOR_PLAN.md` non-goals:
 |---|---|---|
 | Fixed-point venue math | ✅ | `types.rs`, `orders.rs` |
 | Local signing/auth | ✅ | `auth.rs`, `signing.rs` |
-| Direct submit classifier | ✅ partial | `submit.rs`; live submit wiring still pending |
-| WSS parser/state authority | ✅ partial | `inventory.rs`, `user.rs`, `market.rs`, `state.rs` |
-| BUY-intent model | ✅ partial | `signal.rs`, `binance.rs`; Binance socket IO still pending |
-| Runtime hot path | ✅ partial | `runtime.rs`; HTTP submit call and user WSS still pending |
+| Direct submit classifier | ✅ | `submit.rs`; full live submit wiring in `main.rs` |
+| WSS parser/state authority | ✅ | `inventory.rs`, `user.rs`, `market.rs`, `state.rs` |
+| BUY-intent model | ✅ | `signal.rs`, `binance.rs`; fully integrated on hot path |
+| Runtime hot path | ✅ | `runtime.rs`, `main.rs` |
 | Shadow mode on EC2 | ⬜ | WebSocket IO crate fetch/build blocked locally |
 | Controlled live run | ⬜ | runtime-only deploy |
 

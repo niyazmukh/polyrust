@@ -8,8 +8,7 @@ use std::fmt;
 
 use crate::runtime::BuySubmitPolicy;
 use crate::signal::SignalConfig;
-use crate::state::MarketContext;
-use crate::types::{ConditionId, PriceTick, TokenId};
+use crate::types::PriceTick;
 
 /// Fully validated, frozen configuration.
 #[derive(Clone, Debug, PartialEq)]
@@ -394,20 +393,6 @@ fn required_string(
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty())
         .ok_or(ConfigError::Missing { name })
-}
-
-fn required_i64(
-    lookup: &mut impl FnMut(&str) -> Option<String>,
-    name: &'static str,
-) -> Result<i64, ConfigError> {
-    env_i64_lookup(lookup, name).ok_or(ConfigError::Missing { name })
-}
-
-fn required_f64(
-    lookup: &mut impl FnMut(&str) -> Option<String>,
-    name: &'static str,
-) -> Result<f64, ConfigError> {
-    env_f64_lookup(lookup, name).ok_or(ConfigError::Missing { name })
 }
 
 /// Parse a decimal env var like "1.01" or "0.55" into integer cents (i64).
