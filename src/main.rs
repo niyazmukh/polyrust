@@ -26,7 +26,7 @@ use minirust::gamma::GammaClient;
 use minirust::logline::{self, Field, Level};
 use minirust::runtime::{self, RuntimeCore};
 use minirust::signing::{
-    OrderSigner, SignInputs, SignatureKind, EXCHANGE_V2_NORMAL, POLYGON_CHAIN_ID,
+    OrderSigner, SignInputs, EXCHANGE_V2_NORMAL, POLYGON_CHAIN_ID,
 };
 use minirust::submit::HttpSubmitter;
 use minirust::types::TsUs;
@@ -118,8 +118,8 @@ async fn main() {
         OrderSigner::new(
             &poly_pk,
             &poly_api_key,
-            None, // EOA: funder is None, maker = signer
-            SignatureKind::Eoa,
+            launch.poly_funder.as_deref().and_then(|f| f.parse().ok()),
+            launch.poly_signature_kind,
             POLYGON_CHAIN_ID,
             EXCHANGE_V2_NORMAL,
         )
@@ -140,21 +140,21 @@ async fn main() {
             eprintln!("FATAL: live mode requires valid OrderSigner (POLY_PK)");
             std::process::exit(2);
         }
-        if poly_api_key.is_empty() || poly_api_secret.is_empty() {
+        if poly_api_key.is_empty() || poly_api_secret.is_empty() || poly_passphrase.is_empty() || poly_address.is_empty() {
             eprintln!(
-                "FATAL: live mode requires POLY_API_KEY and POLY_API_SECRET for user WSS"
+                "FATAL: live mode requires POLY_API_KEY, POLY_API_SECRET, POLY_PASSPHRASE, and POLY_ADDRESS for user WSS and L2 Auth"
             );
             std::process::exit(2);
         }
-        if let Some(sub) = &submitter {
-            if let Err(e) = sub.verify_flat_start().await {
-                logline::log_event(
-                    Level::Error,
-                    "ensure_flat_start_failed",
-                    &[Field { key: "reason", value: &e }],
-                );
-                std::process::exit(3);
-            }
+        if let Some(sub) = &submitter
+            && let Err(e) = sub.verify_flat_start().await
+        {
+            logline::log_event(
+                Level::Error,
+                "ensure_flat_start_failed",
+                &[Field { key: "reason", value: &e }],
+            );
+            std::process::exit(3);
         }
     }
 
@@ -424,7 +424,22 @@ async fn main() {
                             Err(_) => return,
                         };
                         let ts = now_us();
-                        let _ = c.apply_user_raw(&raw, ts);
+                        match c.apply_user_raw(&raw, ts) {
+                            Ok(minirust::user::UserMessage::AuthSuccess) => {
+                                c.inventory_mut().set_user_wss_trusted(true);
+                                logline::log_event(Level::Info, "user_wss_auth_success", &[]);
+                            }
+                            Ok(minirust::user::UserMessage::AuthError(msg)) => {
+                                c.inventory_mut().set_user_wss_trusted(false);
+                                logline::log_event(Level::Error, "user_wss_auth_error", &[Field { key: "msg", value: &msg }]);
+                            }
+                            Err(e) => {
+                                let err_msg = format!("{e:?}");
+                                c.inventory_mut().set_user_wss_trusted(false);
+                                logline::log_event(Level::Error, "user_wss_parse_failed", &[Field { key: "err", value: &err_msg }]);
+                            }
+                            Ok(_) => {}
+                        }
 
                         // Check sellable inventory after trade update.
                         // WSS authority: trade events own inventory.

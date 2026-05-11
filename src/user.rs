@@ -10,6 +10,14 @@ use crate::inventory::{TradeStatus, UserTrade};
 use crate::types::{OrderId, OrderSide, PriceTick, SharesAtoms, TokenId, TradeId, TypeError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserMessage {
+    Trades(Vec<UserTrade>),
+    AuthSuccess,
+    AuthError(String),
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UserParseError {
     InvalidJson(String),
     MissingField(&'static str),
@@ -32,9 +40,19 @@ impl std::fmt::Display for UserParseError {
 
 impl std::error::Error for UserParseError {}
 
-pub fn parse_user_trades(raw: &[u8], ts_us: i64) -> Result<Vec<UserTrade>, UserParseError> {
+pub fn parse_user_message(raw: &[u8], ts_us: i64) -> Result<UserMessage, UserParseError> {
     let value: Value =
         serde_json::from_slice(raw).map_err(|e| UserParseError::InvalidJson(format!("{e}")))?;
+
+    if let Some(event) = optional_str(&value, &["event_type", "eventType", "event", "type"]) {
+        if event.eq_ignore_ascii_case("error") {
+            let msg = optional_str(&value, &["message", "msg"]).unwrap_or("unknown error").to_owned();
+            return Ok(UserMessage::AuthError(msg));
+        } else if event.eq_ignore_ascii_case("success") {
+            return Ok(UserMessage::AuthSuccess);
+        }
+    }
+
     let mut out = Vec::new();
     match value {
         Value::Array(items) => {
@@ -50,7 +68,11 @@ pub fn parse_user_trades(raw: &[u8], ts_us: i64) -> Result<Vec<UserTrade>, UserP
             }
         }
     }
-    Ok(out)
+    if out.is_empty() {
+        Ok(UserMessage::Other)
+    } else {
+        Ok(UserMessage::Trades(out))
+    }
 }
 
 fn parse_trade_value(value: &Value, fallback_ts_us: i64) -> Result<Option<UserTrade>, UserParseError> {
@@ -132,7 +154,8 @@ mod tests {
             "status":"MATCHED",
             "ts_us":1778087750526774
         }"#;
-        let trades = parse_user_trades(raw, 1).unwrap();
+        let msg = parse_user_message(raw, 1).unwrap();
+        let trades = match msg { UserMessage::Trades(t) => t, _ => panic!("expected trades") };
         assert_eq!(trades.len(), 1);
         let t = &trades[0];
         assert_eq!(t.trade_id.as_str(), "tr1");
@@ -150,7 +173,8 @@ mod tests {
             {"event_type":"order","id":"o1"},
             {"event_type":"trade","id":"tr1","asset_id":"123","side":"SELL","size":"0.010000","price":"0.87","status":"CONFIRMED"}
         ]"#;
-        let trades = parse_user_trades(raw, 42).unwrap();
+        let msg = parse_user_message(raw, 42).unwrap();
+        let trades = match msg { UserMessage::Trades(t) => t, _ => panic!("expected trades") };
         assert_eq!(trades.len(), 1);
         assert_eq!(trades[0].side, OrderSide::Sell);
         assert_eq!(trades[0].size_atoms, SharesAtoms(10_000));
@@ -163,13 +187,13 @@ mod tests {
     fn rejects_sub_atom_size_and_sub_cent_price() {
         let raw = br#"{"event_type":"trade","id":"tr1","asset_id":"123","side":"BUY","size":"1.0000001","price":"0.59"}"#;
         assert!(matches!(
-            parse_user_trades(raw, 1),
+            parse_user_message(raw, 1),
             Err(UserParseError::InvalidSize(_))
         ));
 
         let raw = br#"{"event_type":"trade","id":"tr1","asset_id":"123","side":"BUY","size":"1.000000","price":"0.591"}"#;
         assert!(matches!(
-            parse_user_trades(raw, 1),
+            parse_user_message(raw, 1),
             Err(UserParseError::InvalidPrice(_))
         ));
     }

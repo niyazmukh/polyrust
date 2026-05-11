@@ -147,10 +147,9 @@ impl HttpSubmitter {
     /// array. Parse both string and numeric `size` values. Reject any
     /// position whose size parses to a non-zero positive number.
     ///
-    /// NOTE: This does NOT check open orders (`GET /data/orders`).
-    /// A resting limit order from a prior session could fill after this
-    /// check passes. Live operators should manually cancel open orders
-    /// before starting the bot.
+    /// Verifies the account has a perfectly flat inventory before starting.
+    /// It queries `GET /positions` and `GET /orders` and fails closed if
+    /// any nonzero sizes or resting limit orders are found.
     pub async fn verify_flat_start(&self) -> Result<(), String> {
         let ts = (self.now_secs)();
         let url = format!("{}/positions", self.base_url);
@@ -199,6 +198,34 @@ impl HttpSubmitter {
                 "flat_start violation: {} nonzero position(s) found", nonzero_count
             ));
         }
+
+        // Check for resting open orders.
+        let ts2 = (self.now_secs)();
+        let orders_url = format!("{}/orders?status=OPEN", self.base_url);
+        let mut req2 = self.client.get(&orders_url);
+        let headers2 = self.auth.headers("GET", "/orders?status=OPEN", b"", ts2);
+        for (name, value) in headers2.as_pairs() {
+            req2 = req2.header(name, value);
+        }
+        let resp2 = req2.send().await.map_err(|e| format!("flat_start orders http: {e}"))?;
+        if !resp2.status().is_success() {
+            return Err(format!("flat_start orders API error: {}", resp2.status()));
+        }
+        let body2 = resp2.text().await.map_err(|e| format!("flat_start orders read: {e}"))?;
+        let value2: Value = serde_json::from_str(&body2)
+            .map_err(|e| format!("flat_start orders json parse: {e}"))?;
+
+        let orders = match value2 {
+            Value::Array(arr) => arr,
+            _ => return Err(format!("flat_start orders unexpected schema: expected array, got: {}", body2.chars().take(200).collect::<String>())),
+        };
+
+        if !orders.is_empty() {
+            return Err(format!(
+                "flat_start violation: {} open order(s) found. Cancel them manually.", orders.len()
+            ));
+        }
+
         Ok(())
     }
 

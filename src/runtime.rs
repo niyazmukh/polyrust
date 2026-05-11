@@ -17,7 +17,7 @@ use crate::signing::{OrderSigner, SignInputs, SignedFakOrderBody, SigningError};
 use crate::state::RuntimeState;
 use crate::submit::SubmitOutcome;
 use crate::types::{OrderId, OrderSide, OutcomeSide, PriceTick, Shares2, SharesAtoms, TokenId, TsUs};
-use crate::user::{parse_user_trades, UserParseError};
+use crate::user::{parse_user_message, UserMessage, UserParseError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeError {
@@ -157,13 +157,14 @@ impl RuntimeCore {
         Ok(apply_market_events(&events, &mut self.state, ts_us))
     }
 
-    pub fn apply_user_raw(&mut self, raw: &[u8], ts_us: i64) -> Result<usize, RuntimeError> {
-        let trades = parse_user_trades(raw, ts_us)?;
-        let count = trades.len();
-        for trade in trades {
-            self.inventory.apply_user_trade(trade);
+    pub fn apply_user_raw(&mut self, raw: &[u8], ts_us: i64) -> Result<UserMessage, RuntimeError> {
+        let msg = parse_user_message(raw, ts_us)?;
+        if let UserMessage::Trades(ref trades) = msg {
+            for trade in trades {
+                self.inventory.apply_user_trade(trade.clone());
+            }
         }
-        Ok(count)
+        Ok(msg)
     }
 
     // Delivered by DeepSeek — sell convenience methods.

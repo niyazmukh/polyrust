@@ -142,6 +142,7 @@ pub struct PositionView {
 
 #[derive(Clone, Debug, Default)]
 pub struct Inventory {
+    user_wss_trusted: bool,
     next_submit_id: u64,
     owned_by_token: HashMap<TokenId, i64>,
     trades: HashMap<TradeId, TradeRecord>,
@@ -151,6 +152,14 @@ pub struct Inventory {
 impl Inventory {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn set_user_wss_trusted(&mut self, trusted: bool) {
+        self.user_wss_trusted = trusted;
+    }
+
+    pub fn is_user_wss_trusted(&self) -> bool {
+        self.user_wss_trusted
     }
 
     pub fn register_submit(
@@ -222,7 +231,7 @@ impl Inventory {
 
     pub fn expire_unknowns(&mut self, older_than_ts_us: i64) {
         for p in self.pending.values_mut() {
-            if (p.status == SubmitStatus::Unknown || p.status == SubmitStatus::Accepted) && p.updated_ts_us <= older_than_ts_us {
+            if p.status == SubmitStatus::Unknown && p.updated_ts_us <= older_than_ts_us {
                 p.status = SubmitStatus::ExpiredUnknown;
             }
         }
@@ -293,6 +302,9 @@ impl Inventory {
     }
 
     pub fn has_entry_exposure_or_pending(&self, token: &TokenId) -> bool {
+        if !self.user_wss_trusted {
+            return true;
+        }
         self.owned_atoms(token).atoms() > 0
             || self.pending.values().any(|p| {
                 p.intent == SubmitIntent::Entry
@@ -448,6 +460,7 @@ mod tests {
     #[test]
     fn unknown_submit_matches_late_wss_trade_and_blocks_until_expired() {
         let mut inv = Inventory::new();
+        inv.set_user_wss_trusted(true);
         let t = token("asset");
         let id = inv.register_submit(
             SubmitIntent::Entry,

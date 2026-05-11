@@ -66,6 +66,8 @@ pub struct LaunchConfig {
     /// Gamma REST API base URL for market discovery.
     /// Traces to: http_client.py:55 (gamma_get_event_by_slug).
     pub gamma_url: String,
+    pub poly_signature_kind: crate::signing::SignatureKind,
+    pub poly_funder: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -322,6 +324,17 @@ impl LaunchConfig {
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| "https://gamma-api.polymarket.com".to_owned());
 
+        let poly_signature_kind_str = lookup("POLY_SIGNATURE_KIND")
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "EOA".to_owned());
+        let poly_signature_kind = match poly_signature_kind_str.to_ascii_uppercase().as_str() {
+            "POLYGON_GNO_SAFE" | "POLY_GNOSIS_SAFE" => crate::signing::SignatureKind::PolyGnosisSafe,
+            "POLY_PROXY" => crate::signing::SignatureKind::PolyProxy,
+            _ => crate::signing::SignatureKind::Eoa,
+        };
+
+        let poly_funder = lookup("POLY_FUNDER").filter(|s| !s.trim().is_empty());
+
         Ok(Self {
             binance_ws_url,
             poly_market_ws_url,
@@ -330,6 +343,8 @@ impl LaunchConfig {
             market_window_s,
             clob_url,
             gamma_url,
+            poly_signature_kind,
+            poly_funder,
         })
     }
 }
@@ -528,17 +543,13 @@ mod tests {
     }
 
     #[test]
-    fn launch_config_requires_static_market_and_builds_official_stream_urls() {
+    fn launch_config_loads_properly() {
         let launch = LaunchConfig::from_lookup(|name| {
             HashMap::from([
-                ("MINIRUST_MARKET_SLUG", "btc-up-down-1m"),
-                ("MINIRUST_CONDITION_ID", "0xcond"),
-                ("MINIRUST_YES_TOKEN_ID", "yes"),
-                ("MINIRUST_NO_TOKEN_ID", "no"),
-                ("MINIRUST_MARKET_START_TS", "1777000000"),
-                ("MINIRUST_MARKET_END_TS", "1777000060"),
-                ("MINIRUST_STRIKE_USD", "100000"),
+                ("MINIRUST_MARKET_SLUG_FMT", "btc-up-down-1m-{ts}"),
                 ("MINIRUST_BINANCE_SYMBOL", "BTCUSDT"),
+                ("POLY_SIGNATURE_KIND", "POLYGON_GNO_SAFE"),
+                ("POLY_FUNDER", "0xabc"),
             ])
             .get(name)
             .map(|s| (*s).to_owned())
@@ -553,6 +564,8 @@ mod tests {
             launch.poly_market_ws_url,
             "wss://ws-subscriptions-clob.polymarket.com/ws/market"
         );
+        assert_eq!(launch.poly_signature_kind, crate::signing::SignatureKind::PolyGnosisSafe);
+        assert_eq!(launch.poly_funder, Some("0xabc".to_owned()));
     }
 
     #[test]

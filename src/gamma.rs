@@ -205,27 +205,26 @@ impl GammaClient {
 /// Parse `clobTokenIds` and `outcomes` from Gamma's JSON representation.
 fn parse_clob_tokens(value: &Value, outcomes: Option<&Value>) -> Option<Vec<ClobToken>> {
     // try object array first (case 4 logic)
-    if let Some(arr) = value.as_array() {
-        if arr.first().and_then(|v| v.as_object()).is_some() {
-            return Some(parse_token_objects(arr));
-        }
+    if let Some(arr) = value.as_array()
+        && arr.first().and_then(|v| v.as_object()).is_some()
+    {
+        return Some(parse_token_objects(arr));
     }
-    if let Some(raw) = value.as_str() {
-        if let Ok(parsed) = serde_json::from_str::<Vec<Value>>(raw) {
-            if parsed.first().and_then(|v| v.as_object()).is_some() {
-                return Some(parse_token_objects(&parsed));
-            }
-        }
+    if let Some(raw) = value.as_str()
+        && let Ok(parsed) = serde_json::from_str::<Vec<Value>>(raw)
+        && parsed.first().and_then(|v| v.as_object()).is_some()
+    {
+        return Some(parse_token_objects(&parsed));
     }
 
     let parse_str_array = |v: &Value| -> Option<Vec<String>> {
         if let Some(arr) = v.as_array() {
             return Some(arr.iter().filter_map(|s| s.as_str().map(|s| s.to_owned())).collect());
         }
-        if let Some(s) = v.as_str() {
-            if let Ok(p) = serde_json::from_str::<Vec<String>>(s) {
-                return Some(p);
-            }
+        if let Some(s) = v.as_str()
+            && let Ok(p) = serde_json::from_str::<Vec<String>>(s)
+        {
+            return Some(p);
         }
         None
     };

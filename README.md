@@ -105,9 +105,8 @@ goal is the smaller live invariant set:
   and update IDs before samples enter the signal ring.
 * Startup config owns all signal thresholds and order sizing policy. Tests use
   the same env-shaped parser instead of parallel hardcoded runtime defaults.
-* Shadow launch config is explicit and static: market slug, condition ID,
-  YES/NO token IDs, expiry, strike, and Binance symbol. Rust market discovery
-  is not implemented yet, so missing context fails startup instead of guessing.
+* Shadow launch config uses dynamic market discovery via Gamma to fetch market slug, condition ID,
+  YES/NO token IDs, expiry, and strike on startup.
 * Runtime BUY integration returns `Some(BuyIntent)` or `None`; inactive market,
   missing quotes, weak signal/OFI/imbalance, existing token exposure, and
   max-position cap do not become hot-path reason enums.
@@ -149,8 +148,8 @@ Per `docs/RUST_SOTA_ARCHITECTURE_REFACTOR_PLAN.md` non-goals:
 The official `polymarket_client_sdk_v2` crate exists but its order
 builder calls `tick_size`, `fee_rate_bps`, and `resolve_version`
 against the live CLOB *before* producing a signable body. That defeats
-this bot's pre-signing architecture (Binance tick → cached signed body
-→ submit, with the EIP-712 + secp256k1 cost paid off the hot path).
+this bot's low-latency architecture (Binance tick → sign FAK order on-demand
+→ submit, with the ~100μs EIP-712 + secp256k1 cost paid concurrently).
 
 We instead read the V2 schema from the SDK source as a reference (the
 schema is fixed by the on-chain `CTFExchange` V2 contract; copying it
