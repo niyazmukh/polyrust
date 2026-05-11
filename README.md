@@ -72,18 +72,21 @@ cargo clippy -- -D warnings
 Rust 2024 edition is required. This is a new low-latency implementation,
 not a compatibility exercise for old compilers.
 
-Shadow mode requires `.env.poly` plus explicit static market context:
+Shadow mode requires `.env.poly` with Gamma dynamic discovery, Binance symbol,
+and the standard signal/sizing env vars. Market context (slug, token IDs, strike)
+is discovered dynamically from the Gamma API at startup and on rotation.
+
+Shadow mode ALSO requires Polymarket user-channel credentials
+(`POLY_API_KEY` / `POLY_API_SECRET`) — the bot gates BUY signals on
+authenticated user WSS inventory truth, even in dry-run. Without them,
+no BUY signals will fire.
 
 ```powershell
 $env:MINIMAL_DRY_RUN_ORDERS="true"
-$env:MINIRUST_MARKET_SLUG="btc-up-down-1m"
-$env:MINIRUST_CONDITION_ID="0x..."
-$env:MINIRUST_YES_TOKEN_ID="..."
-$env:MINIRUST_NO_TOKEN_ID="..."
-$env:MINIRUST_MARKET_START_TS="1777000000"
-$env:MINIRUST_MARKET_END_TS="1777000060"
-$env:MINIRUST_STRIKE_USD="100000"
+$env:MINIRUST_MARKET_SLUG_FMT="btc-updown-5m-{ts}"
 $env:MINIRUST_BINANCE_SYMBOL="BTCUSDT"
+$env:POLY_API_KEY="..."
+$env:POLY_API_SECRET="..."
 cargo run --release
 ```
 

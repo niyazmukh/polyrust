@@ -264,6 +264,8 @@ async fn main() {
                 // has_entry_exposure_or_pending checks the claim so a second
                 // Binance tick cannot slip in between intent production and
                 // claim registration.
+                // NOTE: dry-run does NOT claim — shadow mode must not create
+                // fake pending exposure that blocks future same-token BUYs.
                 let claimed = {
                     let mut c = match core.lock() {
                         Ok(c) => c,
@@ -282,34 +284,27 @@ async fn main() {
 
                     match c.on_binance_sample(sample, ts, tte_us) {
                         Ok(Some(intent)) => {
-                            let policy = c.buy_submit_policy();
-                            let claim_id = c.inventory_mut().claim_entry(
-                                intent.token.clone(),
-                                minirust::types::OrderSide::Buy,
-                                minirust::types::SharesAtoms(1),
-                                ts.micros(),
-                            );
-                            Some((intent, policy, claim_id))
+                            let claim = if dry_run {
+                                None
+                            } else {
+                                let policy = c.buy_submit_policy();
+                                let claim_id = c.inventory_mut().claim_entry(
+                                    intent.token.clone(),
+                                    minirust::types::OrderSide::Buy,
+                                    minirust::types::SharesAtoms(1),
+                                    ts.micros(),
+                                );
+                                Some((policy, claim_id))
+                            };
+                            Some((intent, claim))
                         }
                         _ => None,
                     }
                 };
 
-                if let Some((intent, policy, claim_id)) = claimed {
+                if let Some((intent, claim)) = claimed {
                     let id = sig_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if dry_run {
-                        logline::log_event(
-                            Level::Warn,
-                            "shadow_buy_signal",
-                            &[
-                                Field { key: "signal_id", value: &(id as i64) },
-                                Field { key: "side", value: &intent.side.as_str() },
-                                Field { key: "token_id", value: &intent.token.as_str() },
-                                Field { key: "limit_ticks", value: &intent.limit.ticks() },
-                                Field { key: "edge_ticks", value: &intent.edge_ticks },
-                            ],
-                        );
-                    } else {
+                    if let Some((policy, claim_id)) = claim {
                         if let (Some(sub), Some(sign)) = (sub.as_ref(), sign.as_ref()) {
                             let sub = sub.clone();
                             let sign = sign.clone();
@@ -369,6 +364,19 @@ async fn main() {
                                 );
                             });
                         }
+                    } else {
+                        // Dry-run: log the signal, no claim, no submit.
+                        logline::log_event(
+                            Level::Warn,
+                            "shadow_buy_signal",
+                            &[
+                                Field { key: "signal_id", value: &(id as i64) },
+                                Field { key: "side", value: &intent.side.as_str() },
+                                Field { key: "token_id", value: &intent.token.as_str() },
+                                Field { key: "limit_ticks", value: &intent.limit.ticks() },
+                                Field { key: "edge_ticks", value: &intent.edge_ticks },
+                            ],
+                        );
                     }
                 }
             })
@@ -614,7 +622,8 @@ async fn main() {
 
     // --- Force-exit task: close positions near market expiry ---
     // Traces to: bot_orchestrator.py force_exit_tte_us check in evaluate_exit.
-    // Fires sells with no limit (marketable at any bid) when TTE < 5s.
+    // Sells owned_atoms at best bid when TTE < 5s.
+    // Uses prepare_sell_for_size_at_bid — FAK at current bid, not a limit order.
     let force_exit_task = {
         let core = core.clone();
         let sub = submitter.clone();

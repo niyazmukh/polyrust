@@ -18,9 +18,10 @@ base64 = "0.22"
 
 # EIP-712 order signing: primitives only. The SDK's order
 # builder calls tick_size / fee_rate / version over the network *before*
-# producing a signable body — that defeats the entire pre-signing
-# architecture (Binance tick → cached signed body → submit) the plan
-# is built around. We reference the SDK source for the schema (the V2
+# producing a signable body — that defeats the low-latency architecture
+# (Binance tick → sign FAK order on-demand → submit, ~100μs EIP-712 cost
+# paid concurrently in a spawned task) the plan is built around.
+# We reference the SDK source for the schema (the V2
 # Order struct, the EIP-712 domain separator constants, the
 # verifying-contract addresses) and compute the digest + signature
 # locally and synchronously. The schema is fixed by the on-chain
