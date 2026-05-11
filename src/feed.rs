@@ -1,4 +1,3 @@
-// Delivered by DeepSeek.
 //! WebSocket feed loops for all three connections.
 //!
 //! Each function owns one WS connection with its own exponential-backoff

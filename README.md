@@ -77,9 +77,9 @@ and the standard signal/sizing env vars. Market context (slug, token IDs, strike
 is discovered dynamically from the Gamma API at startup and on rotation.
 
 Shadow mode ALSO requires Polymarket user-channel credentials
-(`POLY_API_KEY` / `POLY_API_SECRET`) — the bot gates BUY signals on
-authenticated user WSS inventory truth, even in dry-run. Without them,
-no BUY signals will fire.
+(`POLY_API_KEY` / `POLY_API_SECRET` / `POLY_PASSPHRASE`) — the bot gates
+BUY signals on authenticated user WSS inventory truth, even in dry-run.
+Startup fails fast if any of the three are missing.
 
 ```powershell
 $env:MINIMAL_DRY_RUN_ORDERS="true"
@@ -87,6 +87,7 @@ $env:MINIRUST_MARKET_SLUG_FMT="btc-updown-5m-{ts}"
 $env:MINIRUST_BINANCE_SYMBOL="BTCUSDT"
 $env:POLY_API_KEY="..."
 $env:POLY_API_SECRET="..."
+$env:POLY_PASSPHRASE="..."
 cargo run --release
 ```
 

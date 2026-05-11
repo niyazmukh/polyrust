@@ -170,8 +170,7 @@ impl RuntimeCore {
         Ok(msg)
     }
 
-    // Delivered by DeepSeek — sell convenience methods.
-    // Methods on `&self` benefit from field-level borrow splitting.
+    // Sell convenience methods. `&self` benefits from field-level borrow splitting.
 
     /// Prepare a FAK SELL at the current executable bid. Returns `None` if
     /// no bid quote exists or sellable inventory is zero.
@@ -281,7 +280,9 @@ pub fn record_buy_submit_outcome(
             inventory.mark_submit_unknown(submit_id, now_ts_us);
         }
         SubmitOutcome::Rejected { .. } => {
-            inventory.mark_submit_rejected(submit_id, now_ts_us);
+            // FAK rejection is definitive no-order. Remove the claim
+            // so it does not linger in pending scans.
+            inventory.release_claim(submit_id);
         }
     }
 }

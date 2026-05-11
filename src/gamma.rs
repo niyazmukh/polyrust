@@ -1,4 +1,3 @@
-// Delivered by DeepSeek.
 //! Gamma REST API client for Polymarket market discovery.
 //!
 //! Traces to:

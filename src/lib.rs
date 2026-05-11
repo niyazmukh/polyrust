@@ -17,7 +17,6 @@
 //! * `binance` — narrow Binance book-ticker parser into signal samples.
 //! * `runtime` — thin integration edges; no god orchestrator.
 
-// Delivered by DeepSeek — new modules for feed IO, market discovery, anchor resolution.
 pub mod anchor;
 pub mod auth;
 pub mod binance;

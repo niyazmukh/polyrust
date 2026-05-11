@@ -1,4 +1,3 @@
-// Delivered by DeepSeek.
 //! Shadow-probe and live-trading binary. Wires all three WebSocket feeds
 //! into RuntimeCore with anchor strike resolution, Gamma market discovery,
 //! and gated live order submission.

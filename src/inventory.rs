@@ -26,7 +26,6 @@ pub enum SubmitStatus {
     Pending,
     Accepted,
     Unknown,
-    Rejected,
     ExpiredUnknown,
 }
 
@@ -197,13 +196,6 @@ impl Inventory {
     pub fn mark_submit_unknown(&mut self, id: &SubmitId, now_ts_us: i64) {
         if let Some(p) = self.pending.get_mut(id) {
             p.status = SubmitStatus::Unknown;
-            p.updated_ts_us = now_ts_us;
-        }
-    }
-
-    pub fn mark_submit_rejected(&mut self, id: &SubmitId, now_ts_us: i64) {
-        if let Some(p) = self.pending.get_mut(id) {
-            p.status = SubmitStatus::Rejected;
             p.updated_ts_us = now_ts_us;
         }
     }

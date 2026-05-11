@@ -1,4 +1,3 @@
-// Delivered by DeepSeek.
 //! Anchor strike resolution from Binance microprice samples.
 //!
 //! Maintains a rolling buffer of (timestamp_us, microprice) tuples and

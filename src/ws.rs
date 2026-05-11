@@ -1,4 +1,3 @@
-// Delivered by DeepSeek.
 //! Shared WebSocket primitives — connect, backoff, ping.
 //!
 //! Traces to:

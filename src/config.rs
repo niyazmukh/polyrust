@@ -53,7 +53,6 @@ pub struct LaunchConfig {
     pub binance_ws_url: String,
     pub poly_market_ws_url: String,
     pub poly_user_ws_url: String,
-    // Delivered by DeepSeek — dynamic market discovery fields.
     /// Slug template for Gamma REST API.
     /// Traces to: market_ws.py:124 (slug = cfg.market_slug_fmt.format(ts=ts)).
     pub market_slug_fmt: String,
@@ -304,7 +303,7 @@ impl LaunchConfig {
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| "wss://ws-subscriptions-clob.polymarket.com/ws/user".to_owned());
 
-        // Delivered by DeepSeek — dynamic discovery fields.
+        // Dynamic discovery fields.
         // Traces to: market_ws.py (cfg.market_slug_fmt, cfg.market_window_s),
         //   http_client.py (CLOB / Gamma base URLs).
         let market_slug_fmt = lookup("MINIRUST_MARKET_SLUG_FMT")
