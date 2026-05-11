@@ -328,9 +328,15 @@ impl LaunchConfig {
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| "EOA".to_owned());
         let poly_signature_kind = match poly_signature_kind_str.to_ascii_uppercase().as_str() {
+            "EOA" => crate::signing::SignatureKind::Eoa,
             "POLYGON_GNO_SAFE" | "POLY_GNOSIS_SAFE" => crate::signing::SignatureKind::PolyGnosisSafe,
             "POLY_PROXY" => crate::signing::SignatureKind::PolyProxy,
-            _ => crate::signing::SignatureKind::Eoa,
+            other => {
+                return Err(ConfigError::Invalid {
+                    name: "POLY_SIGNATURE_KIND",
+                    reason: format!("unsupported value={other}"),
+                });
+            }
         };
 
         let poly_funder = lookup("POLY_FUNDER").filter(|s| !s.trim().is_empty());

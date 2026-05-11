@@ -180,6 +180,7 @@ pub async fn user_feed_loop(
     api_secret: &str,
     api_passphrase: &str,
     on_event: impl Fn(Bytes) + Send + 'static,
+    on_disconnect: impl Fn() + Send + 'static,
 ) {
     let mut backoff = Backoff::new(250.0, 1.7, 5_000.0);
     // Pre-render the auth frame — credentials don't change across reconnects.
@@ -235,6 +236,7 @@ pub async fn user_feed_loop(
                 // connect failed — backoff and retry.
             }
         }
+        on_disconnect();
         tokio::time::sleep(backoff.next_delay()).await;
     }
 }
@@ -318,7 +320,7 @@ mod tests {
 
         // Spawn feed — will send auth then block waiting for echo.
         let feed = tokio::spawn(async move {
-            user_feed_loop(&url, "key", "secret", "phrase", |_| {}).await;
+            user_feed_loop(&url, "key", "secret", "phrase", |_| {}, || {}).await;
         });
 
         // Wait for server to receive auth frame.

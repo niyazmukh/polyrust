@@ -29,6 +29,7 @@ use serde_json::Value;
 
 use crate::auth::L2AuthSigner;
 use crate::signing::SignedFakOrderBody;
+use crate::types::SharesAtoms;
 
 /// Path component of the order endpoint, relative to the configured
 /// base URL.
@@ -174,21 +175,14 @@ impl HttpSubmitter {
 
         let mut nonzero_count = 0;
         for p in &positions {
-            let has_nonzero = match p.get("size") {
-                // String: parse as f64 to catch "0.000001" or "1.416664"
-                Some(Value::String(s)) => {
-                    s.parse::<f64>()
-                        .map(|v| v.abs() > 0.0 && v.is_finite())
-                        .unwrap_or(false)
-                }
-                // Numeric: check directly
-                Some(Value::Number(n)) => {
-                    n.as_f64().map(|v| v.abs() > 0.0 && v.is_finite()).unwrap_or(false)
-                }
-                // Missing or other type: not a violation
-                _ => false,
+            let size_atoms = match p.get("size") {
+                Some(Value::String(s)) => SharesAtoms::parse_decimal(s)
+                    .map_err(|e| format!("flat_start invalid position size: {e}"))?,
+                Some(Value::Number(n)) => SharesAtoms::parse_decimal(&n.to_string())
+                    .map_err(|e| format!("flat_start invalid position size: {e}"))?,
+                _ => return Err(format!("flat_start unexpected position item schema: {p}")),
             };
-            if has_nonzero {
+            if size_atoms.atoms() != 0 {
                 nonzero_count += 1;
             }
         }

@@ -45,7 +45,17 @@ pub fn parse_user_message(raw: &[u8], ts_us: i64) -> Result<UserMessage, UserPar
         serde_json::from_slice(raw).map_err(|e| UserParseError::InvalidJson(format!("{e}")))?;
 
     if let Some(event) = optional_str(&value, &["event_type", "eventType", "event", "type"]) {
-        if event.eq_ignore_ascii_case("error") {
+        if event.eq_ignore_ascii_case("auth") {
+            match optional_str(&value, &["status"]) {
+                Some(s) if s.eq_ignore_ascii_case("SUCCESS") => return Ok(UserMessage::AuthSuccess),
+                Some(s) if s.eq_ignore_ascii_case("ERROR") || s.eq_ignore_ascii_case("FAILURE") => {
+                    return Ok(UserMessage::AuthError(
+                        optional_str(&value, &["message", "msg"]).unwrap_or(s).to_owned(),
+                    ));
+                }
+                _ => return Ok(UserMessage::Other),
+            }
+        } else if event.eq_ignore_ascii_case("error") {
             let msg = optional_str(&value, &["message", "msg"]).unwrap_or("unknown error").to_owned();
             return Ok(UserMessage::AuthError(msg));
         } else if event.eq_ignore_ascii_case("success") {
@@ -181,6 +191,27 @@ mod tests {
         assert_eq!(trades[0].price, PriceTick::checked(87).unwrap());
         assert_eq!(trades[0].status, TradeStatus::Confirmed);
         assert_eq!(trades[0].ts_us, 42);
+    }
+
+    #[test]
+    fn parses_auth_success() {
+        let raw = br#"{"event_type":"auth","status":"SUCCESS"}"#;
+        let msg = parse_user_message(raw, 1).unwrap();
+        assert_eq!(msg, UserMessage::AuthSuccess);
+    }
+
+    #[test]
+    fn parses_auth_error_with_message() {
+        let raw = br#"{"event_type":"auth","status":"ERROR","message":"bad auth"}"#;
+        let msg = parse_user_message(raw, 1).unwrap();
+        assert_eq!(msg, UserMessage::AuthError("bad auth".to_owned()));
+    }
+
+    #[test]
+    fn auth_unknown_status_returns_other() {
+        let raw = br#"{"event_type":"auth","status":"PENDING"}"#;
+        let msg = parse_user_message(raw, 1).unwrap();
+        assert_eq!(msg, UserMessage::Other);
     }
 
     #[test]

@@ -259,18 +259,20 @@ async fn main() {
                     }
                 }
 
-                // Try signal decision.
-                let intent = {
+                // Signal decision + claim in one lock scope.
+                // claim_entry() MUST be atomic with on_binance_sample():
+                // has_entry_exposure_or_pending checks the claim so a second
+                // Binance tick cannot slip in between intent production and
+                // claim registration.
+                let claimed = {
                     let mut c = match core.lock() {
                         Ok(c) => c,
                         Err(_) => return,
                     };
 
-                    // Compute TTE from the current market.
                     let market = match c.state_mut().market() {
                         Some(m) => m.clone(),
                         None => {
-                            // No market set yet — push sample and move on.
                             c.signal_mut().push(sample);
                             return;
                         }
@@ -279,13 +281,21 @@ async fn main() {
                         .saturating_sub(ts.micros());
 
                     match c.on_binance_sample(sample, ts, tte_us) {
-                        Ok(Some(intent)) => Some(intent),
+                        Ok(Some(intent)) => {
+                            let policy = c.buy_submit_policy();
+                            let claim_id = c.inventory_mut().claim_entry(
+                                intent.token.clone(),
+                                minirust::types::OrderSide::Buy,
+                                minirust::types::SharesAtoms(1),
+                                ts.micros(),
+                            );
+                            Some((intent, policy, claim_id))
+                        }
                         _ => None,
                     }
                 };
 
-                // Log the buy signal and optionally submit.
-                if let Some(intent) = intent {
+                if let Some((intent, policy, claim_id)) = claimed {
                     let id = sig_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if dry_run {
                         logline::log_event(
@@ -300,30 +310,7 @@ async fn main() {
                             ],
                         );
                     } else {
-                        // Live mode: fire-and-forget submit via spawn.
-                        // P0-2 fix: claim entry BEFORE spawn under the same
-                        // lock scope that will produce the intent check, so a
-                        // second Binance tick cannot pass
-                        // has_entry_exposure_or_pending between lock release
-                        // and the old register_submit inside the spawn.
                         if let (Some(sub), Some(sign)) = (sub.as_ref(), sign.as_ref()) {
-                            let ts_us = ts.micros();
-                            let (claim_id, policy) = {
-                                let mut c = match core.lock() {
-                                    Ok(c) => c,
-                                    Err(_) => return,
-                                };
-                                let policy = c.buy_submit_policy();
-                                // Use SharesAtoms(1) as placeholder — claim
-                                // blocks by token+Entry, not by size.
-                                let claim = c.inventory_mut().claim_entry(
-                                    intent.token.clone(),
-                                    minirust::types::OrderSide::Buy,
-                                    minirust::types::SharesAtoms(1),
-                                    ts_us,
-                                );
-                                (claim, policy)
-                            };
                             let sub = sub.clone();
                             let sign = sign.clone();
                             let core2 = core.clone();
@@ -412,6 +399,7 @@ async fn main() {
                 );
                 return;
             }
+            let core_disconnect = core.clone();
             feed::user_feed_loop(
                 &user_url,
                 &api_key,
@@ -514,6 +502,14 @@ async fn main() {
                                 ],
                             );
                         });
+                    }
+                },
+                {
+                    let cd = core_disconnect.clone();
+                    move || {
+                        if let Ok(mut c) = cd.lock() {
+                            c.inventory_mut().set_user_wss_trusted(false);
+                        }
                     }
                 },
             )
