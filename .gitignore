@@ -1,8 +1,6 @@
 /target
 **/*.rs.bk
 *.pdb
-graphify-out/
-src/graphify-out/
 .claude/
 .env*
 
@@ -21,3 +19,5 @@ TODO.md
 
 # Tests
 /tests/
+.venv/
+.ssh_tmp/
