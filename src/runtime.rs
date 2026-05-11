@@ -6,7 +6,7 @@
 
 use crate::binance::BinanceParseError;
 use crate::config::{Config, ConfigError};
-use crate::inventory::{Inventory, SubmitId, SubmitIntent};
+use crate::inventory::{Inventory, SubmitId};
 use crate::market::{apply_market_events, parse_market_events, MarketParseError};
 use crate::orders::{
     canonical_buy_target_for_notional, canonical_sell_params, BuyCanonicalError, BuyCanonicalInput,
@@ -16,7 +16,7 @@ use crate::signal::{BuyIntent, SignalEngine};
 use crate::signing::{OrderSigner, SignInputs, SignedFakOrderBody, SigningError};
 use crate::state::RuntimeState;
 use crate::submit::SubmitOutcome;
-use crate::types::{OrderId, OrderSide, OutcomeSide, PriceTick, Shares2, SharesAtoms, TokenId, TsUs};
+use crate::types::{OrderId, OutcomeSide, PriceTick, Shares2, SharesAtoms, TokenId, TsUs};
 use crate::user::{parse_user_message, UserMessage, UserParseError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,7 +90,6 @@ pub struct PreparedBuySubmit {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparedSellSubmit {
-    pub submit_id: SubmitId,
     pub price: PriceTick,
     pub size: Shares2,
     pub body: SignedFakOrderBody,
@@ -117,6 +116,10 @@ impl RuntimeCore {
 
     pub fn state_mut(&mut self) -> &mut RuntimeState {
         &mut self.state
+    }
+
+    pub fn inventory(&self) -> &Inventory {
+        &self.inventory
     }
 
     pub fn inventory_mut(&mut self) -> &mut Inventory {
@@ -168,37 +171,29 @@ impl RuntimeCore {
     }
 
     // Delivered by DeepSeek — sell convenience methods.
-    // These exist to work around Rust's borrow checker: the free functions
-    // take `&RuntimeState` + `&mut Inventory` separately, but from a
-    // MutexGuard<RuntimeCore> we can't call `state_mut()` and
-    // `inventory_mut()` simultaneously. Methods on `&mut self` benefit from
-    // field-level borrow splitting.
+    // Methods on `&self` benefit from field-level borrow splitting.
 
     /// Prepare a FAK SELL at the current executable bid. Returns `None` if
     /// no bid quote exists or sellable inventory is zero.
     pub fn prepare_sell_at_bid(
-        &mut self,
+        &self,
         token: &TokenId,
         signer: &OrderSigner,
         sign_inputs: SignInputs,
-        now_ts_us: i64,
     ) -> Result<Option<PreparedSellSubmit>, RuntimeError> {
-        prepare_sell_submit_at_bid(
-            token, &self.state, signer, sign_inputs, &mut self.inventory, now_ts_us,
-        )
+        prepare_sell_submit_at_bid(token, &self.state, signer, sign_inputs, &self.inventory)
     }
 
     /// Prepare a FAK SELL for a specific size (in atoms) at the current bid.
     pub fn prepare_sell_for_size_at_bid(
-        &mut self,
+        &self,
         token: &TokenId,
         size_atoms: SharesAtoms,
         signer: &OrderSigner,
         sign_inputs: SignInputs,
-        now_ts_us: i64,
     ) -> Result<Option<PreparedSellSubmit>, RuntimeError> {
         prepare_sell_submit_for_size_at_bid(
-            token, size_atoms, &self.state, signer, sign_inputs, &mut self.inventory, now_ts_us,
+            token, size_atoms, &self.state, signer, sign_inputs, &self.inventory,
         )
     }
 }
@@ -296,8 +291,7 @@ pub fn prepare_sell_submit(
     limit: PriceTick,
     signer: &OrderSigner,
     sign_inputs: SignInputs,
-    inventory: &mut Inventory,
-    now_ts_us: i64,
+    inventory: &Inventory,
 ) -> Result<Option<PreparedSellSubmit>, RuntimeError> {
     let Some(position) = inventory.position(token) else {
         return Ok(None);
@@ -310,19 +304,7 @@ pub fn prepare_sell_submit(
         return Ok(None);
     }
     let body = signer.sign_fak_sell(token, price, size, sign_inputs)?;
-    let submit_id = inventory.register_submit(
-        SubmitIntent::Exit,
-        token.clone(),
-        OrderSide::Sell,
-        size.to_atoms(),
-        now_ts_us,
-    );
-    Ok(Some(PreparedSellSubmit {
-        submit_id,
-        price,
-        size,
-        body,
-    }))
+    Ok(Some(PreparedSellSubmit { price, size, body }))
 }
 
 pub fn prepare_sell_submit_at_bid(
@@ -330,13 +312,12 @@ pub fn prepare_sell_submit_at_bid(
     state: &RuntimeState,
     signer: &OrderSigner,
     sign_inputs: SignInputs,
-    inventory: &mut Inventory,
-    now_ts_us: i64,
+    inventory: &Inventory,
 ) -> Result<Option<PreparedSellSubmit>, RuntimeError> {
     let Some(bid) = state.quote_for_token(token).and_then(|q| q.bid) else {
         return Ok(None);
     };
-    prepare_sell_submit(token, bid, signer, sign_inputs, inventory, now_ts_us)
+    prepare_sell_submit(token, bid, signer, sign_inputs, inventory)
 }
 
 pub fn prepare_sell_submit_for_size_at_bid(
@@ -345,13 +326,12 @@ pub fn prepare_sell_submit_for_size_at_bid(
     state: &RuntimeState,
     signer: &OrderSigner,
     sign_inputs: SignInputs,
-    inventory: &mut Inventory,
-    now_ts_us: i64,
+    inventory: &Inventory,
 ) -> Result<Option<PreparedSellSubmit>, RuntimeError> {
     let Some(bid) = state.quote_for_token(token).and_then(|q| q.bid) else {
         return Ok(None);
     };
-    prepare_sell_submit_for_size(token, bid, size_atoms, signer, sign_inputs, inventory, now_ts_us)
+    prepare_sell_submit_for_size(token, bid, size_atoms, signer, sign_inputs, inventory)
 }
 
 fn prepare_sell_submit_for_size(
@@ -360,8 +340,7 @@ fn prepare_sell_submit_for_size(
     size_atoms: SharesAtoms,
     signer: &OrderSigner,
     sign_inputs: SignInputs,
-    inventory: &mut Inventory,
-    now_ts_us: i64,
+    _inventory: &Inventory,
 ) -> Result<Option<PreparedSellSubmit>, RuntimeError> {
     let raw_size_taker_units = size_atoms.atoms().div_euclid(100);
     let (price, size) = canonical_sell_params(limit, raw_size_taker_units)?;
@@ -369,36 +348,6 @@ fn prepare_sell_submit_for_size(
         return Ok(None);
     }
     let body = signer.sign_fak_sell(token, price, size, sign_inputs)?;
-    let submit_id = inventory.register_submit(
-        SubmitIntent::Exit,
-        token.clone(),
-        OrderSide::Sell,
-        size.to_atoms(),
-        now_ts_us,
-    );
-    Ok(Some(PreparedSellSubmit {
-        submit_id,
-        price,
-        size,
-        body,
-    }))
+    Ok(Some(PreparedSellSubmit { price, size, body }))
 }
 
-pub fn record_sell_submit_outcome(
-    inventory: &mut Inventory,
-    submit_id: &SubmitId,
-    outcome: &SubmitOutcome,
-    now_ts_us: i64,
-) {
-    match outcome {
-        SubmitOutcome::Accepted { order_id, .. } => {
-            inventory.mark_submit_accepted(submit_id, OrderId::new(order_id.clone()), now_ts_us);
-        }
-        SubmitOutcome::Unknown { .. } => {
-            inventory.mark_submit_unknown(submit_id, now_ts_us);
-        }
-        SubmitOutcome::Rejected { .. } => {
-            inventory.mark_submit_rejected(submit_id, now_ts_us);
-        }
-    }
-}

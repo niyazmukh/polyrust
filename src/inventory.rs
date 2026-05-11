@@ -19,7 +19,6 @@ use crate::types::{OrderId, OrderSide, PriceTick, Shares2, SharesAtoms, TokenId,
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SubmitIntent {
     Entry,
-    Exit,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -239,6 +238,16 @@ impl Inventory {
 
     pub fn apply_user_trade(&mut self, trade: UserTrade) -> TradeState {
         let matched_submit = self.match_pending_submit(&trade);
+
+        // WSS is now authoritative — remove matched Entry pending submits.
+        // They have served their purpose (blocking duplicate BUYs between
+        // claim and WSS confirmation). Inventory is truth.
+        if let Some(ref id) = matched_submit
+            && self.pending.get(id).is_some_and(|p| p.intent == SubmitIntent::Entry)
+        {
+            self.pending.remove(id);
+        }
+
         let record = self
             .trades
             .entry(trade.trade_id.clone())
@@ -485,7 +494,7 @@ mod tests {
             ts_us: 30,
         });
         assert_eq!(state.matched_submit, Some(id.clone()));
-        assert_eq!(inv.pending(&id).unwrap().status, SubmitStatus::Accepted);
+        assert_eq!(inv.pending(&id), None); // Entry pending removed — WSS is authority
         assert_eq!(inv.owned_atoms(&t), SharesAtoms(1_000_000));
     }
 

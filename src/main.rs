@@ -102,6 +102,18 @@ async fn main() {
     let poly_address = std::env::var("POLY_ADDRESS").unwrap_or_default();
     let poly_pk = std::env::var("POLY_PK").unwrap_or_default();
 
+    // Fail fast if user WSS credentials are missing — even in dry-run.
+    // BUY signals are gated on authenticated user WSS inventory truth;
+    // without WSS auth, user_wss_trusted remains false and no signals fire.
+    if poly_api_key.is_empty() || poly_api_secret.is_empty() || poly_passphrase.is_empty() {
+        eprintln!(
+            "FATAL: POLY_API_KEY, POLY_API_SECRET, and POLY_PASSPHRASE are required. \
+             In shadow mode, BUY signals are gated on authenticated user WSS inventory truth. \
+             Without WSS auth, user_wss_trusted remains false and no BUY signals will fire."
+        );
+        std::process::exit(2);
+    }
+
     // 6. Live-submit infrastructure (only built when POLY_ALLOW_LIVE_ORDERS=true).
     //    Shadow mode skips both — no signer, no HTTP submitter.
     let auth_signer: Option<L2AuthSigner> = if cfg.allow_live_orders {
@@ -399,11 +411,11 @@ async fn main() {
         let sign = order_signer.clone();
         let sid = sell_id.clone();
         tokio::spawn(async move {
-            if api_key.is_empty() || api_secret.is_empty() {
+            if api_key.is_empty() || api_secret.is_empty() || passphrase.is_empty() {
                 logline::log_event(
                     Level::Warn,
                     "user_feed_skipped",
-                    &[Field { key: "reason", value: &"missing POLY_API_KEY or POLY_API_SECRET" }],
+                    &[Field { key: "reason", value: &"missing POLY_API_KEY, POLY_API_SECRET, or POLY_PASSPHRASE" }],
                 );
                 return;
             }
@@ -468,7 +480,7 @@ async fn main() {
                             sid.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         tokio::spawn(async move {
                             let prepared = {
-                                let mut c = match core2.lock() {
+                                let c = match core2.lock() {
                                     Ok(c) => c,
                                     Err(_) => return,
                                 };
@@ -479,25 +491,12 @@ async fn main() {
                                         salt: sid_val,
                                         timestamp_ms: now_ms(),
                                     },
-                                    now_us(),
                                 ) {
                                     Ok(Some(p)) => p,
                                     _ => return,
                                 }
                             };
                             let outcome = sub2.submit_order(&prepared.body).await;
-                            {
-                                let mut c = match core2.lock() {
-                                    Ok(c) => c,
-                                    Err(_) => return,
-                                };
-                                runtime::record_sell_submit_outcome(
-                                    c.inventory_mut(),
-                                    &prepared.submit_id,
-                                    &outcome,
-                                    now_us(),
-                                );
-                            }
                             logline::log_event(
                                 Level::Warn,
                                 "sell_trade_trigger",
@@ -565,7 +564,7 @@ async fn main() {
                     tokens
                         .into_iter()
                         .filter_map(|token| {
-                            let pos = c.inventory_mut().position(&token)?;
+                            let pos = c.inventory().position(&token)?;
                             if pos.sellable.units() <= 0 {
                                 return None;
                             }
@@ -576,7 +575,6 @@ async fn main() {
                                     salt: sid.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                                     timestamp_ms: now_ms(),
                                 },
-                                now_us(),
                             )
                             .ok()??;
                             Some((prepared, token))
@@ -587,21 +585,8 @@ async fn main() {
                 // Fire sells outside the lock via spawn.
                 for (prepared, token) in sells {
                     let sub2 = sub.clone();
-                    let core2 = core.clone();
                     tokio::spawn(async move {
                         let outcome = sub2.submit_order(&prepared.body).await;
-                        {
-                            let mut c = match core2.lock() {
-                                Ok(c) => c,
-                                Err(_) => return,
-                            };
-                            runtime::record_sell_submit_outcome(
-                                c.inventory_mut(),
-                                &prepared.submit_id,
-                                &outcome,
-                                now_us(),
-                            );
-                        }
                         logline::log_event(
                             Level::Warn,
                             "sell_submit_outcome",
@@ -663,7 +648,7 @@ async fn main() {
                     tokens
                         .into_iter()
                         .filter_map(|token| {
-                            let pos = c.inventory_mut().position(&token)?;
+                            let pos = c.inventory().position(&token)?;
                             let size_atoms = pos.owned_atoms;
                             if size_atoms.atoms() <= 0 {
                                 return None;
@@ -676,7 +661,6 @@ async fn main() {
                                     salt: sid.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                                     timestamp_ms: now_ms(),
                                 },
-                                now_us(),
                             )
                             .ok()??;
                             Some((prepared, token))
@@ -686,21 +670,8 @@ async fn main() {
 
                 for (prepared, token) in force_sells {
                     let sub2 = sub.clone();
-                    let core2 = core.clone();
                     tokio::spawn(async move {
                         let outcome = sub2.submit_order(&prepared.body).await;
-                        {
-                            let mut c = match core2.lock() {
-                                Ok(c) => c,
-                                Err(_) => return,
-                            };
-                            runtime::record_sell_submit_outcome(
-                                c.inventory_mut(),
-                                &prepared.submit_id,
-                                &outcome,
-                                now_us(),
-                            );
-                        }
                         logline::log_event(
                             Level::Warn,
                             "force_sell_outcome",
