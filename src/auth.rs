@@ -8,8 +8,8 @@
 //! the secret-decoding step (base64-url with padding) is one-shot and
 //! amortizes across requests via `L2AuthSigner`.
 
-use base64::engine::general_purpose::URL_SAFE as BASE64_URL_SAFE;
 use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE as BASE64_URL_SAFE;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
@@ -59,8 +59,8 @@ impl L2AuthSigner {
     pub fn headers(&self, method: &str, path: &str, body: &[u8], ts_secs: i64) -> L2Headers {
         let method = method.to_ascii_uppercase();
         let ts = ts_secs.to_string();
-        let mut mac = HmacSha256::new_from_slice(&self.secret)
-            .expect("HMAC-SHA256 accepts any key length");
+        let mut mac =
+            HmacSha256::new_from_slice(&self.secret).expect("HMAC-SHA256 accepts any key length");
         mac.update(ts.as_bytes());
         mac.update(method.as_bytes());
         mac.update(path.as_bytes());
@@ -153,10 +153,7 @@ mod tests {
         // Python: base64.urlsafe_b64decode("QUJ..." + "=" * (-len % 4))
         // -> bytes "ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"
         let secret = decode_secret_b64_padded(SECRET_B64).unwrap();
-        assert_eq!(
-            secret,
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"
-        );
+        assert_eq!(secret, b"ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890");
     }
 
     #[test]
@@ -165,7 +162,10 @@ mod tests {
         //   GET /data/orders body=b"" -> J5KxwOwqKqeWsE9yxJ4U3zPNZWHBGYtQYTFRBL_O8pg=
         let signer = L2AuthSigner::new(API_KEY, PASSPHRASE, SECRET_B64, ADDRESS).unwrap();
         let h = signer.headers("GET", "/data/orders", b"", TS_FIXED);
-        assert_eq!(h.poly_signature, "J5KxwOwqKqeWsE9yxJ4U3zPNZWHBGYtQYTFRBL_O8pg=");
+        assert_eq!(
+            h.poly_signature,
+            "J5KxwOwqKqeWsE9yxJ4U3zPNZWHBGYtQYTFRBL_O8pg="
+        );
         assert_eq!(h.poly_timestamp, "1704067200");
         assert_eq!(h.poly_api_key, API_KEY);
         assert_eq!(h.poly_passphrase, PASSPHRASE);
@@ -181,7 +181,10 @@ mod tests {
             br#"{"order":{"id":1},"owner":"k","orderType":"FAK","postOnly":false,"deferExec":false}"#;
         let signer = L2AuthSigner::new(API_KEY, PASSPHRASE, SECRET_B64, ADDRESS).unwrap();
         let h = signer.headers("POST", "/order", body, TS_FIXED);
-        assert_eq!(h.poly_signature, "x6f0Hg9yxXs6uBnBDwuIaVDpfxtK43rBYvSGqTfho7g=");
+        assert_eq!(
+            h.poly_signature,
+            "x6f0Hg9yxXs6uBnBDwuIaVDpfxtK43rBYvSGqTfho7g="
+        );
     }
 
     #[test]
@@ -190,7 +193,10 @@ mod tests {
         let body = br#"{"order":{"a":"b"}}"#;
         let signer = L2AuthSigner::new(API_KEY, PASSPHRASE, SECRET_B64, ADDRESS).unwrap();
         let h = signer.headers("POST", "/order", body, TS_FIXED);
-        assert_eq!(h.poly_signature, "GC-M2ceYVmNc4J1L6H4UyY9bKIH_s7aS64bOqHjwdBg=");
+        assert_eq!(
+            h.poly_signature,
+            "GC-M2ceYVmNc4J1L6H4UyY9bKIH_s7aS64bOqHjwdBg="
+        );
     }
 
     #[test]

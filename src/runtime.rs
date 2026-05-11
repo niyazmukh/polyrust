@@ -7,17 +7,17 @@
 use crate::binance::BinanceParseError;
 use crate::config::{Config, ConfigError};
 use crate::inventory::{Inventory, SubmitId};
-use crate::market::{apply_market_events, parse_market_events, MarketParseError};
+use crate::market::{MarketParseError, apply_market_events, parse_market_events};
 use crate::orders::{
-    canonical_buy_target_for_notional, canonical_sell_params, BuyCanonicalError, BuyCanonicalInput,
-    BuyCanonicalTarget,
+    BuyCanonicalError, BuyCanonicalInput, BuyCanonicalTarget, canonical_buy_target_for_notional,
+    canonical_sell_params,
 };
 use crate::signal::{BuyIntent, SignalEngine};
 use crate::signing::{OrderSigner, SignInputs, SignedFakOrderBody, SigningError};
 use crate::state::RuntimeState;
 use crate::submit::SubmitOutcome;
 use crate::types::{OrderId, OutcomeSide, PriceTick, Shares2, SharesAtoms, TokenId, TsUs};
-use crate::user::{parse_user_message, UserMessage, UserParseError};
+use crate::user::{UserMessage, UserParseError, parse_user_message};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeError {
@@ -93,6 +93,38 @@ pub struct PreparedSellSubmit {
     pub price: PriceTick,
     pub size: Shares2,
     pub body: SignedFakOrderBody,
+}
+
+/// Snapshot of the inputs needed to sign a FAK SELL, computable purely
+/// from WSS-owned inventory and state under the core lock, with no
+/// signing or JSON serialization required. Callers on the hot path are
+/// expected to build a `SellPlan` under the lock, drop the lock, then
+/// hand the plan to `sign_sell_plan` outside the lock. Keeping signing
+/// off the mutex prevents the SELL exit loop from serializing against
+/// the Binance BUY decision critical section.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SellPlan {
+    pub token: TokenId,
+    pub price: PriceTick,
+    pub size: Shares2,
+}
+
+impl SellPlan {
+    /// Sign the plan into a submit-ready body. This does EIP-712
+    /// keccak256 + secp256k1 ECDSA + JSON serialization; it is
+    /// intentionally not called inside any shared mutex.
+    pub fn sign(
+        &self,
+        signer: &OrderSigner,
+        sign_inputs: SignInputs,
+    ) -> Result<PreparedSellSubmit, RuntimeError> {
+        let body = signer.sign_fak_sell(&self.token, self.price, self.size, sign_inputs)?;
+        Ok(PreparedSellSubmit {
+            price: self.price,
+            size: self.size,
+            body,
+        })
+    }
 }
 
 pub struct RuntimeCore {
@@ -172,8 +204,32 @@ impl RuntimeCore {
 
     // Sell convenience methods. `&self` benefits from field-level borrow splitting.
 
+    /// Build a `SellPlan` for a FAK SELL at the current executable bid.
+    /// Returns `None` if no bid quote exists or sellable inventory is
+    /// zero. This does no signing — callers must hand the plan to
+    /// `SellPlan::sign` outside the core lock.
+    pub fn plan_sell_at_bid(&self, token: &TokenId) -> Option<SellPlan> {
+        plan_sell_at_bid(token, &self.state, &self.inventory)
+    }
+
+    /// Build a `SellPlan` for a specific size (in atoms) at the current
+    /// bid. Returns `None` if no bid exists or the size rounds to zero
+    /// sellable units.
+    pub fn plan_sell_for_size_at_bid(
+        &self,
+        token: &TokenId,
+        size_atoms: SharesAtoms,
+    ) -> Option<SellPlan> {
+        plan_sell_for_size_at_bid(token, size_atoms, &self.state)
+    }
+
     /// Prepare a FAK SELL at the current executable bid. Returns `None` if
     /// no bid quote exists or sellable inventory is zero.
+    ///
+    /// This signs under whatever lock the caller holds. Prefer
+    /// `plan_sell_at_bid` + `SellPlan::sign` outside the lock on hot
+    /// paths. Kept for tests and call sites that don't contend with the
+    /// Binance BUY hot path.
     pub fn prepare_sell_at_bid(
         &self,
         token: &TokenId,
@@ -184,6 +240,8 @@ impl RuntimeCore {
     }
 
     /// Prepare a FAK SELL for a specific size (in atoms) at the current bid.
+    ///
+    /// See `prepare_sell_at_bid` for the lock-discipline caveat.
     pub fn prepare_sell_for_size_at_bid(
         &self,
         token: &TokenId,
@@ -192,7 +250,12 @@ impl RuntimeCore {
         sign_inputs: SignInputs,
     ) -> Result<Option<PreparedSellSubmit>, RuntimeError> {
         prepare_sell_submit_for_size_at_bid(
-            token, size_atoms, &self.state, signer, sign_inputs, &self.inventory,
+            token,
+            size_atoms,
+            &self.state,
+            signer,
+            sign_inputs,
+            &self.inventory,
         )
     }
 }
@@ -308,6 +371,54 @@ pub fn prepare_sell_submit(
     Ok(Some(PreparedSellSubmit { price, size, body }))
 }
 
+/// Compute a `SellPlan` for a FAK SELL at the current executable bid,
+/// without signing. The returned plan can be handed to `SellPlan::sign`
+/// outside any shared mutex. Returns `None` if no bid exists, the
+/// sellable inventory is zero, or the size rounds to zero sellable
+/// units after venue-quantum snap.
+pub fn plan_sell_at_bid(
+    token: &TokenId,
+    state: &RuntimeState,
+    inventory: &Inventory,
+) -> Option<SellPlan> {
+    let bid = state.quote_for_token(token).and_then(|q| q.bid)?;
+    let position = inventory.position(token)?;
+    if position.sellable.units() <= 0 {
+        return None;
+    }
+    let (price, size) = canonical_sell_params(bid, position.sellable.units() * 100).ok()?;
+    if size.units() <= 0 {
+        return None;
+    }
+    Some(SellPlan {
+        token: token.clone(),
+        price,
+        size,
+    })
+}
+
+/// Compute a `SellPlan` for an explicit size (in atoms) at the current
+/// bid. Unlike `plan_sell_at_bid`, this does not require WSS inventory
+/// — it trusts the caller-supplied `size_atoms`. Used by the force-exit
+/// path which sells `owned_atoms` directly.
+pub fn plan_sell_for_size_at_bid(
+    token: &TokenId,
+    size_atoms: SharesAtoms,
+    state: &RuntimeState,
+) -> Option<SellPlan> {
+    let bid = state.quote_for_token(token).and_then(|q| q.bid)?;
+    let raw_size_taker_units = size_atoms.atoms().div_euclid(100);
+    let (price, size) = canonical_sell_params(bid, raw_size_taker_units).ok()?;
+    if size.units() <= 0 {
+        return None;
+    }
+    Some(SellPlan {
+        token: token.clone(),
+        price,
+        size,
+    })
+}
+
 pub fn prepare_sell_submit_at_bid(
     token: &TokenId,
     state: &RuntimeState,
@@ -351,4 +462,3 @@ fn prepare_sell_submit_for_size(
     let body = signer.sign_fak_sell(token, price, size, sign_inputs)?;
     Ok(Some(PreparedSellSubmit { price, size, body }))
 }
-

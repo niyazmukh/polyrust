@@ -151,6 +151,19 @@ impl HttpSubmitter {
     /// Verifies the account has a perfectly flat inventory before starting.
     /// It queries `GET /positions` and `GET /orders` and fails closed if
     /// any nonzero sizes or resting limit orders are found.
+    ///
+    /// Release-blocker note: the exact endpoint URL `"/orders?status=OPEN"`
+    /// and the HMAC path string used for L2 auth on it are unit-tested for
+    /// shape only (array-or-fail, empty-array-or-fail). Neither has been
+    /// round-tripped against the live CLOB from the deploy target. Before
+    /// cutting over to live, run one authenticated probe to confirm:
+    ///
+    ///   1. HTTP 200 on the happy path with an empty array body;
+    ///   2. The HMAC signature path matches what the venue expects
+    ///      (path + query vs path only).
+    ///
+    /// A mismatch will block live startup (fail-closed). This is a
+    /// "cannot go live", not "goes live with open orders", failure.
     pub async fn verify_flat_start(&self) -> Result<(), String> {
         let ts = (self.now_secs)();
         let url = format!("{}/positions", self.base_url);
@@ -159,18 +172,29 @@ impl HttpSubmitter {
         for (name, value) in headers.as_pairs() {
             req = req.header(name, value);
         }
-        let resp = req.send().await.map_err(|e| format!("flat_start http: {e}"))?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| format!("flat_start http: {e}"))?;
         if !resp.status().is_success() {
             return Err(format!("flat_start API error: {}", resp.status()));
         }
-        let body = resp.text().await.map_err(|e| format!("flat_start read: {e}"))?;
-        let value: Value = serde_json::from_str(&body)
-            .map_err(|e| format!("flat_start json parse: {e}"))?;
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| format!("flat_start read: {e}"))?;
+        let value: Value =
+            serde_json::from_str(&body).map_err(|e| format!("flat_start json parse: {e}"))?;
 
         // P0-3: fail-closed if response is not a JSON array.
         let positions = match value {
             Value::Array(arr) => arr,
-            _ => return Err(format!("flat_start unexpected schema: expected array, got: {}", body.chars().take(200).collect::<String>())),
+            _ => {
+                return Err(format!(
+                    "flat_start unexpected schema: expected array, got: {}",
+                    body.chars().take(200).collect::<String>()
+                ));
+            }
         };
 
         let mut nonzero_count = 0;
@@ -189,7 +213,8 @@ impl HttpSubmitter {
 
         if nonzero_count > 0 {
             return Err(format!(
-                "flat_start violation: {} nonzero position(s) found", nonzero_count
+                "flat_start violation: {} nonzero position(s) found",
+                nonzero_count
             ));
         }
 
@@ -201,22 +226,34 @@ impl HttpSubmitter {
         for (name, value) in headers2.as_pairs() {
             req2 = req2.header(name, value);
         }
-        let resp2 = req2.send().await.map_err(|e| format!("flat_start orders http: {e}"))?;
+        let resp2 = req2
+            .send()
+            .await
+            .map_err(|e| format!("flat_start orders http: {e}"))?;
         if !resp2.status().is_success() {
             return Err(format!("flat_start orders API error: {}", resp2.status()));
         }
-        let body2 = resp2.text().await.map_err(|e| format!("flat_start orders read: {e}"))?;
+        let body2 = resp2
+            .text()
+            .await
+            .map_err(|e| format!("flat_start orders read: {e}"))?;
         let value2: Value = serde_json::from_str(&body2)
             .map_err(|e| format!("flat_start orders json parse: {e}"))?;
 
         let orders = match value2 {
             Value::Array(arr) => arr,
-            _ => return Err(format!("flat_start orders unexpected schema: expected array, got: {}", body2.chars().take(200).collect::<String>())),
+            _ => {
+                return Err(format!(
+                    "flat_start orders unexpected schema: expected array, got: {}",
+                    body2.chars().take(200).collect::<String>()
+                ));
+            }
         };
 
         if !orders.is_empty() {
             return Err(format!(
-                "flat_start violation: {} open order(s) found. Cancel them manually.", orders.len()
+                "flat_start violation: {} open order(s) found. Cancel them manually.",
+                orders.len()
             ));
         }
 
@@ -238,10 +275,7 @@ impl HttpSubmitter {
         let bytes = body.as_bytes();
         let headers = self.auth.headers("POST", ORDER_PATH, bytes, ts);
 
-        let mut req = self
-            .client
-            .post(&url)
-            .body(bytes.to_vec());
+        let mut req = self.client.post(&url).body(bytes.to_vec());
         for (name, value) in headers.as_pairs() {
             req = req.header(name, value);
         }
@@ -452,7 +486,9 @@ mod tests {
         // FAK no-match comes back as 400. Body parses, error is set.
         let r = classify(
             400,
-            b(r#"{"error":"no orders found to match with FAK order. FAK orders are partially filled or killed if no match is found."}"#),
+            b(
+                r#"{"error":"no orders found to match with FAK order. FAK orders are partially filled or killed if no match is found."}"#,
+            ),
         );
         assert!(r.is_rejected());
     }

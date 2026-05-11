@@ -31,7 +31,10 @@ pub enum SubmitStatus {
 
 impl SubmitStatus {
     fn blocks_entry(self) -> bool {
-        matches!(self, SubmitStatus::Pending | SubmitStatus::Accepted | SubmitStatus::Unknown)
+        matches!(
+            self,
+            SubmitStatus::Pending | SubmitStatus::Accepted | SubmitStatus::Unknown
+        )
     }
 
     fn matchable(self) -> bool {
@@ -228,6 +231,30 @@ impl Inventory {
         }
     }
 
+    /// Remove `Pending`-status entries older than `older_than_ts_us`.
+    ///
+    /// A `Pending` entry only exists in the narrow window between
+    /// `claim_entry` (synchronous, under the core lock) and the spawned
+    /// submit task's call to `mark_submit_accepted` /
+    /// `mark_submit_unknown` / `release_claim`. In normal operation this
+    /// window is ≤ HTTP timeout (2 s). If a submit task panics or is
+    /// cancelled before resolving the outcome, the Pending claim lingers
+    /// forever and blocks same-token BUYs (because `blocks_entry()` is
+    /// true for Pending).
+    ///
+    /// The caller is expected to pass a conservatively large cutoff
+    /// (e.g., 60 s) so normal submits never expire. This is NOT an
+    /// Unknown-equivalent state machine step: the order was never
+    /// confirmed placed at the venue, so there is no pending WSS trade
+    /// to bind later. Removal is safe; a subsequent WSS trade that
+    /// matches the same token will still apply inventory via the
+    /// (token, side) fallback matcher.
+    pub fn expire_pending(&mut self, older_than_ts_us: i64) {
+        self.pending.retain(|_, p| {
+            !(p.status == SubmitStatus::Pending && p.created_ts_us <= older_than_ts_us)
+        });
+    }
+
     pub fn apply_user_trade(&mut self, trade: UserTrade) -> TradeState {
         let matched_submit = self.match_pending_submit(&trade);
 
@@ -235,7 +262,10 @@ impl Inventory {
         // They have served their purpose (blocking duplicate BUYs between
         // claim and WSS confirmation). Inventory is truth.
         if let Some(ref id) = matched_submit
-            && self.pending.get(id).is_some_and(|p| p.intent == SubmitIntent::Entry)
+            && self
+                .pending
+                .get(id)
+                .is_some_and(|p| p.intent == SubmitIntent::Entry)
         {
             self.pending.remove(id);
         }
@@ -308,9 +338,7 @@ impl Inventory {
         }
         self.owned_atoms(token).atoms() > 0
             || self.pending.values().any(|p| {
-                p.intent == SubmitIntent::Entry
-                    && p.token == *token
-                    && p.status.blocks_entry()
+                p.intent == SubmitIntent::Entry && p.token == *token && p.status.blocks_entry()
             })
     }
 
@@ -334,9 +362,13 @@ impl Inventory {
             .len()
     }
 
-    pub fn release_market_scope<'a>(&mut self, active_tokens: impl IntoIterator<Item = &'a TokenId>) {
+    pub fn release_market_scope<'a>(
+        &mut self,
+        active_tokens: impl IntoIterator<Item = &'a TokenId>,
+    ) {
         let active: HashSet<TokenId> = active_tokens.into_iter().cloned().collect();
-        self.owned_by_token.retain(|token, _| active.contains(token));
+        self.owned_by_token
+            .retain(|token, _| active.contains(token));
         self.pending.retain(|_, p| active.contains(&p.token));
     }
 
@@ -355,9 +387,7 @@ impl Inventory {
             self.pending
                 .iter()
                 .find(|(_, p)| {
-                    p.status.matchable()
-                        && p.token == trade.token
-                        && p.side == trade.side
+                    p.status.matchable() && p.token == trade.token && p.side == trade.side
                 })
                 .map(|(id, _)| id.clone())
         });
@@ -416,23 +446,40 @@ mod tests {
     fn matched_applies_inventory_once_and_confirmed_only_finalizes() {
         let mut inv = Inventory::new();
         let t = token("asset");
-        let first = inv.apply_user_trade(trade("tr1", t.clone(), OrderSide::Buy, TradeStatus::Matched));
+        let first = inv.apply_user_trade(trade(
+            "tr1",
+            t.clone(),
+            OrderSide::Buy,
+            TradeStatus::Matched,
+        ));
         assert!(first.applied);
         assert_eq!(inv.owned_atoms(&t), SharesAtoms(1_416_664));
         assert_eq!(inv.sellable(&t), Shares2::new_unchecked(141));
 
-        let confirmed =
-            inv.apply_user_trade(trade("tr1", t.clone(), OrderSide::Buy, TradeStatus::Confirmed));
+        let confirmed = inv.apply_user_trade(trade(
+            "tr1",
+            t.clone(),
+            OrderSide::Buy,
+            TradeStatus::Confirmed,
+        ));
         assert!(confirmed.finalized);
         assert_eq!(inv.owned_atoms(&t), SharesAtoms(1_416_664));
-        assert_eq!(confirmed.lifecycle, vec![TradeStatus::Matched, TradeStatus::Confirmed]);
+        assert_eq!(
+            confirmed.lifecycle,
+            vec![TradeStatus::Matched, TradeStatus::Confirmed]
+        );
     }
 
     #[test]
     fn confirmed_without_matched_still_recovers_inventory_once() {
         let mut inv = Inventory::new();
         let t = token("asset");
-        let state = inv.apply_user_trade(trade("tr1", t.clone(), OrderSide::Buy, TradeStatus::Confirmed));
+        let state = inv.apply_user_trade(trade(
+            "tr1",
+            t.clone(),
+            OrderSide::Buy,
+            TradeStatus::Confirmed,
+        ));
         assert!(state.applied);
         assert!(state.finalized);
         assert_eq!(inv.owned_atoms(&t), SharesAtoms(1_416_664));
@@ -442,7 +489,12 @@ mod tests {
     fn sell_reduces_inventory_and_clamps_underflow() {
         let mut inv = Inventory::new();
         let t = token("asset");
-        inv.apply_user_trade(trade("buy", t.clone(), OrderSide::Buy, TradeStatus::Matched));
+        inv.apply_user_trade(trade(
+            "buy",
+            t.clone(),
+            OrderSide::Buy,
+            TradeStatus::Matched,
+        ));
         let sell = UserTrade {
             trade_id: TradeId::new("sell"),
             token: t.clone(),
@@ -495,7 +547,12 @@ mod tests {
         let mut inv = Inventory::new();
         let old = token("old");
         let new = token("new");
-        inv.apply_user_trade(trade("old-trade", old.clone(), OrderSide::Buy, TradeStatus::Matched));
+        inv.apply_user_trade(trade(
+            "old-trade",
+            old.clone(),
+            OrderSide::Buy,
+            TradeStatus::Matched,
+        ));
         inv.register_submit(
             SubmitIntent::Entry,
             old.clone(),
@@ -506,5 +563,90 @@ mod tests {
         inv.release_market_scope([&new]);
         assert_eq!(inv.owned_atoms(&old), SharesAtoms(0));
         assert_eq!(inv.open_position_count([&old, &new]), 0);
+    }
+
+    #[test]
+    fn expire_pending_removes_only_old_pending_entries() {
+        // Three submits: old pending (task wedged), fresh pending
+        // (normal in-flight), accepted (do not touch).
+        let mut inv = Inventory::new();
+        inv.set_user_wss_trusted(true);
+        let t_old = token("t-old");
+        let t_fresh = token("t-fresh");
+        let t_acc = token("t-acc");
+
+        let id_old = inv.register_submit(
+            SubmitIntent::Entry,
+            t_old.clone(),
+            OrderSide::Buy,
+            SharesAtoms(1_000_000),
+            1_000,
+        );
+        let id_fresh = inv.register_submit(
+            SubmitIntent::Entry,
+            t_fresh.clone(),
+            OrderSide::Buy,
+            SharesAtoms(1_000_000),
+            2_000_000,
+        );
+        let id_acc = inv.register_submit(
+            SubmitIntent::Entry,
+            t_acc.clone(),
+            OrderSide::Buy,
+            SharesAtoms(1_000_000),
+            1_000,
+        );
+        inv.mark_submit_accepted(&id_acc, OrderId::new("0xacc"), 1_500);
+
+        // Cutoff that is older than id_fresh but newer than id_old and id_acc.
+        inv.expire_pending(1_500_000);
+
+        assert_eq!(inv.pending(&id_old), None, "old Pending must be removed");
+        assert!(
+            inv.pending(&id_fresh).is_some(),
+            "fresh Pending must survive (created after cutoff)"
+        );
+        let acc = inv.pending(&id_acc).expect("accepted must survive");
+        assert_eq!(acc.status, SubmitStatus::Accepted);
+
+        // Unknown submits are untouched by expire_pending.
+        let id_unk = inv.register_submit(
+            SubmitIntent::Entry,
+            token("t-unk"),
+            OrderSide::Buy,
+            SharesAtoms(1_000_000),
+            500,
+        );
+        inv.mark_submit_unknown(&id_unk, 600);
+        inv.expire_pending(1_500_000);
+        assert!(
+            inv.pending(&id_unk).is_some(),
+            "Unknown must survive expire_pending"
+        );
+        assert_eq!(inv.pending(&id_unk).unwrap().status, SubmitStatus::Unknown);
+    }
+
+    #[test]
+    fn expire_pending_unblocks_same_token_buy() {
+        let mut inv = Inventory::new();
+        inv.set_user_wss_trusted(true);
+        let t = token("asset");
+        inv.register_submit(
+            SubmitIntent::Entry,
+            t.clone(),
+            OrderSide::Buy,
+            SharesAtoms(1_000_000),
+            1_000,
+        );
+        assert!(
+            inv.has_entry_exposure_or_pending(&t),
+            "fresh Pending must block BUY"
+        );
+        // 60 s later the submit task never reported an outcome.
+        inv.expire_pending(60_000_001_000);
+        assert!(
+            !inv.has_entry_exposure_or_pending(&t),
+            "stale Pending must be cleared by expire_pending"
+        );
     }
 }

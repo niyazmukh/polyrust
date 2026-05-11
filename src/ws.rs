@@ -9,10 +9,7 @@ use std::time::Duration;
 
 use futures_util::SinkExt;
 use tokio::net::TcpStream;
-use tokio_tungstenite::tungstenite::{
-    client::IntoClientRequest,
-    Message,
-};
+use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 pub type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;

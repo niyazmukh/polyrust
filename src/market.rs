@@ -21,9 +21,7 @@ pub struct QuoteUpdate {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MarketEvent {
     Quote(QuoteUpdate),
-    Resolved {
-        condition_id: Option<ConditionId>,
-    },
+    Resolved { condition_id: Option<ConditionId> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,7 +142,10 @@ fn quote_from_dict(value: &Value) -> Option<QuoteUpdate> {
     })
 }
 
-fn resolution_matches_active_market(condition_id: Option<&ConditionId>, state: &RuntimeState) -> bool {
+fn resolution_matches_active_market(
+    condition_id: Option<&ConditionId>,
+    state: &RuntimeState,
+) -> bool {
     let Some(condition_id) = condition_id else {
         return true;
     };

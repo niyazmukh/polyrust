@@ -1,15 +1,16 @@
-//! EIP-712 BUY/SELL order signing — synchronous, offline, pre-signable.
+//! EIP-712 BUY/SELL order signing — synchronous, offline, on-demand.
 //!
 //! ## Why not the SDK
 //!
 //! `polymarket_client_sdk_v2::clob::Client::limit_order().build()` calls
 //! `tick_size().await?`, `fee_rate_bps().await?`, and `resolve_version()`
 //! against the live CLOB *before* producing a signable body. That defeats
-//! the pre-signing architecture this bot is built around: Binance tick →
-//! cached signed body → submit, with the EIP-712 + secp256k1 cost paid
-//! off the hot path. Holding network round-trips inside the signing
-//! function would force every signal to wait on the SDK's HTTP cache
-//! lookups before submit — a full architectural regression.
+//! the on-demand signing architecture this bot is built around: Binance
+//! tick → signal decision → sign a fresh FAK body in the spawned submit
+//! task → POST /order, with the EIP-712 + secp256k1 cost paid in that
+//! spawned task off the core mutex. Holding network round-trips inside
+//! the signing function would force every signal to wait on the SDK's
+//! HTTP cache lookups before submit — a full architectural regression.
 //!
 //! ## What this module does
 //!
@@ -37,8 +38,9 @@
 //! * Renders the JSON body in the venue-expected shape (V2 with the
 //!   signature folded into the inner `order` object, plus
 //!   `orderType`/`owner`/`postOnly`/`deferExec` outer fields).
-//! * Is fully synchronous, deterministic, and pre-signable for cached
-//!   templates.
+//! * Is fully synchronous, deterministic, and safe to call on-demand
+//!   from the spawned submit task without reaching back into the core
+//!   mutex.
 //!
 //! Verifying contract addresses for V2 (Polygon, chain_id 137) are taken
 //! from the SDK's `CONFIG` map. They are pinned to the on-chain contracts;
@@ -164,7 +166,6 @@ impl SignedFakOrderBody {
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
-
 }
 
 impl std::fmt::Display for SigningError {
@@ -262,14 +263,15 @@ impl OrderSigner {
         chain_id: u64,
         verifying_contract: H160,
     ) -> Result<Self, SigningError> {
-        let pk_hex = private_key_hex.strip_prefix("0x").unwrap_or(private_key_hex);
-        let pk_bytes =
-            hex::decode(pk_hex).map_err(|_| SigningError::InvalidPrivateKey)?;
+        let pk_hex = private_key_hex
+            .strip_prefix("0x")
+            .unwrap_or(private_key_hex);
+        let pk_bytes = hex::decode(pk_hex).map_err(|_| SigningError::InvalidPrivateKey)?;
         if pk_bytes.len() != 32 {
             return Err(SigningError::InvalidPrivateKey);
         }
-        let signing_key = SigningKey::from_slice(&pk_bytes)
-            .map_err(|_| SigningError::InvalidPrivateKey)?;
+        let signing_key =
+            SigningKey::from_slice(&pk_bytes).map_err(|_| SigningError::InvalidPrivateKey)?;
         let address = derive_address(signing_key.verifying_key());
 
         if api_key.is_empty() {
@@ -289,12 +291,8 @@ impl OrderSigner {
             }
         };
 
-        let domain_separator = compute_domain_separator(
-            DOMAIN_NAME,
-            DOMAIN_VERSION_V2,
-            chain_id,
-            verifying_contract,
-        );
+        let domain_separator =
+            compute_domain_separator(DOMAIN_NAME, DOMAIN_VERSION_V2, chain_id, verifying_contract);
 
         Ok(Self {
             signing_key,
@@ -387,8 +385,7 @@ impl OrderSigner {
         taker_amount: U256,
         inputs: SignInputs,
     ) -> Result<SignedFakOrderBody, SigningError> {
-        let token_id = parse_u256_decimal(token.as_str())
-            .ok_or(SigningError::InvalidTokenId)?;
+        let token_id = parse_u256_decimal(token.as_str()).ok_or(SigningError::InvalidTokenId)?;
 
         let order = OrderV2 {
             salt: inputs.salt,
@@ -418,8 +415,24 @@ impl OrderSigner {
             .signing_key
             .sign_prehash_recoverable(digest.as_bytes())
             .map_err(|_| SigningError::InvalidPrivateKey)?;
-        let normalized_sig = sig.normalize_s().unwrap_or(sig);
-        let signature_bytes = encode_signature(&normalized_sig, recovery_id);
+        // Ethereum (and the CTFExchange verifier) requires low-S signatures.
+        // If `normalize_s` flips `s`, the public key recovered from the
+        // signature changes unless we also flip the recovery parity. Newer
+        // `k256::sign_prehash_recoverable` always returns low-S, so the
+        // branch is typically unreachable — but keeping the parity flip
+        // here makes correctness independent of the crate's internal
+        // normalization policy. See test
+        // `sign_prehash_recoverable_returns_low_s_for_many_digests`.
+        let (normalized_sig, normalized_recovery_id) = match sig.normalize_s() {
+            Some(flipped) => {
+                let flipped_parity = u8::from(recovery_id) ^ 1;
+                let new_recovery_id = RecoveryId::try_from(flipped_parity)
+                    .map_err(|_| SigningError::InvalidPrivateKey)?;
+                (flipped, new_recovery_id)
+            }
+            None => (sig, recovery_id),
+        };
+        let signature_bytes = encode_signature(&normalized_sig, normalized_recovery_id);
 
         // Render JSON body matching the V2 envelope expected by /order.
         // expiration is 0 for FAK — the V2 schema does not include it in
@@ -606,7 +619,7 @@ fn parse_u256_decimal(s: &str) -> Option<U256> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::orders::{canonical_buy_target_for_notional, BuyCanonicalInput};
+    use crate::orders::{BuyCanonicalInput, canonical_buy_target_for_notional};
 
     /// Standard low-private-key test vector. Address derives to:
     /// 0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf
@@ -673,9 +686,8 @@ mod tests {
         })
         .unwrap();
 
-        let token = TokenId::new(
-            "1234567890123456789012345678901234567890123456789012345678901234",
-        );
+        let token =
+            TokenId::new("1234567890123456789012345678901234567890123456789012345678901234");
         let inputs = SignInputs {
             salt: 0xdead_beef_cafe_babe,
             timestamp_ms: 1_777_000_000_000,
@@ -734,8 +746,8 @@ mod tests {
         let r = k256::ecdsa::Signature::from_slice(&signature_bytes[..64]).unwrap();
         let v = signature_bytes[64];
         let recovery_id = RecoveryId::try_from(v - 27).unwrap();
-        let recovered = VerifyingKey::recover_from_prehash(digest.as_bytes(), &r, recovery_id)
-            .unwrap();
+        let recovered =
+            VerifyingKey::recover_from_prehash(digest.as_bytes(), &r, recovery_id).unwrap();
         let recovered_address = derive_address(&recovered);
         assert_eq!(recovered_address, s.address);
     }
@@ -743,9 +755,8 @@ mod tests {
     #[test]
     fn signature_recovers_to_signer_address_for_sell() {
         let s = signer();
-        let token = TokenId::new(
-            "1234567890123456789012345678901234567890123456789012345678901234",
-        );
+        let token =
+            TokenId::new("1234567890123456789012345678901234567890123456789012345678901234");
         let inputs = SignInputs {
             salt: 1,
             timestamp_ms: 1_777_000_000_000,
@@ -770,8 +781,7 @@ mod tests {
 
         // Recover.
         let signature_str = order["signature"].as_str().unwrap();
-        let signature_bytes =
-            hex::decode(signature_str.strip_prefix("0x").unwrap()).unwrap();
+        let signature_bytes = hex::decode(signature_str.strip_prefix("0x").unwrap()).unwrap();
         let token_id = parse_u256_decimal(token.as_str()).unwrap();
         let order_v2 = OrderV2 {
             salt: inputs.salt,
@@ -795,8 +805,8 @@ mod tests {
 
         let r = k256::ecdsa::Signature::from_slice(&signature_bytes[..64]).unwrap();
         let recovery_id = RecoveryId::try_from(signature_bytes[64] - 27).unwrap();
-        let recovered = VerifyingKey::recover_from_prehash(digest.as_bytes(), &r, recovery_id)
-            .unwrap();
+        let recovered =
+            VerifyingKey::recover_from_prehash(digest.as_bytes(), &r, recovery_id).unwrap();
         assert_eq!(derive_address(&recovered), s.address);
     }
 
@@ -842,7 +852,14 @@ mod tests {
         .unwrap();
         let bogus = TokenId::new("not a number");
         let err = s
-            .sign_fak_buy(&bogus, &target, SignInputs { salt: 0, timestamp_ms: 0 })
+            .sign_fak_buy(
+                &bogus,
+                &target,
+                SignInputs {
+                    salt: 0,
+                    timestamp_ms: 0,
+                },
+            )
             .unwrap_err();
         assert_eq!(err, SigningError::InvalidTokenId);
     }
@@ -863,10 +880,172 @@ mod tests {
         .unwrap();
         let token = TokenId::new("1");
         let body = s
-            .sign_fak_buy(&token, &target, SignInputs { salt: 12345, timestamp_ms: 1 })
+            .sign_fak_buy(
+                &token,
+                &target,
+                SignInputs {
+                    salt: 12345,
+                    timestamp_ms: 1,
+                },
+            )
             .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(body.as_bytes()).unwrap();
-        assert!(parsed["order"]["salt"].is_number(), "salt must be a JSON number");
+        assert!(
+            parsed["order"]["salt"].is_number(),
+            "salt must be a JSON number"
+        );
         assert_eq!(parsed["order"]["salt"].as_u64(), Some(12345));
+    }
+
+    /// Sign `iterations` BUY bodies with varying salts and recover the
+    /// public key from each signature. A mismatch means either the
+    /// signing path produced a high-S signature without flipping recovery
+    /// parity, or low-S normalization silently changed `s` without the
+    /// corresponding `v` flip. Running over a broad salt range exercises
+    /// RFC 6979 nonce derivation enough to hit both parity bits.
+    #[test]
+    fn signature_recovers_for_many_salts_across_both_sides() {
+        let s = signer();
+        let token =
+            TokenId::new("1234567890123456789012345678901234567890123456789012345678901234");
+        let buy_target = canonical_buy_target_for_notional(BuyCanonicalInput {
+            price: PriceTick::checked(50).unwrap(),
+            target_maker_cents: 101,
+            min_size_taker_units: 100,
+            min_maker_cents: 100,
+            max_overrun_cents: 1,
+            max_overrun_bps: 0,
+        })
+        .unwrap();
+
+        let iterations = 128u64;
+        let mut low_s_count = 0u64;
+        let mut high_s_count = 0u64;
+        let half_order = {
+            // secp256k1 order / 2, as big-endian bytes.
+            // Anything strictly > this would originally have been high-S.
+            let bytes: [u8; 32] = [
+                0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                0xFF, 0xFF, 0x5D, 0x57, 0x6E, 0x73, 0x57, 0xA4, 0x50, 0x1D, 0xDF, 0xE9, 0x2F, 0x46,
+                0x68, 0x1B, 0x20, 0xA0,
+            ];
+            bytes
+        };
+
+        for salt in 0..iterations {
+            let inputs = SignInputs {
+                salt,
+                timestamp_ms: 1_777_000_000_000 + salt as u128,
+            };
+
+            // BUY recovery.
+            let body = s.sign_fak_buy(&token, &buy_target, inputs).unwrap();
+            let parsed: serde_json::Value = serde_json::from_slice(body.as_bytes()).unwrap();
+            let sig_hex = parsed["order"]["signature"].as_str().unwrap();
+            let sig_bytes = hex::decode(sig_hex.strip_prefix("0x").unwrap()).unwrap();
+            assert_eq!(sig_bytes.len(), 65);
+
+            // All output signatures must be in low-S canonical form.
+            let s_bytes: [u8; 32] = sig_bytes[32..64].try_into().unwrap();
+            if s_bytes <= half_order {
+                low_s_count += 1;
+            } else {
+                high_s_count += 1;
+            }
+            assert!(
+                s_bytes <= half_order,
+                "signature at salt={salt} has high-S component — normalization regression"
+            );
+
+            let order_v2 = OrderV2 {
+                salt: inputs.salt,
+                maker: s.maker,
+                signer: s.address,
+                token_id: parse_u256_decimal(token.as_str()).unwrap(),
+                maker_amount: U256::from(1_010_000u64),
+                taker_amount: U256::from(2_020_000u64),
+                side: OrderSide::Buy,
+                signature_kind: SignatureKind::Eoa,
+                timestamp_ms: inputs.timestamp_ms,
+                metadata: H256::zero(),
+                builder: H256::zero(),
+            };
+            let mut buf = [0u8; 66];
+            buf[0] = 0x19;
+            buf[1] = 0x01;
+            buf[2..34].copy_from_slice(s.domain_separator.as_bytes());
+            buf[34..66].copy_from_slice(order_v2.struct_hash().as_bytes());
+            let digest = keccak256(&buf);
+
+            let r = k256::ecdsa::Signature::from_slice(&sig_bytes[..64]).unwrap();
+            let v = sig_bytes[64];
+            assert!(v == 27 || v == 28, "v must be 27 or 28, got {v}");
+            let rid = RecoveryId::try_from(v - 27).unwrap();
+            let recovered = VerifyingKey::recover_from_prehash(digest.as_bytes(), &r, rid).unwrap();
+            assert_eq!(
+                derive_address(&recovered),
+                s.address,
+                "BUY recovery mismatch at salt={salt}"
+            );
+
+            // SELL recovery with same salt.
+            let body = s
+                .sign_fak_sell(
+                    &token,
+                    PriceTick::checked(60).unwrap(),
+                    Shares2::new_unchecked(150),
+                    inputs,
+                )
+                .unwrap();
+            let parsed: serde_json::Value = serde_json::from_slice(body.as_bytes()).unwrap();
+            let sig_hex = parsed["order"]["signature"].as_str().unwrap();
+            let sig_bytes = hex::decode(sig_hex.strip_prefix("0x").unwrap()).unwrap();
+            let s_bytes: [u8; 32] = sig_bytes[32..64].try_into().unwrap();
+            assert!(
+                s_bytes <= half_order,
+                "SELL signature at salt={salt} has high-S component"
+            );
+
+            let order_v2 = OrderV2 {
+                salt: inputs.salt,
+                maker: s.maker,
+                signer: s.address,
+                token_id: parse_u256_decimal(token.as_str()).unwrap(),
+                maker_amount: U256::from(1_500_000u64),
+                taker_amount: U256::from(900_000u64),
+                side: OrderSide::Sell,
+                signature_kind: SignatureKind::Eoa,
+                timestamp_ms: inputs.timestamp_ms,
+                metadata: H256::zero(),
+                builder: H256::zero(),
+            };
+            let mut buf = [0u8; 66];
+            buf[0] = 0x19;
+            buf[1] = 0x01;
+            buf[2..34].copy_from_slice(s.domain_separator.as_bytes());
+            buf[34..66].copy_from_slice(order_v2.struct_hash().as_bytes());
+            let digest = keccak256(&buf);
+
+            let r = k256::ecdsa::Signature::from_slice(&sig_bytes[..64]).unwrap();
+            let v = sig_bytes[64];
+            let rid = RecoveryId::try_from(v - 27).unwrap();
+            let recovered = VerifyingKey::recover_from_prehash(digest.as_bytes(), &r, rid).unwrap();
+            assert_eq!(
+                derive_address(&recovered),
+                s.address,
+                "SELL recovery mismatch at salt={salt}"
+            );
+        }
+
+        // Document the observed low-S rate. `k256::sign_prehash_recoverable`
+        // in the pinned version produces low-S for effectively every salt
+        // via internal normalization; `high_s_count` should stay at 0.
+        // If it becomes non-zero in a future k256 update, the parity-flip
+        // path is exercised and still correct.
+        assert_eq!(
+            low_s_count + high_s_count,
+            iterations,
+            "salt accounting lost signatures"
+        );
     }
 }

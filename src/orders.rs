@@ -10,8 +10,8 @@
 //! by signing and submit code.
 
 use crate::types::{
+    MAX_PRICE_TICK, MIN_PRICE_TICK, PriceTick, Shares2, Shares4, UsdcCents,
     buy_size_multiple_taker_units, ceil_to_multiple, floor_to_multiple, maker_cents_for,
-    PriceTick, Shares2, Shares4, UsdcCents, MAX_PRICE_TICK, MIN_PRICE_TICK,
 };
 
 /// Which side of the lattice the chosen size came from.
@@ -127,8 +127,7 @@ pub fn canonical_buy_target_for_notional(
         .checked_mul(100)
         .expect("target_cents * 100 overflow");
     let denom = price_ticks as i64;
-    let raw_in_0_01 = numer.div_euclid(denom)
-        + if numer.rem_euclid(denom) > 0 { 1 } else { 0 };
+    let raw_in_0_01 = numer.div_euclid(denom) + if numer.rem_euclid(denom) > 0 { 1 } else { 0 };
     let raw_size_taker_units = raw_in_0_01.checked_mul(100).expect("raw size overflow");
 
     if raw_size_taker_units < inp.min_size_taker_units {

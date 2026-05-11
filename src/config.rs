@@ -3,8 +3,8 @@
 //! Keep only keys with a current consumer. Future feed/signing keys are added
 //! when their runtime owner exists; predeclared env state is dead state.
 
-use std::{env, fs};
 use std::fmt;
+use std::{env, fs};
 
 use crate::runtime::BuySubmitPolicy;
 use crate::signal::SignalConfig;
@@ -71,10 +71,24 @@ pub struct LaunchConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigError {
-    Missing { name: &'static str },
-    Invalid { name: &'static str, reason: String },
+    Missing {
+        name: &'static str,
+    },
+    Invalid {
+        name: &'static str,
+        reason: String,
+    },
     LiveDisallowed,
-    BandIncoherent { min: i32, max: i32 },
+    /// Both `MINIMAL_DRY_RUN_ORDERS` and `POLY_ALLOW_LIVE_ORDERS` are true.
+    /// They are mutually exclusive: dry-run means no live submit infrastructure
+    /// is built; live means BUY/SELL submit infrastructure is built and used.
+    /// Accepting both silently is a live-funds risk because SELL paths key off
+    /// the presence of live submit infra (not the `dry_run` flag).
+    ModeConflict,
+    BandIncoherent {
+        min: i32,
+        max: i32,
+    },
 }
 
 impl fmt::Display for ConfigError {
@@ -87,6 +101,10 @@ impl fmt::Display for ConfigError {
             ConfigError::LiveDisallowed => write!(
                 f,
                 "refusing_live_runtime: set POLY_ALLOW_LIVE_ORDERS=true or MINIMAL_DRY_RUN_ORDERS=true"
+            ),
+            ConfigError::ModeConflict => write!(
+                f,
+                "mode_conflict: MINIMAL_DRY_RUN_ORDERS and POLY_ALLOW_LIVE_ORDERS are mutually exclusive"
             ),
             ConfigError::BandIncoherent { min, max } => {
                 write!(f, "buy_band_incoherent min_cents={min} max_cents={max}")
@@ -108,10 +126,18 @@ impl Config {
     }
 
     fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Self, ConfigError> {
-        let allow_live_orders = env_bool_lookup(&mut lookup, "POLY_ALLOW_LIVE_ORDERS").unwrap_or(false);
-        let dry_run_orders = env_bool_lookup(&mut lookup, "MINIMAL_DRY_RUN_ORDERS").unwrap_or(false);
+        let allow_live_orders =
+            env_bool_lookup(&mut lookup, "POLY_ALLOW_LIVE_ORDERS").unwrap_or(false);
+        let dry_run_orders =
+            env_bool_lookup(&mut lookup, "MINIMAL_DRY_RUN_ORDERS").unwrap_or(false);
         if !allow_live_orders && !dry_run_orders {
             return Err(ConfigError::LiveDisallowed);
+        }
+        // Mutually exclusive: dry-run disables live submit infra; live enables
+        // it and drives SELL paths. Accepting both silently means a shadow
+        // operator can fire real FAK SELLs without intending to. Fail closed.
+        if allow_live_orders && dry_run_orders {
+            return Err(ConfigError::ModeConflict);
         }
 
         let usdc_per_trade_cents = env_dec_cents_lookup(&mut lookup, "MINIMAL_USDC_PER_TRADE")
@@ -156,11 +182,10 @@ impl Config {
             });
         }
 
-        let min_decision_tte_us = env_i64_lookup(&mut lookup, "MINIMAL_DECISION_MIN_TTE_US").ok_or(
-            ConfigError::Missing {
+        let min_decision_tte_us = env_i64_lookup(&mut lookup, "MINIMAL_DECISION_MIN_TTE_US")
+            .ok_or(ConfigError::Missing {
                 name: "MINIMAL_DECISION_MIN_TTE_US",
-            },
-        )?;
+            })?;
         if min_decision_tte_us <= 0 {
             return Err(ConfigError::Invalid {
                 name: "MINIMAL_DECISION_MIN_TTE_US",
@@ -184,14 +209,13 @@ impl Config {
                     name: "MINIMAL_DECISION_MIN_EDGE",
                     reason: "out_of_range".into(),
                 })?;
-        let entry_slippage_cents =
-            env_dec_cents_lookup(&mut lookup, "MINIMAL_ENTRY_SLIPPAGE")
-                .unwrap_or(0)
-                .try_into()
-                .map_err(|_| ConfigError::Invalid {
-                    name: "MINIMAL_ENTRY_SLIPPAGE",
-                    reason: "out_of_range".into(),
-                })?;
+        let entry_slippage_cents = env_dec_cents_lookup(&mut lookup, "MINIMAL_ENTRY_SLIPPAGE")
+            .unwrap_or(0)
+            .try_into()
+            .map_err(|_| ConfigError::Invalid {
+                name: "MINIMAL_ENTRY_SLIPPAGE",
+                reason: "out_of_range".into(),
+            })?;
 
         Ok(Self {
             allow_live_orders,
@@ -203,9 +227,12 @@ impl Config {
             max_buy_limit_cents,
             min_decision_tte_us,
             max_decision_tte_us,
-            max_concurrent_positions: env_i64_lookup(&mut lookup, "MINIMAL_MAX_CONCURRENT_POSITIONS")
-                .unwrap_or(3)
-                .max(0) as usize,
+            max_concurrent_positions: env_i64_lookup(
+                &mut lookup,
+                "MINIMAL_MAX_CONCURRENT_POSITIONS",
+            )
+            .unwrap_or(3)
+            .max(0) as usize,
             signal_max_lag_us: env_i64_lookup(&mut lookup, "MINIMAL_SIGNAL_MAX_LAG_US")
                 .unwrap_or(250_000),
             signal_min_window_us: env_i64_lookup(&mut lookup, "MINIMAL_SIGNAL_MIN_WINDOW_US")
@@ -292,9 +319,7 @@ impl LaunchConfig {
         let binance_ws_url = lookup("MINIRUST_BINANCE_WS_URL")
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| {
-                format!(
-                    "wss://stream.binance.com:9443/ws/{symbol}@bookTicker?timeUnit=MICROSECOND"
-                )
+                format!("wss://stream.binance.com:9443/ws/{symbol}@bookTicker?timeUnit=MICROSECOND")
             });
         let poly_market_ws_url = lookup("MINIRUST_POLY_MARKET_WS_URL")
             .filter(|s| !s.trim().is_empty())
@@ -309,7 +334,8 @@ impl LaunchConfig {
         let market_slug_fmt = lookup("MINIRUST_MARKET_SLUG_FMT")
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| "btc-updown-5m-{ts}".to_owned());
-        let market_window_s = env_i64_lookup(&mut lookup, "MINIRUST_MARKET_WINDOW_S").unwrap_or(300);
+        let market_window_s =
+            env_i64_lookup(&mut lookup, "MINIRUST_MARKET_WINDOW_S").unwrap_or(300);
         if market_window_s <= 0 {
             return Err(ConfigError::Invalid {
                 name: "MINIRUST_MARKET_WINDOW_S",
@@ -328,7 +354,9 @@ impl LaunchConfig {
             .unwrap_or_else(|| "EOA".to_owned());
         let poly_signature_kind = match poly_signature_kind_str.to_ascii_uppercase().as_str() {
             "EOA" => crate::signing::SignatureKind::Eoa,
-            "POLYGON_GNO_SAFE" | "POLY_GNOSIS_SAFE" => crate::signing::SignatureKind::PolyGnosisSafe,
+            "POLYGON_GNO_SAFE" | "POLY_GNOSIS_SAFE" => {
+                crate::signing::SignatureKind::PolyGnosisSafe
+            }
             "POLY_PROXY" => crate::signing::SignatureKind::PolyProxy,
             other => {
                 return Err(ConfigError::Invalid {
@@ -386,10 +414,7 @@ pub fn load_env_file(path: &str) -> Result<usize, ConfigError> {
 
 fn env_bool_lookup(lookup: &mut impl FnMut(&str) -> Option<String>, name: &str) -> Option<bool> {
     let raw = lookup(name)?.trim().to_ascii_lowercase();
-    Some(matches!(
-        raw.as_str(),
-        "1" | "true" | "yes" | "on"
-    ))
+    Some(matches!(raw.as_str(), "1" | "true" | "yes" | "on"))
 }
 
 fn env_i64_lookup(lookup: &mut impl FnMut(&str) -> Option<String>, name: &str) -> Option<i64> {
@@ -398,11 +423,7 @@ fn env_i64_lookup(lookup: &mut impl FnMut(&str) -> Option<String>, name: &str) -
 
 fn env_f64_lookup(lookup: &mut impl FnMut(&str) -> Option<String>, name: &str) -> Option<f64> {
     let n = lookup(name)?.trim().parse::<f64>().ok()?;
-    if n.is_finite() {
-        Some(n)
-    } else {
-        None
-    }
+    if n.is_finite() { Some(n) } else { None }
 }
 
 fn required_string(
@@ -504,6 +525,63 @@ mod tests {
     }
 
     #[test]
+    fn config_rejects_both_dry_run_and_live_true() {
+        // Live-safety invariant: dry-run and live are mutually exclusive.
+        // Both-true must fail before any live submit infra is built.
+        let err = cfg_from_pairs(&[
+            ("POLY_ALLOW_LIVE_ORDERS", "true"),
+            ("MINIMAL_DRY_RUN_ORDERS", "true"),
+            ("MINIMAL_USDC_PER_TRADE", "1.01"),
+            ("MINIMAL_MIN_BUY_LIMIT", "0.35"),
+            ("MINIMAL_MAX_BUY_LIMIT", "0.65"),
+            ("MINIMAL_DECISION_MIN_TTE_US", "45000000"),
+        ])
+        .unwrap_err();
+        assert_eq!(err, ConfigError::ModeConflict);
+    }
+
+    #[test]
+    fn config_rejects_both_dry_run_and_live_false() {
+        // Pre-existing invariant: at least one mode must be set.
+        let err = cfg_from_pairs(&[
+            ("MINIMAL_USDC_PER_TRADE", "1.01"),
+            ("MINIMAL_MIN_BUY_LIMIT", "0.35"),
+            ("MINIMAL_MAX_BUY_LIMIT", "0.65"),
+            ("MINIMAL_DECISION_MIN_TTE_US", "45000000"),
+        ])
+        .unwrap_err();
+        assert_eq!(err, ConfigError::LiveDisallowed);
+    }
+
+    #[test]
+    fn config_accepts_dry_run_only() {
+        let cfg = cfg_from_pairs(&[
+            ("MINIMAL_DRY_RUN_ORDERS", "true"),
+            ("MINIMAL_USDC_PER_TRADE", "1.01"),
+            ("MINIMAL_MIN_BUY_LIMIT", "0.35"),
+            ("MINIMAL_MAX_BUY_LIMIT", "0.65"),
+            ("MINIMAL_DECISION_MIN_TTE_US", "45000000"),
+        ])
+        .unwrap();
+        assert!(cfg.dry_run_orders);
+        assert!(!cfg.allow_live_orders);
+    }
+
+    #[test]
+    fn config_accepts_live_only() {
+        let cfg = cfg_from_pairs(&[
+            ("POLY_ALLOW_LIVE_ORDERS", "true"),
+            ("MINIMAL_USDC_PER_TRADE", "1.01"),
+            ("MINIMAL_MIN_BUY_LIMIT", "0.35"),
+            ("MINIMAL_MAX_BUY_LIMIT", "0.65"),
+            ("MINIMAL_DECISION_MIN_TTE_US", "45000000"),
+        ])
+        .unwrap();
+        assert!(cfg.allow_live_orders);
+        assert!(!cfg.dry_run_orders);
+    }
+
+    #[test]
     fn config_builds_signal_and_buy_submit_policy_from_runtime_env_shape() {
         let cfg = cfg_from_pairs(&[
             ("POLY_ALLOW_LIVE_ORDERS", "true"),
@@ -569,16 +647,16 @@ mod tests {
             launch.poly_market_ws_url,
             "wss://ws-subscriptions-clob.polymarket.com/ws/market"
         );
-        assert_eq!(launch.poly_signature_kind, crate::signing::SignatureKind::PolyGnosisSafe);
+        assert_eq!(
+            launch.poly_signature_kind,
+            crate::signing::SignatureKind::PolyGnosisSafe
+        );
         assert_eq!(launch.poly_funder, Some("0xabc".to_owned()));
     }
 
     #[test]
     fn load_env_file_sets_missing_keys_only() {
-        let path = std::env::temp_dir().join(format!(
-            "minirust-env-{}.poly",
-            std::process::id()
-        ));
+        let path = std::env::temp_dir().join(format!("minirust-env-{}.poly", std::process::id()));
         std::fs::write(
             &path,
             "MINIRUST_ENV_TEST_A=one\nMINIRUST_ENV_TEST_B=\"two\"\n# ignored\n",

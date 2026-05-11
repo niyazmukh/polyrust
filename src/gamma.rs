@@ -67,7 +67,11 @@ impl GammaClient {
             .parse()
             .map_err(|e| format!("clob /time parse failed: {e}"))?;
         // Normalise ms → s if the value looks like a millisecond timestamp.
-        Ok(if raw > 10_000_000_000 { raw / 1000 } else { raw })
+        Ok(if raw > 10_000_000_000 {
+            raw / 1000
+        } else {
+            raw
+        })
     }
 
     // ------------------------------------------------------------------
@@ -100,9 +104,7 @@ impl GammaClient {
         let base_slug_ts = self.slug_ts(server_ts);
 
         for candidate_ts in [base_slug_ts, base_slug_ts + self.window_s] {
-            let slug = self
-                .slug_fmt
-                .replace("{ts}", &candidate_ts.to_string());
+            let slug = self.slug_fmt.replace("{ts}", &candidate_ts.to_string());
             if let Some(ctx) = self.try_discover_slug(&slug, candidate_ts).await {
                 return Some(ctx);
             }
@@ -110,34 +112,37 @@ impl GammaClient {
         None
     }
 
-    async fn try_discover_slug(
-        &self,
-        slug: &str,
-        slug_ts: i64,
-    ) -> Option<MarketContext> {
+    async fn try_discover_slug(&self, slug: &str, slug_ts: i64) -> Option<MarketContext> {
         let url = format!("{}/events/slug/{}", self.gamma_url, slug);
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .ok()?;
+        let resp = self.client.get(&url).send().await.ok()?;
         if !resp.status().is_success() {
             return None;
         }
         let event: Value = resp.json().await.ok()?;
 
         // Gate: must be active and not closed.
-        if !event.get("active").and_then(|v| v.as_bool()).unwrap_or(false) {
+        if !event
+            .get("active")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
             return None;
         }
-        if event.get("closed").and_then(|v| v.as_bool()).unwrap_or(false) {
+        if event
+            .get("closed")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
             return None;
         }
 
         let markets = event.get("markets")?.as_array()?;
         for market in markets {
-            if !market.get("active").and_then(|v| v.as_bool()).unwrap_or(false) {
+            if !market
+                .get("active")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
                 continue;
             }
             if !market
@@ -147,7 +152,11 @@ impl GammaClient {
             {
                 continue;
             }
-            if market.get("closed").and_then(|v| v.as_bool()).unwrap_or(false) {
+            if market
+                .get("closed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
                 continue;
             }
 
@@ -166,10 +175,7 @@ impl GammaClient {
                 .get("startDate")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let end_raw = market
-                .get("endDate")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let end_raw = market.get("endDate").and_then(|v| v.as_str()).unwrap_or("");
             let end_ts = parse_gamma_iso8601(end_raw).unwrap_or(slug_ts + self.window_s);
 
             // Already expired? Skip.
@@ -218,7 +224,11 @@ fn parse_clob_tokens(value: &Value, outcomes: Option<&Value>) -> Option<Vec<Clob
 
     let parse_str_array = |v: &Value| -> Option<Vec<String>> {
         if let Some(arr) = v.as_array() {
-            return Some(arr.iter().filter_map(|s| s.as_str().map(|s| s.to_owned())).collect());
+            return Some(
+                arr.iter()
+                    .filter_map(|s| s.as_str().map(|s| s.to_owned()))
+                    .collect(),
+            );
         }
         if let Some(s) = v.as_str()
             && let Ok(p) = serde_json::from_str::<Vec<String>>(s)
@@ -238,7 +248,7 @@ fn parse_clob_tokens(value: &Value, outcomes: Option<&Value>) -> Option<Vec<Clob
                 token_id: TokenId::new(id),
                 outcome: outs.get(i).cloned().unwrap_or_default(),
             })
-            .collect()
+            .collect(),
     )
 }
 

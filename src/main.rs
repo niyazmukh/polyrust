@@ -24,9 +24,7 @@ use minirust::feed;
 use minirust::gamma::GammaClient;
 use minirust::logline::{self, Field, Level};
 use minirust::runtime::{self, RuntimeCore};
-use minirust::signing::{
-    OrderSigner, SignInputs, EXCHANGE_V2_NORMAL, POLYGON_CHAIN_ID,
-};
+use minirust::signing::{EXCHANGE_V2_NORMAL, OrderSigner, POLYGON_CHAIN_ID, SignInputs};
 use minirust::submit::HttpSubmitter;
 use minirust::types::TsUs;
 use tokio::sync::mpsc;
@@ -73,10 +71,22 @@ async fn main() {
         Level::Warn,
         "minirust_start",
         &[
-            Field { key: "dry_run", value: &cfg.dry_run_orders },
-            Field { key: "live", value: &cfg.allow_live_orders },
-            Field { key: "slug_fmt", value: &launch.market_slug_fmt.as_str() },
-            Field { key: "binance_url", value: &launch.binance_ws_url.as_str() },
+            Field {
+                key: "dry_run",
+                value: &cfg.dry_run_orders,
+            },
+            Field {
+                key: "live",
+                value: &cfg.allow_live_orders,
+            },
+            Field {
+                key: "slug_fmt",
+                value: &launch.market_slug_fmt.as_str(),
+            },
+            Field {
+                key: "binance_url",
+                value: &launch.binance_ws_url.as_str(),
+            },
         ],
     );
 
@@ -116,7 +126,13 @@ async fn main() {
     // 6. Live-submit infrastructure (only built when POLY_ALLOW_LIVE_ORDERS=true).
     //    Shadow mode skips both — no signer, no HTTP submitter.
     let auth_signer: Option<L2AuthSigner> = if cfg.allow_live_orders {
-        L2AuthSigner::new(&poly_api_key, &poly_passphrase, &poly_api_secret, &poly_address).ok()
+        L2AuthSigner::new(
+            &poly_api_key,
+            &poly_passphrase,
+            &poly_api_secret,
+            &poly_address,
+        )
+        .ok()
     } else {
         None
     };
@@ -151,7 +167,11 @@ async fn main() {
             eprintln!("FATAL: live mode requires valid OrderSigner (POLY_PK)");
             std::process::exit(2);
         }
-        if poly_api_key.is_empty() || poly_api_secret.is_empty() || poly_passphrase.is_empty() || poly_address.is_empty() {
+        if poly_api_key.is_empty()
+            || poly_api_secret.is_empty()
+            || poly_passphrase.is_empty()
+            || poly_address.is_empty()
+        {
             eprintln!(
                 "FATAL: live mode requires POLY_API_KEY, POLY_API_SECRET, POLY_PASSPHRASE, and POLY_ADDRESS for user WSS and L2 Auth"
             );
@@ -163,7 +183,10 @@ async fn main() {
             logline::log_event(
                 Level::Error,
                 "ensure_flat_start_failed",
-                &[Field { key: "reason", value: &e }],
+                &[Field {
+                    key: "reason",
+                    value: &e,
+                }],
             );
             std::process::exit(3);
         }
@@ -201,10 +224,12 @@ async fn main() {
                         core.lock()
                             .ok()
                             .and_then(|mut c| c.state_mut().market().cloned())
-                            .map(|m| vec![
-                                m.yes_token.as_str().to_owned(),
-                                m.no_token.as_str().to_owned(),
-                            ])
+                            .map(|m| {
+                                vec![
+                                    m.yes_token.as_str().to_owned(),
+                                    m.no_token.as_str().to_owned(),
+                                ]
+                            })
                             .unwrap_or_default()
                     }
                 },
@@ -265,7 +290,10 @@ async fn main() {
                         logline::log_event(
                             Level::Warn,
                             "shadow_anchor_resolved",
-                            &[Field { key: "strike", value: &strike }],
+                            &[Field {
+                                key: "strike",
+                                value: &strike,
+                            }],
                         );
                     }
                 }
@@ -290,7 +318,9 @@ async fn main() {
                             return;
                         }
                     };
-                    let tte_us = market.end_ts.saturating_mul(1_000_000)
+                    let tte_us = market
+                        .end_ts
+                        .saturating_mul(1_000_000)
                         .saturating_sub(ts.micros());
 
                     match c.on_binance_sample(sample, ts, tte_us) {
@@ -327,7 +357,10 @@ async fn main() {
                                     &intent2,
                                     policy,
                                     &sign,
-                                    SignInputs { salt: id, timestamp_ms: now_ms() },
+                                    SignInputs {
+                                        salt: id,
+                                        timestamp_ms: now_ms(),
+                                    },
                                     claim_id2,
                                 ) {
                                     Ok(p) => p,
@@ -335,7 +368,10 @@ async fn main() {
                                         logline::log_event(
                                             Level::Error,
                                             "buy_prepare_failed",
-                                            &[Field { key: "error", value: &e.to_string().as_str() }],
+                                            &[Field {
+                                                key: "error",
+                                                value: &e.to_string().as_str(),
+                                            }],
                                         );
                                         // Release the claim so this token is
                                         // unblocked for future BUYs.
@@ -366,11 +402,26 @@ async fn main() {
                                     Level::Warn,
                                     "buy_submit_outcome",
                                     &[
-                                        Field { key: "signal_id", value: &(id as i64) },
-                                        Field { key: "side", value: &intent2.side.as_str() },
-                                        Field { key: "token_id", value: &intent2.token.as_str() },
-                                        Field { key: "accepted", value: &accepted },
-                                        Field { key: "http_status", value: &(outcome.http_status() as i64) },
+                                        Field {
+                                            key: "signal_id",
+                                            value: &(id as i64),
+                                        },
+                                        Field {
+                                            key: "side",
+                                            value: &intent2.side.as_str(),
+                                        },
+                                        Field {
+                                            key: "token_id",
+                                            value: &intent2.token.as_str(),
+                                        },
+                                        Field {
+                                            key: "accepted",
+                                            value: &accepted,
+                                        },
+                                        Field {
+                                            key: "http_status",
+                                            value: &(outcome.http_status() as i64),
+                                        },
                                     ],
                                 );
                             });
@@ -381,11 +432,26 @@ async fn main() {
                             Level::Warn,
                             "shadow_buy_signal",
                             &[
-                                Field { key: "signal_id", value: &(id as i64) },
-                                Field { key: "side", value: &intent.side.as_str() },
-                                Field { key: "token_id", value: &intent.token.as_str() },
-                                Field { key: "limit_ticks", value: &intent.limit.ticks() },
-                                Field { key: "edge_ticks", value: &intent.edge_ticks },
+                                Field {
+                                    key: "signal_id",
+                                    value: &(id as i64),
+                                },
+                                Field {
+                                    key: "side",
+                                    value: &intent.side.as_str(),
+                                },
+                                Field {
+                                    key: "token_id",
+                                    value: &intent.token.as_str(),
+                                },
+                                Field {
+                                    key: "limit_ticks",
+                                    value: &intent.limit.ticks(),
+                                },
+                                Field {
+                                    key: "edge_ticks",
+                                    value: &intent.edge_ticks,
+                                },
                             ],
                         );
                     }
@@ -414,7 +480,10 @@ async fn main() {
                 logline::log_event(
                     Level::Warn,
                     "user_feed_skipped",
-                    &[Field { key: "reason", value: &"missing POLY_API_KEY, POLY_API_SECRET, or POLY_PASSPHRASE" }],
+                    &[Field {
+                        key: "reason",
+                        value: &"missing POLY_API_KEY, POLY_API_SECRET, or POLY_PASSPHRASE",
+                    }],
                 );
                 return;
             }
@@ -438,12 +507,26 @@ async fn main() {
                             }
                             Ok(minirust::user::UserMessage::AuthError(msg)) => {
                                 c.inventory_mut().set_user_wss_trusted(false);
-                                logline::log_event(Level::Error, "user_wss_auth_error", &[Field { key: "msg", value: &msg }]);
+                                logline::log_event(
+                                    Level::Error,
+                                    "user_wss_auth_error",
+                                    &[Field {
+                                        key: "msg",
+                                        value: &msg,
+                                    }],
+                                );
                             }
                             Err(e) => {
                                 let err_msg = format!("{e:?}");
                                 c.inventory_mut().set_user_wss_trusted(false);
-                                logline::log_event(Level::Error, "user_wss_parse_failed", &[Field { key: "err", value: &err_msg }]);
+                                logline::log_event(
+                                    Level::Error,
+                                    "user_wss_parse_failed",
+                                    &[Field {
+                                        key: "err",
+                                        value: &err_msg,
+                                    }],
+                                );
                             }
                             Ok(_) => {}
                         }
@@ -456,16 +539,14 @@ async fn main() {
                             .market()
                             .map(|m| vec![m.yes_token.clone(), m.no_token.clone()])
                             .unwrap_or_default();
-                        tokens
-                            .into_iter()
-                            .find_map(|token| {
-                                let pos = c.inventory_mut().position(&token)?;
-                                if pos.sellable.units() > 0 {
-                                    Some(token)
-                                } else {
-                                    None
-                                }
-                            })
+                        tokens.into_iter().find_map(|token| {
+                            let pos = c.inventory_mut().position(&token)?;
+                            if pos.sellable.units() > 0 {
+                                Some(token)
+                            } else {
+                                None
+                            }
+                        })
                     };
 
                     // Fire sell outside the lock.
@@ -475,24 +556,40 @@ async fn main() {
                         let sub2 = sub.clone();
                         let sign2 = sign.clone();
                         let core2 = core.clone();
-                        let sid_val =
-                            sid.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let sid_val = sid.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         tokio::spawn(async move {
-                            let prepared = {
+                            // Plan under the lock (quote + inventory read only),
+                            // drop the lock, then sign + submit outside it.
+                            // Signing under `core.lock()` would serialize against
+                            // the Binance BUY hot path.
+                            let plan = {
                                 let c = match core2.lock() {
                                     Ok(c) => c,
                                     Err(_) => return,
                                 };
-                                match c.prepare_sell_at_bid(
-                                    &token,
-                                    &sign2,
-                                    SignInputs {
-                                        salt: sid_val,
-                                        timestamp_ms: now_ms(),
-                                    },
-                                ) {
-                                    Ok(Some(p)) => p,
-                                    _ => return,
+                                match c.plan_sell_at_bid(&token) {
+                                    Some(p) => p,
+                                    None => return,
+                                }
+                            };
+                            let prepared = match plan.sign(
+                                &sign2,
+                                SignInputs {
+                                    salt: sid_val,
+                                    timestamp_ms: now_ms(),
+                                },
+                            ) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    logline::log_event(
+                                        Level::Error,
+                                        "sell_prepare_failed",
+                                        &[Field {
+                                            key: "error",
+                                            value: &e.to_string().as_str(),
+                                        }],
+                                    );
+                                    return;
                                 }
                             };
                             let outcome = sub2.submit_order(&prepared.body).await;
@@ -500,7 +597,10 @@ async fn main() {
                                 Level::Warn,
                                 "sell_trade_trigger",
                                 &[
-                                    Field { key: "token_id", value: &token.as_str() },
+                                    Field {
+                                        key: "token_id",
+                                        value: &token.as_str(),
+                                    },
                                     Field {
                                         key: "accepted",
                                         value: &outcome.is_accepted(),
@@ -534,9 +634,7 @@ async fn main() {
         let sign = order_signer.clone();
         let sid = sell_id.clone();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(
-                std::time::Duration::from_micros(50_000),
-            );
+            let mut tick = tokio::time::interval(std::time::Duration::from_micros(50_000));
             tick.tick().await;
             loop {
                 tick.tick().await;
@@ -549,8 +647,10 @@ async fn main() {
                     None => continue,
                 };
 
-                // Collect sellable positions under lock.
-                let sells: Vec<_> = {
+                // Collect sellable plans under lock. Signing is done
+                // outside the lock to avoid serializing against the
+                // Binance BUY hot path.
+                let plans: Vec<_> = {
                     let mut c = match core.lock() {
                         Ok(c) => c,
                         Err(_) => continue,
@@ -562,27 +662,33 @@ async fn main() {
                         .unwrap_or_default();
                     tokens
                         .into_iter()
-                        .filter_map(|token| {
-                            let pos = c.inventory().position(&token)?;
-                            if pos.sellable.units() <= 0 {
-                                return None;
-                            }
-                            let prepared = c.prepare_sell_at_bid(
-                                &token,
-                                &sign,
-                                SignInputs {
-                                    salt: sid.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                                    timestamp_ms: now_ms(),
-                                },
-                            )
-                            .ok()??;
-                            Some((prepared, token))
-                        })
+                        .filter_map(|token| c.plan_sell_at_bid(&token))
                         .collect()
                 };
 
-                // Fire sells outside the lock via spawn.
-                for (prepared, token) in sells {
+                // Sign and fire sells outside the lock.
+                for plan in plans {
+                    let token = plan.token.clone();
+                    let prepared = match plan.sign(
+                        &sign,
+                        SignInputs {
+                            salt: sid.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                            timestamp_ms: now_ms(),
+                        },
+                    ) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            logline::log_event(
+                                Level::Error,
+                                "sell_prepare_failed",
+                                &[Field {
+                                    key: "error",
+                                    value: &e.to_string().as_str(),
+                                }],
+                            );
+                            continue;
+                        }
+                    };
                     let sub2 = sub.clone();
                     tokio::spawn(async move {
                         let outcome = sub2.submit_order(&prepared.body).await;
@@ -590,8 +696,14 @@ async fn main() {
                             Level::Warn,
                             "sell_submit_outcome",
                             &[
-                                Field { key: "token_id", value: &token.as_str() },
-                                Field { key: "accepted", value: &outcome.is_accepted() },
+                                Field {
+                                    key: "token_id",
+                                    value: &token.as_str(),
+                                },
+                                Field {
+                                    key: "accepted",
+                                    value: &outcome.is_accepted(),
+                                },
                                 Field {
                                     key: "http_status",
                                     value: &(outcome.http_status() as i64),
@@ -614,9 +726,7 @@ async fn main() {
         let sign = order_signer.clone();
         let sid = sell_id.clone();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(
-                std::time::Duration::from_millis(500),
-            );
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(500));
             tick.tick().await;
             loop {
                 tick.tick().await;
@@ -625,7 +735,7 @@ async fn main() {
                     _ => continue,
                 };
 
-                let force_sells: Vec<_> = {
+                let force_plans: Vec<_> = {
                     let mut c = match core.lock() {
                         Ok(c) => c,
                         Err(_) => continue,
@@ -652,22 +762,34 @@ async fn main() {
                             if size_atoms.atoms() <= 0 {
                                 return None;
                             }
-                            let prepared = c.prepare_sell_for_size_at_bid(
-                                &token,
-                                size_atoms,
-                                &sign,
-                                SignInputs {
-                                    salt: sid.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                                    timestamp_ms: now_ms(),
-                                },
-                            )
-                            .ok()??;
-                            Some((prepared, token))
+                            c.plan_sell_for_size_at_bid(&token, size_atoms)
                         })
                         .collect()
                 };
 
-                for (prepared, token) in force_sells {
+                // Sign and fire force sells outside the lock.
+                for plan in force_plans {
+                    let token = plan.token.clone();
+                    let prepared = match plan.sign(
+                        &sign,
+                        SignInputs {
+                            salt: sid.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                            timestamp_ms: now_ms(),
+                        },
+                    ) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            logline::log_event(
+                                Level::Error,
+                                "force_sell_prepare_failed",
+                                &[Field {
+                                    key: "error",
+                                    value: &e.to_string().as_str(),
+                                }],
+                            );
+                            continue;
+                        }
+                    };
                     let sub2 = sub.clone();
                     tokio::spawn(async move {
                         let outcome = sub2.submit_order(&prepared.body).await;
@@ -675,8 +797,14 @@ async fn main() {
                             Level::Warn,
                             "force_sell_outcome",
                             &[
-                                Field { key: "token_id", value: &token.as_str() },
-                                Field { key: "accepted", value: &outcome.is_accepted() },
+                                Field {
+                                    key: "token_id",
+                                    value: &token.as_str(),
+                                },
+                                Field {
+                                    key: "accepted",
+                                    value: &outcome.is_accepted(),
+                                },
                             ],
                         );
                     });
@@ -693,19 +821,25 @@ async fn main() {
         let core = core.clone();
         let anchor = anchor.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(
-                std::time::Duration::from_secs(10),
-            );
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
             interval.tick().await; // skip initial burst
             loop {
                 interval.tick().await;
 
-                // 1. Expire unknown submits older than 30 s.
+                // 1. Expire unknown submits older than 30 s, and pending
+                //    claims older than 60 s (defensive — the spawned submit
+                //    task normally resolves the outcome in ≤ 2 s via HTTP
+                //    timeout, but a task panic or cancellation would
+                //    otherwise leave the Pending claim blocking same-token
+                //    BUY forever).
                 //    Traces to: _unknown_submit_expiry_loop in minimal_live_bot.py.
                 {
                     let mut c = core.lock().unwrap();
-                    let cutoff = now_us().saturating_sub(30_000_000);
-                    c.inventory_mut().expire_unknowns(cutoff);
+                    let now = now_us();
+                    let unknown_cutoff = now.saturating_sub(30_000_000);
+                    let pending_cutoff = now.saturating_sub(60_000_000);
+                    c.inventory_mut().expire_unknowns(unknown_cutoff);
+                    c.inventory_mut().expire_pending(pending_cutoff);
                 }
 
                 // 2. Discover current market.
@@ -719,8 +853,7 @@ async fn main() {
                     let mut c = core.lock().unwrap();
                     let current = c.state_mut().market();
                     let is_new = current.is_none_or(|m| {
-                        m.condition_id != discovered.condition_id
-                            || m.slug != discovered.slug
+                        m.condition_id != discovered.condition_id || m.slug != discovered.slug
                     });
                     if is_new {
                         // P0-4: fail-closed if old tokens have nonzero inventory.
@@ -736,8 +869,14 @@ async fn main() {
                                     Level::Error,
                                     "rotation_blocked_nonzero_inventory",
                                     &[
-                                        Field { key: "yes_atoms", value: &yes_atoms },
-                                        Field { key: "no_atoms", value: &no_atoms },
+                                        Field {
+                                            key: "yes_atoms",
+                                            value: &yes_atoms,
+                                        },
+                                        Field {
+                                            key: "no_atoms",
+                                            value: &no_atoms,
+                                        },
                                     ],
                                 );
                                 false
@@ -755,9 +894,18 @@ async fn main() {
                                 Level::Warn,
                                 "minirust_market_context",
                                 &[
-                                    Field { key: "slug", value: &discovered.slug.as_str() },
-                                    Field { key: "condition_id", value: &discovered.condition_id.as_str() },
-                                    Field { key: "end_ts", value: &discovered.end_ts },
+                                    Field {
+                                        key: "slug",
+                                        value: &discovered.slug.as_str(),
+                                    },
+                                    Field {
+                                        key: "condition_id",
+                                        value: &discovered.condition_id.as_str(),
+                                    },
+                                    Field {
+                                        key: "end_ts",
+                                        value: &discovered.end_ts,
+                                    },
                                 ],
                             );
                             c.inventory_mut().release_market_scope([&yes, &no]);
@@ -784,8 +932,10 @@ async fn main() {
                         let m = c.state_mut().market();
                         (
                             m.map(|m| m.slug_ts).unwrap_or(0),
-                            m.map(|m| m.yes_token.as_str().to_owned()).unwrap_or_default(),
-                            m.map(|m| m.no_token.as_str().to_owned()).unwrap_or_default(),
+                            m.map(|m| m.yes_token.as_str().to_owned())
+                                .unwrap_or_default(),
+                            m.map(|m| m.no_token.as_str().to_owned())
+                                .unwrap_or_default(),
                         )
                     };
                     a.set_pending(slug_ts);

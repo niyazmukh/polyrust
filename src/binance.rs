@@ -51,7 +51,9 @@ pub fn parse_book_ticker(raw: &[u8]) -> Result<Option<BinanceBookTicker>, Binanc
         return Ok(None);
     }
 
-    let has_ticker_shape = ["u", "b", "B", "a", "A"].iter().any(|k| obj.contains_key(*k));
+    let has_ticker_shape = ["u", "b", "B", "a", "A"]
+        .iter()
+        .any(|k| obj.contains_key(*k));
     if !has_ticker_shape {
         return Ok(None);
     }

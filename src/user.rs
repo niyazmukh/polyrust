@@ -47,16 +47,22 @@ pub fn parse_user_message(raw: &[u8], ts_us: i64) -> Result<UserMessage, UserPar
     if let Some(event) = optional_str(&value, &["event_type", "eventType", "event", "type"]) {
         if event.eq_ignore_ascii_case("auth") {
             match optional_str(&value, &["status"]) {
-                Some(s) if s.eq_ignore_ascii_case("SUCCESS") => return Ok(UserMessage::AuthSuccess),
+                Some(s) if s.eq_ignore_ascii_case("SUCCESS") => {
+                    return Ok(UserMessage::AuthSuccess);
+                }
                 Some(s) if s.eq_ignore_ascii_case("ERROR") || s.eq_ignore_ascii_case("FAILURE") => {
                     return Ok(UserMessage::AuthError(
-                        optional_str(&value, &["message", "msg"]).unwrap_or(s).to_owned(),
+                        optional_str(&value, &["message", "msg"])
+                            .unwrap_or(s)
+                            .to_owned(),
                     ));
                 }
                 _ => return Ok(UserMessage::Other),
             }
         } else if event.eq_ignore_ascii_case("error") {
-            let msg = optional_str(&value, &["message", "msg"]).unwrap_or("unknown error").to_owned();
+            let msg = optional_str(&value, &["message", "msg"])
+                .unwrap_or("unknown error")
+                .to_owned();
             return Ok(UserMessage::AuthError(msg));
         } else if event.eq_ignore_ascii_case("success") {
             return Ok(UserMessage::AuthSuccess);
@@ -85,24 +91,38 @@ pub fn parse_user_message(raw: &[u8], ts_us: i64) -> Result<UserMessage, UserPar
     }
 }
 
-fn parse_trade_value(value: &Value, fallback_ts_us: i64) -> Result<Option<UserTrade>, UserParseError> {
+fn parse_trade_value(
+    value: &Value,
+    fallback_ts_us: i64,
+) -> Result<Option<UserTrade>, UserParseError> {
     if !is_trade_event(value) {
         return Ok(None);
     }
     let trade_id = required_str(value, &["trade_id", "tradeId", "id"], "trade_id")?;
-    let token = required_str(value, &["asset_id", "assetId", "token_id", "tokenId"], "asset_id")?;
+    let token = required_str(
+        value,
+        &["asset_id", "assetId", "token_id", "tokenId"],
+        "asset_id",
+    )?;
     let side = parse_side(required_str(value, &["side"], "side")?)?;
     let size_raw = required_str(value, &["size", "amount"], "size")?;
     let price_raw = required_str(value, &["price"], "price")?;
     let status_raw = optional_str(value, &["status"]).unwrap_or("MATCHED");
-    let ts_us = optional_i64(value, &["ts_us", "timestamp_us", "timestampUs"]).unwrap_or(fallback_ts_us);
+    let ts_us =
+        optional_i64(value, &["ts_us", "timestamp_us", "timestampUs"]).unwrap_or(fallback_ts_us);
 
     Ok(Some(UserTrade {
         trade_id: TradeId::new(trade_id),
         token: TokenId::new(token),
         taker_order_id: optional_str(
             value,
-            &["taker_order_id", "takerOrderId", "order_id", "orderId", "orderID"],
+            &[
+                "taker_order_id",
+                "takerOrderId",
+                "order_id",
+                "orderId",
+                "orderID",
+            ],
         )
         .map(OrderId::new),
         side,
@@ -165,7 +185,10 @@ mod tests {
             "ts_us":1778087750526774
         }"#;
         let msg = parse_user_message(raw, 1).unwrap();
-        let trades = match msg { UserMessage::Trades(t) => t, _ => panic!("expected trades") };
+        let trades = match msg {
+            UserMessage::Trades(t) => t,
+            _ => panic!("expected trades"),
+        };
         assert_eq!(trades.len(), 1);
         let t = &trades[0];
         assert_eq!(t.trade_id.as_str(), "tr1");
@@ -184,7 +207,10 @@ mod tests {
             {"event_type":"trade","id":"tr1","asset_id":"123","side":"SELL","size":"0.010000","price":"0.87","status":"CONFIRMED"}
         ]"#;
         let msg = parse_user_message(raw, 42).unwrap();
-        let trades = match msg { UserMessage::Trades(t) => t, _ => panic!("expected trades") };
+        let trades = match msg {
+            UserMessage::Trades(t) => t,
+            _ => panic!("expected trades"),
+        };
         assert_eq!(trades.len(), 1);
         assert_eq!(trades[0].side, OrderSide::Sell);
         assert_eq!(trades[0].size_atoms, SharesAtoms(10_000));

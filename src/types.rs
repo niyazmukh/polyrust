@@ -459,9 +459,7 @@ fn parse_decimal_scaled(raw: &str, scale: i64) -> Option<i64> {
         whole_str.parse::<i64>().ok()?
     };
     let scale_digits = decimal_scale_digits(scale)?;
-    if frac_str.len() > scale_digits
-        && !frac_str[scale_digits..].chars().all(|c| c == '0')
-    {
+    if frac_str.len() > scale_digits && !frac_str[scale_digits..].chars().all(|c| c == '0') {
         return None;
     }
     let mut frac_padded = String::with_capacity(scale_digits);
@@ -548,7 +546,10 @@ mod tests {
     fn decimal_parsers_fail_closed() {
         assert_eq!(PriceTick::parse_decimal("0.59"), Ok(PriceTick(59)));
         assert!(PriceTick::parse_decimal("0.591").is_err());
-        assert_eq!(SharesAtoms::parse_decimal("1.416664"), Ok(SharesAtoms(1_416_664)));
+        assert_eq!(
+            SharesAtoms::parse_decimal("1.416664"),
+            Ok(SharesAtoms(1_416_664))
+        );
         assert!(SharesAtoms::parse_decimal("1.4166641").is_err());
     }
 

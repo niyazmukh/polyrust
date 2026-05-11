@@ -215,7 +215,8 @@ impl SignalEngine {
             return None;
         }
 
-        let limit = PriceTick::checked(ask.ticks().checked_add(self.cfg.entry_slippage_ticks)?) .ok()?;
+        let limit =
+            PriceTick::checked(ask.ticks().checked_add(self.cfg.entry_slippage_ticks)?).ok()?;
         if limit < self.cfg.min_buy_limit || limit > self.cfg.max_buy_limit {
             return None;
         }
@@ -249,12 +250,15 @@ impl SignalEngine {
         if self.samples.is_empty() {
             return 0.0;
         }
-        let bid_flow = (if sample.bid >= self.last_bid { sample.bid_qty } else { 0.0 })
-            - if sample.bid <= self.last_bid {
-                self.last_bid_qty
-            } else {
-                0.0
-            };
+        let bid_flow = (if sample.bid >= self.last_bid {
+            sample.bid_qty
+        } else {
+            0.0
+        }) - if sample.bid <= self.last_bid {
+            self.last_bid_qty
+        } else {
+            0.0
+        };
         let ask_flow = (if sample.ask >= self.last_ask {
             self.last_ask_qty
         } else {
@@ -289,7 +293,8 @@ impl SignalEngine {
         let sigma_px = self
             .realized_sigma_since(latest_ts.micros() - self.cfg.max_window_us)
             .max(self.cfg.prob_sigma_floor_usd);
-        let sigma_eff = self.cfg.prob_sigma_scale * sigma_px * ((tte_us as f64) / 1_000_000.0).sqrt();
+        let sigma_eff =
+            self.cfg.prob_sigma_scale * sigma_px * ((tte_us as f64) / 1_000_000.0).sqrt();
         if !sigma_eff.is_finite() || sigma_eff <= 1e-9 {
             return None;
         }
@@ -316,7 +321,8 @@ impl SignalEngine {
             .filter(|sample| sample.ts_us.micros() >= cutoff_us)
         {
             if let Some(p) = prev {
-                let dt_s = ((sample.ts_us.micros() - p.ts_us.micros()).max(1_000) as f64) / 1_000_000.0;
+                let dt_s =
+                    ((sample.ts_us.micros() - p.ts_us.micros()).max(1_000) as f64) / 1_000_000.0;
                 let dp = sample.microprice - p.microprice;
                 sum_sq += dp * dp;
                 total_dt_s += dt_s;
@@ -341,8 +347,7 @@ fn phi(z: f64) -> f64 {
 
 fn phi_tail(z: f64) -> f64 {
     let t = 1.0 / (1.0 + 0.231_641_9 * z);
-    let poly = (((((1.330_274_429 * t - 1.821_255_978) * t) + 1.781_477_937) * t
-        - 0.356_563_782)
+    let poly = (((((1.330_274_429 * t - 1.821_255_978) * t) + 1.781_477_937) * t - 0.356_563_782)
         * t
         + 0.319_381_530)
         * t;

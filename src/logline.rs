@@ -14,9 +14,9 @@
 //! log sizes.
 
 use std::io::Write;
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::mpsc::{SyncSender, sync_channel};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]

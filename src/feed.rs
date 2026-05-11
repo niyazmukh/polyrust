@@ -70,9 +70,9 @@ pub async fn market_feed_loop(
                     }
                 }
 
-                let mut ping = tokio::time::interval(
-                    std::time::Duration::from_secs_f64(ws::POLY_PING_INTERVAL_S),
-                );
+                let mut ping = tokio::time::interval(std::time::Duration::from_secs_f64(
+                    ws::POLY_PING_INTERVAL_S,
+                ));
                 ping.tick().await; // skip initial burst
 
                 loop {
@@ -130,10 +130,7 @@ pub async fn market_feed_loop(
 /// Traces to: binance_sbe_listener.py:583-614.
 /// NOTE: Python uses SBE binary; Rust uses JSON @bookTicker which
 /// `binance.rs::parse_book_ticker` already handles.
-pub async fn binance_feed_loop(
-    url: &str,
-    on_ticker: impl Fn(Bytes) + Send + 'static,
-) {
+pub async fn binance_feed_loop(url: &str, on_ticker: impl Fn(Bytes) + Send + 'static) {
     let mut backoff = Backoff::new(250.0, 1.7, 8_000.0);
     loop {
         match ws::connect(url, None).await {
@@ -205,9 +202,9 @@ pub async fn user_feed_loop(
                     continue;
                 }
 
-                let mut ping = tokio::time::interval(
-                    std::time::Duration::from_secs_f64(ws::POLY_PING_INTERVAL_S),
-                );
+                let mut ping = tokio::time::interval(std::time::Duration::from_secs_f64(
+                    ws::POLY_PING_INTERVAL_S,
+                ));
                 ping.tick().await; // skip initial burst
 
                 loop {
@@ -287,18 +284,12 @@ mod tests {
         });
 
         // Wait for the frame to arrive.
-        let received = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            rx.recv(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let received = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
 
-        assert!(received
-            .to_vec()
-            .windows(11)
-            .any(|w| w == b"\"bookTicker"));
+        assert!(received.to_vec().windows(11).any(|w| w == b"\"bookTicker"));
         feed.abort();
         server.abort();
     }
@@ -323,13 +314,10 @@ mod tests {
         });
 
         // Wait for server to receive auth frame.
-        let first_frame = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            server,
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let first_frame = tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
 
         match first_frame {
             Some(Ok(Message::Text(t))) => {
