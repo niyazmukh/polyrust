@@ -144,54 +144,40 @@ impl HttpSubmitter {
     /// Retrieve positions to ensure the bot starts with a flat inventory.
     /// This prevents risk overlap across restarts.
     ///
-    /// P0-3 hardening: fail-closed on any response that is not a JSON
-    /// array. Parse both string and numeric `size` values. Reject any
-    /// position whose size parses to a non-zero positive number.
+    /// Uses official Polymarket endpoints:
+    ///   Positions: GET https://data-api.polymarket.com/positions?user={addr}
+    ///     (unauthenticated, per core/get-current-positions-for-a-user)
+    ///   Orders:   GET https://clob.polymarket.com/data/orders
+    ///     (L2-authenticated, per trade/get-user-orders)
     ///
-    /// Verifies the account has a perfectly flat inventory before starting.
-    /// It queries `GET /positions` and `GET /orders` and fails closed if
-    /// any nonzero sizes or resting limit orders are found.
-    ///
-    /// Release-blocker note: the exact endpoint URL `"/orders?status=OPEN"`
-    /// and the HMAC path string used for L2 auth on it are unit-tested for
-    /// shape only (array-or-fail, empty-array-or-fail). Neither has been
-    /// round-tripped against the live CLOB from the deploy target. Before
-    /// cutting over to live, run one authenticated probe to confirm:
-    ///
-    ///   1. HTTP 200 on the happy path with an empty array body;
-    ///   2. The HMAC signature path matches what the venue expects
-    ///      (path + query vs path only).
-    ///
-    /// A mismatch will block live startup (fail-closed). This is a
-    /// "cannot go live", not "goes live with open orders", failure.
+    /// Fail-closed on any nonzero position or any open order.
     pub async fn verify_flat_start(&self) -> Result<(), String> {
-        let ts = (self.now_secs)();
-        let url = format!("{}/positions", self.base_url);
-        let mut req = self.client.get(&url);
-        let headers = self.auth.headers("GET", "/positions", b"", ts);
-        for (name, value) in headers.as_pairs() {
-            req = req.header(name, value);
-        }
-        let resp = req
+        let user_address = self.auth.address();
+
+        // 1. Positions via Data API — unauthenticated, different host.
+        let pos_url =
+            format!("https://data-api.polymarket.com/positions?user={user_address}&limit=1");
+        let resp = self
+            .client
+            .get(&pos_url)
             .send()
             .await
-            .map_err(|e| format!("flat_start http: {e}"))?;
+            .map_err(|e| format!("flat_start positions http: {e}"))?;
         if !resp.status().is_success() {
-            return Err(format!("flat_start API error: {}", resp.status()));
+            return Err(format!("flat_start positions API error: {}", resp.status()));
         }
         let body = resp
             .text()
             .await
-            .map_err(|e| format!("flat_start read: {e}"))?;
+            .map_err(|e| format!("flat_start positions read: {e}"))?;
         let value: Value =
-            serde_json::from_str(&body).map_err(|e| format!("flat_start json parse: {e}"))?;
+            serde_json::from_str(&body).map_err(|e| format!("flat_start positions json: {e}"))?;
 
-        // P0-3: fail-closed if response is not a JSON array.
         let positions = match value {
             Value::Array(arr) => arr,
             _ => {
                 return Err(format!(
-                    "flat_start unexpected schema: expected array, got: {}",
+                    "flat_start positions unexpected schema: expected array, got: {}",
                     body.chars().take(200).collect::<String>()
                 ));
             }
@@ -218,34 +204,34 @@ impl HttpSubmitter {
             ));
         }
 
-        // Check for resting open orders.
-        let ts2 = (self.now_secs)();
-        let orders_url = format!("{}/orders?status=OPEN", self.base_url);
-        let mut req2 = self.client.get(&orders_url);
-        let headers2 = self.auth.headers("GET", "/orders?status=OPEN", b"", ts2);
-        for (name, value) in headers2.as_pairs() {
-            req2 = req2.header(name, value);
+        // 2. Open orders via CLOB API — L2-authenticated, /data/orders path.
+        let ts = (self.now_secs)();
+        let orders_url = format!("{}/data/orders", self.base_url);
+        let mut req = self.client.get(&orders_url);
+        let headers = self.auth.headers("GET", "/data/orders", b"", ts);
+        for (name, value) in headers.as_pairs() {
+            req = req.header(name, value);
         }
-        let resp2 = req2
+        let resp = req
             .send()
             .await
             .map_err(|e| format!("flat_start orders http: {e}"))?;
-        if !resp2.status().is_success() {
-            return Err(format!("flat_start orders API error: {}", resp2.status()));
+        if !resp.status().is_success() {
+            return Err(format!("flat_start orders API error: {}", resp.status()));
         }
-        let body2 = resp2
+        let body = resp
             .text()
             .await
             .map_err(|e| format!("flat_start orders read: {e}"))?;
-        let value2: Value = serde_json::from_str(&body2)
-            .map_err(|e| format!("flat_start orders json parse: {e}"))?;
+        let value: Value =
+            serde_json::from_str(&body).map_err(|e| format!("flat_start orders json: {e}"))?;
 
-        let orders = match value2 {
+        let orders = match value {
             Value::Array(arr) => arr,
             _ => {
                 return Err(format!(
                     "flat_start orders unexpected schema: expected array, got: {}",
-                    body2.chars().take(200).collect::<String>()
+                    body.chars().take(200).collect::<String>()
                 ));
             }
         };

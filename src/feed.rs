@@ -20,6 +20,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::logline::{self, Field, Level};
 use crate::ws::{self, Backoff};
 
 // ---------------------------------------------------------------------------
@@ -123,19 +124,24 @@ pub async fn market_feed_loop(
 
 /// Run the Binance `@bookTicker` WebSocket feed (JSON protocol).
 ///
-/// - URL: `wss://stream.binance.com:9443/ws/{symbol}@bookTicker?timeUnit=MICROSECOND`
+/// - URL: `wss://stream-sbe.binance.com:9443/ws/{symbol}@bestBidAsk` (SBE binary)
 /// - No app-level ping (relies on TCP keepalive).
 /// - Backoff: 0.25 s initial → 1.7× → 8 s max.
 ///
 /// Traces to: binance_sbe_listener.py:583-614.
 /// NOTE: Python uses SBE binary; Rust uses JSON @bookTicker which
 /// `binance.rs::parse_book_ticker` already handles.
-pub async fn binance_feed_loop(url: &str, on_ticker: impl Fn(Bytes) + Send + 'static) {
+pub async fn binance_feed_loop(
+    url: &str,
+    api_key: Option<&str>,
+    on_ticker: impl Fn(Bytes) + Send + 'static,
+) {
     let mut backoff = Backoff::new(250.0, 1.7, 8_000.0);
     loop {
-        match ws::connect(url, None).await {
+        match ws::connect(url, api_key).await {
             Ok(ws) => {
                 backoff.reset();
+                logline::log_event(Level::Warn, "binance_ws_connected", &[]);
                 let (_write, mut read) = ws.split();
                 // Binance @bookTicker does not need app-level PING.
                 loop {
@@ -150,10 +156,18 @@ pub async fn binance_feed_loop(url: &str, on_ticker: impl Fn(Bytes) + Send + 'st
                     }
                 }
             }
-            Err(_) => {
-                // connect failed — backoff and retry.
+            Err(e) => {
+                logline::log_event(
+                    Level::Error,
+                    "binance_ws_connect_failed",
+                    &[Field {
+                        key: "err",
+                        value: &e.as_str(),
+                    }],
+                );
             }
         }
+        logline::log_event(Level::Warn, "binance_ws_disconnected", &[]);
         tokio::time::sleep(backoff.next_delay()).await;
     }
 }
@@ -177,6 +191,7 @@ pub async fn user_feed_loop(
     api_passphrase: &str,
     on_event: impl Fn(Bytes) + Send + 'static,
     on_disconnect: impl Fn() + Send + 'static,
+    on_authenticated: impl Fn() + Send + 'static,
 ) {
     let mut backoff = Backoff::new(250.0, 1.7, 5_000.0);
     // Pre-render the auth frame — credentials don't change across reconnects.
@@ -194,13 +209,19 @@ pub async fn user_feed_loop(
         match ws::connect(url, None).await {
             Ok(ws) => {
                 backoff.reset();
+                logline::log_event(Level::Warn, "user_ws_connected", &[]);
                 let (mut write, mut read) = ws.split();
 
                 // Send auth frame.
                 if ws::send_text(&mut write, &auth_frame).await.is_err() {
+                    logline::log_event(Level::Error, "user_ws_auth_send_failed", &[]);
                     tokio::time::sleep(backoff.next_delay()).await;
                     continue;
                 }
+                logline::log_event(Level::Warn, "user_ws_auth_sent", &[]);
+                // Auth is implicit: the server keeps the connection open
+                // on success and closes it on failure. Trust the connection.
+                on_authenticated();
 
                 let mut ping = tokio::time::interval(std::time::Duration::from_secs_f64(
                     ws::POLY_PING_INTERVAL_S,
@@ -228,11 +249,20 @@ pub async fn user_feed_loop(
                     }
                 }
             }
-            Err(_) => {
+            Err(e) => {
                 // connect failed — backoff and retry.
+                logline::log_event(
+                    Level::Error,
+                    "user_ws_connect_failed",
+                    &[Field {
+                        key: "err",
+                        value: &e.as_str(),
+                    }],
+                );
             }
         }
         on_disconnect();
+        logline::log_event(Level::Warn, "user_ws_disconnected", &[]);
         tokio::time::sleep(backoff.next_delay()).await;
     }
 }
@@ -277,7 +307,7 @@ mod tests {
 
         let feed_url = url.clone();
         let feed = tokio::spawn(async move {
-            binance_feed_loop(&feed_url, move |data| {
+            binance_feed_loop(&feed_url, None, move |data| {
                 let _ = tx.send(data);
             })
             .await;
@@ -310,7 +340,7 @@ mod tests {
 
         // Spawn feed — will send auth then block waiting for echo.
         let feed = tokio::spawn(async move {
-            user_feed_loop(&url, "key", "secret", "phrase", |_| {}, || {}).await;
+            user_feed_loop(&url, "key", "secret", "phrase", |_| {}, || {}, || {}).await;
         });
 
         // Wait for server to receive auth frame.

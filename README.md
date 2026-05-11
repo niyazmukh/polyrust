@@ -26,12 +26,15 @@ minirust/
 │   ├── market.rs         ← market-channel quote/resolution parser
 │   ├── state.rs          ← active market context + latest quotes only
 │   ├── signal.rs         ← pure Binance move + quote edge → optional BUY intent
-│   ├── binance.rs        ← narrow Binance book-ticker parser into signal samples
+│   ├── binance.rs        ← SBE @bestBidAsk and JSON @bookTicker parser
+│   ├── anchor.rs         ← strike resolution from Binance microprice samples
+│   ├── gamma.rs          ← Gamma REST API client for market discovery
+│   ├── ws.rs             ← shared WebSocket primitives (connect, backoff)
+│   ├── feed.rs           ← three async feed loops (market, binance, user)
 │   ├── runtime.rs        ← thin parser/state/signal/inventory integration edges
 │   ├── logline.rs        ← compact key=value log writer
 │   └── main.rs           ← primary binary integrating WS feeds and trading loop
-└── tests/
-    └── golden_canonical.rs ← BUY canonicalization golden table
+└── tests/                ← integration tests covering all key paths
 ```
 
 `RuntimeCore` accepts parsed Polymarket market frames, user trade frames,
@@ -52,7 +55,7 @@ overhead:
 * `signal.rs` emits only actionable BUY intent; non-buy is `None`; the front
   filter follows the old live Python model's paid-rent parts: 250ms-2s
   microprice momentum with OFI and imbalance confirmation.
-* `binance.rs` parses only usable book-ticker fields into `BinanceSample`.
+* `binance.rs` parses SBE `@bestBidAsk` (exchange-origin `eventTime` in µs) and JSON `@bookTicker` (public, no `E` field). Auto-detects format.
 * `runtime.rs` owns `RuntimeCore`, the small in-process owner of state,
   inventory, signal, BUY policy, and max-position cap. It connects parser,
   state, signal, inventory checks, BUY submit lifecycle, and SELL submit
@@ -114,8 +117,11 @@ goal is the smaller live invariant set:
 * Runtime BUY integration returns `Some(BuyIntent)` or `None`; inactive market,
   missing quotes, weak signal/OFI/imbalance, existing token exposure, and
   max-position cap do not become hot-path reason enums.
-* BUY submit lifecycle registers pending exposure before HTTP, maps Accepted /
-  Rejected / Unknown outcomes into inventory state, and keeps UNKNOWN WSS-bindable.
+* BUY submit lifecycle registers pending exposure before HTTP inside the
+  same `core.lock()` that produced the `BuyIntent` (atomic claim). Accepted
+  and Unknown outcomes map into inventory state; Rejected releases the
+  claim entirely (deletion, no tombstone). Unknown stays WSS-bindable.
+  WSS-bindable.
 * SELL submit lifecycle can use WSS-owned inventory or a trusted HTTP matched
   size hint, floors to venue sellable quantum, signs a fresh FAK SELL at the
   executable bid, and never predicts local balance.
@@ -129,7 +135,7 @@ goal is the smaller live invariant set:
 
 ## What is intentionally NOT here
 
-Per `docs/RUST_SOTA_ARCHITECTURE_REFACTOR_PLAN.md` non-goals:
+Non-goals of this runtime:
 
 * No analyzer (off-runtime by doctrine).
 * No GTC/GTD support — FAK only by strategy invariant.
@@ -143,9 +149,9 @@ Per `docs/RUST_SOTA_ARCHITECTURE_REFACTOR_PLAN.md` non-goals:
 | Direct submit classifier | ✅ | `submit.rs`; full live submit wiring in `main.rs` |
 | WSS parser/state authority | ✅ | `inventory.rs`, `user.rs`, `market.rs`, `state.rs` |
 | BUY-intent model | ✅ | `signal.rs`, `binance.rs`; fully integrated on hot path |
-| Runtime hot path | ✅ | `runtime.rs`, `main.rs` |
-| Shadow mode on EC2 | ⬜ | WebSocket IO crate fetch/build blocked locally |
-| Controlled live run | ⬜ | runtime-only deploy |
+| Runtime hot path (SELL off-lock) | ✅ | `runtime.rs` (SellPlan), `main.rs` |
+| Shadow mode on EC2 | ⬜ | Blocker: first end-to-end shadow run on the deploy target has not been executed |
+| Controlled live run | ⬜ | Blocker: live probe of `/order` submit + `/orders?status=OPEN` flat-start has not been executed |
 
 ### Signing Inline, No SDK At Runtime
 

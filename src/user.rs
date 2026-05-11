@@ -41,8 +41,14 @@ impl std::fmt::Display for UserParseError {
 impl std::error::Error for UserParseError {}
 
 pub fn parse_user_message(raw: &[u8], ts_us: i64) -> Result<UserMessage, UserParseError> {
-    let value: Value =
-        serde_json::from_slice(raw).map_err(|e| UserParseError::InvalidJson(format!("{e}")))?;
+    // Non-JSON frames (auth responses, status messages, heartbeats) are
+    // silently treated as Other — the Python bot discards them via
+    // `except orjson.JSONDecodeError: continue`. We must not treat them
+    // as parse errors that would revoke WSS trust.
+    let value: Value = match serde_json::from_slice(raw) {
+        Ok(v) => v,
+        Err(_) => return Ok(UserMessage::Other),
+    };
 
     if let Some(event) = optional_str(&value, &["event_type", "eventType", "event", "type"]) {
         if event.eq_ignore_ascii_case("auth") {

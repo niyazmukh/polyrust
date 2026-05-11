@@ -37,7 +37,7 @@
 //!   ECDSA sign per call.
 //! * Renders the JSON body in the venue-expected shape (V2 with the
 //!   signature folded into the inner `order` object, plus
-//!   `orderType`/`owner`/`postOnly`/`deferExec` outer fields).
+//!   `orderType`/`owner`/`deferExec` outer fields).
 //! * Is fully synchronous, deterministic, and safe to call on-demand
 //!   from the spawned submit task without reaching back into the core
 //!   mutex.
@@ -455,7 +455,6 @@ impl OrderSigner {
             },
             order_type: "FAK",
             owner: &self.api_key,
-            post_only: false,
             defer_exec: false,
         };
 
@@ -475,8 +474,6 @@ struct SignedOrderBodyV2<'a> {
     #[serde(rename = "orderType")]
     order_type: &'a str,
     owner: &'a str,
-    #[serde(rename = "postOnly")]
-    post_only: bool,
     #[serde(rename = "deferExec")]
     defer_exec: bool,
 }
@@ -699,7 +696,6 @@ mod tests {
         // Sanity: structure.
         assert_eq!(parsed["orderType"], "FAK");
         assert_eq!(parsed["owner"], TEST_API_KEY);
-        assert_eq!(parsed["postOnly"], false);
         assert_eq!(parsed["deferExec"], false);
         let order = &parsed["order"];
         assert_eq!(order["side"], "BUY");

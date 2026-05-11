@@ -105,11 +105,40 @@ async fn main() {
     );
 
     // 5. User WS credentials.
-    let poly_api_key = std::env::var("POLY_API_KEY").unwrap_or_default();
-    let poly_api_secret = std::env::var("POLY_API_SECRET").unwrap_or_default();
-    let poly_passphrase = std::env::var("POLY_PASSPHRASE").unwrap_or_default();
+    let mut poly_api_key = std::env::var("POLY_API_KEY").unwrap_or_default();
+    let mut poly_api_secret = std::env::var("POLY_API_SECRET").unwrap_or_default();
+    let mut poly_passphrase = std::env::var("POLY_PASSPHRASE").unwrap_or_default();
     let poly_address = std::env::var("POLY_ADDRESS").unwrap_or_default();
     let poly_pk = std::env::var("POLY_PK").unwrap_or_default();
+
+    // Derive API credentials from the private key if direct creds are
+    // missing. The Python bot does this via ClobClient.create_or_derive_api_creds().
+    // Derivation is a one-time startup HTTP call — never on the hot path.
+    if (poly_api_key.is_empty() || poly_api_secret.is_empty() || poly_passphrase.is_empty())
+        && !poly_pk.is_empty()
+    {
+        match minirust::auth::derive_api_credentials(
+            &poly_pk,
+            137, // Polygon mainnet
+            &launch.clob_url,
+        )
+        .await
+        {
+            Ok((key, secret, passphrase)) => {
+                logline::log_event(Level::Warn, "api_credentials_derived_from_pk", &[]);
+                poly_api_key = key;
+                poly_api_secret = secret;
+                poly_passphrase = passphrase;
+            }
+            Err(e) => {
+                eprintln!(
+                    "FATAL: failed to derive API credentials from POLY_PK: {e}. \
+                     Set POLY_API_KEY, POLY_API_SECRET, and POLY_PASSPHRASE directly."
+                );
+                std::process::exit(2);
+            }
+        }
+    }
 
     // Fail fast if user WSS credentials are missing — even in dry-run.
     // BUY signals are gated on authenticated user WSS inventory truth;
@@ -142,15 +171,22 @@ async fn main() {
         .and_then(|auth| HttpSubmitter::new(&launch.clob_url, auth.clone()).ok());
 
     let order_signer: Option<OrderSigner> = if cfg.allow_live_orders && !poly_pk.is_empty() {
-        OrderSigner::new(
+        match OrderSigner::new(
             &poly_pk,
             &poly_api_key,
             launch.poly_funder.as_deref().and_then(|f| f.parse().ok()),
             launch.poly_signature_kind,
             POLYGON_CHAIN_ID,
             EXCHANGE_V2_NORMAL,
-        )
-        .ok()
+        ) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!(
+                    "FATAL: invalid OrderSigner: {e} (check POLY_PK, POLY_FUNDER, POLY_SIGNATURE_KIND)"
+                );
+                std::process::exit(2);
+            }
+        }
     } else {
         None
     };
@@ -180,14 +216,7 @@ async fn main() {
         if let Some(sub) = &submitter
             && let Err(e) = sub.verify_flat_start().await
         {
-            logline::log_event(
-                Level::Error,
-                "ensure_flat_start_failed",
-                &[Field {
-                    key: "reason",
-                    value: &e,
-                }],
-            );
+            eprintln!("FATAL: flat_start check failed: {e}");
             std::process::exit(3);
         }
     }
@@ -259,9 +288,10 @@ async fn main() {
         let sub = binance_sub;
         let sign = binance_sign;
         tokio::spawn(async move {
-            feed::binance_feed_loop(&binance_url, move |raw| {
+            let binance_key = std::env::var("BINANCE_SBE_API_KEY").ok();
+            feed::binance_feed_loop(&binance_url, binance_key.as_deref(), move |raw| {
                 let ts = TsUs(now_us());
-                // Parse the book-ticker frame.
+                // SBE @bestBidAsk provides exchange-origin eventTime.
                 let ticker = match minirust::binance::parse_book_ticker(&raw) {
                     Ok(Some(t)) => t,
                     _ => return,
@@ -487,6 +517,7 @@ async fn main() {
                 );
                 return;
             }
+            let core_auth = core.clone();
             let core_disconnect = core.clone();
             feed::user_feed_loop(
                 &user_url,
@@ -501,34 +532,18 @@ async fn main() {
                         };
                         let ts = now_us();
                         match c.apply_user_raw(&raw, ts) {
-                            Ok(minirust::user::UserMessage::AuthSuccess) => {
-                                c.inventory_mut().set_user_wss_trusted(true);
-                                logline::log_event(Level::Info, "user_wss_auth_success", &[]);
-                            }
-                            Ok(minirust::user::UserMessage::AuthError(msg)) => {
-                                c.inventory_mut().set_user_wss_trusted(false);
-                                logline::log_event(
-                                    Level::Error,
-                                    "user_wss_auth_error",
-                                    &[Field {
-                                        key: "msg",
-                                        value: &msg,
-                                    }],
-                                );
-                            }
+                            Ok(minirust::user::UserMessage::Trades(_)) => {}
+                            Ok(_) => {}
                             Err(e) => {
-                                let err_msg = format!("{e:?}");
-                                c.inventory_mut().set_user_wss_trusted(false);
                                 logline::log_event(
                                     Level::Error,
                                     "user_wss_parse_failed",
                                     &[Field {
                                         key: "err",
-                                        value: &err_msg,
+                                        value: &format!("{e:?}").as_str(),
                                     }],
                                 );
                             }
-                            Ok(_) => {}
                         }
 
                         // Check sellable inventory after trade update.
@@ -615,6 +630,15 @@ async fn main() {
                     move || {
                         if let Ok(mut c) = cd.lock() {
                             c.inventory_mut().set_user_wss_trusted(false);
+                        }
+                    }
+                },
+                {
+                    let ca = core_auth.clone();
+                    move || {
+                        if let Ok(mut c) = ca.lock() {
+                            c.inventory_mut().set_user_wss_trusted(true);
+                            logline::log_event(Level::Info, "user_wss_authenticated", &[]);
                         }
                     }
                 },

@@ -133,6 +133,7 @@ pub struct RuntimeCore {
     signal: SignalEngine,
     buy_policy: BuySubmitPolicy,
     max_open_positions: usize,
+    sell_slippage_ticks: i32,
 }
 
 impl RuntimeCore {
@@ -142,6 +143,7 @@ impl RuntimeCore {
             inventory: Inventory::new(),
             signal: SignalEngine::new(config.signal_config()?),
             buy_policy: config.buy_submit_policy(),
+            sell_slippage_ticks: config.entry_slippage_cents,
             max_open_positions: config.max_concurrent_positions,
         })
     }
@@ -209,7 +211,12 @@ impl RuntimeCore {
     /// zero. This does no signing — callers must hand the plan to
     /// `SellPlan::sign` outside the core lock.
     pub fn plan_sell_at_bid(&self, token: &TokenId) -> Option<SellPlan> {
-        plan_sell_at_bid(token, &self.state, &self.inventory)
+        plan_sell_at_bid(
+            token,
+            &self.state,
+            &self.inventory,
+            self.sell_slippage_ticks,
+        )
     }
 
     /// Build a `SellPlan` for a specific size (in atoms) at the current
@@ -220,7 +227,7 @@ impl RuntimeCore {
         token: &TokenId,
         size_atoms: SharesAtoms,
     ) -> Option<SellPlan> {
-        plan_sell_for_size_at_bid(token, size_atoms, &self.state)
+        plan_sell_for_size_at_bid(token, size_atoms, &self.state, self.sell_slippage_ticks)
     }
 
     /// Prepare a FAK SELL at the current executable bid. Returns `None` if
@@ -380,13 +387,16 @@ pub fn plan_sell_at_bid(
     token: &TokenId,
     state: &RuntimeState,
     inventory: &Inventory,
+    slippage_ticks: i32,
 ) -> Option<SellPlan> {
     let bid = state.quote_for_token(token).and_then(|q| q.bid)?;
     let position = inventory.position(token)?;
     if position.sellable.units() <= 0 {
         return None;
     }
-    let (price, size) = canonical_sell_params(bid, position.sellable.units() * 100).ok()?;
+    let limit_ticks = (bid.ticks() - slippage_ticks).max(1);
+    let limit = PriceTick::checked(limit_ticks).ok()?;
+    let (price, size) = canonical_sell_params(limit, position.sellable.units() * 100).ok()?;
     if size.units() <= 0 {
         return None;
     }
@@ -405,10 +415,13 @@ pub fn plan_sell_for_size_at_bid(
     token: &TokenId,
     size_atoms: SharesAtoms,
     state: &RuntimeState,
+    slippage_ticks: i32,
 ) -> Option<SellPlan> {
     let bid = state.quote_for_token(token).and_then(|q| q.bid)?;
+    let limit_ticks = (bid.ticks() - slippage_ticks).max(1);
+    let limit = PriceTick::checked(limit_ticks).ok()?;
     let raw_size_taker_units = size_atoms.atoms().div_euclid(100);
-    let (price, size) = canonical_sell_params(bid, raw_size_taker_units).ok()?;
+    let (price, size) = canonical_sell_params(limit, raw_size_taker_units).ok()?;
     if size.units() <= 0 {
         return None;
     }

@@ -28,6 +28,12 @@ const MIN_ANCHOR_SAMPLES: usize = 3;
 /// Traces to: shadow_signal_probe.py:462 (late_discovery check).
 const LATE_DISCOVERY_THRESHOLD_US: i64 = 1_000_000;
 
+/// Maximum age of the market window for late-discovery resolution.
+/// If the window ended more than this many microseconds ago, the
+/// anchor fails and we wait for the next rotation. Prevents using
+/// mid-window (stale) samples when the bot starts well past t=0.
+const MAX_LATE_WINDOW_US: i64 = 30_000_000;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum AnchorResult {
     /// Not enough samples yet; retry on the next Binance tick.
@@ -107,13 +113,20 @@ impl AnchorBuffer {
         let window_end_us = window_start_us.saturating_add(ANCHOR_WINDOW_END_US);
         let late_discovery = now_us > window_end_us.saturating_add(LATE_DISCOVERY_THRESHOLD_US);
 
-        let samples: Vec<f64> = if late_discovery {
+        // Late discovery is only valid for a limited window past t=0.
+        // If the bot starts mid-window (e.g. 126 s past the boundary),
+        // samples are stale — fail and wait for the next rotation.
+        let too_late = late_discovery && now_us > window_end_us.saturating_add(MAX_LATE_WINDOW_US);
+
+        let samples: Vec<f64> = if late_discovery && !too_late {
             // Late-discovery: use all samples at or after window start.
             self.samples
                 .iter()
                 .filter(|(ts, _)| *ts >= window_start_us)
                 .map(|(_, micro)| *micro)
                 .collect()
+        } else if too_late {
+            Vec::new() // force fail below
         } else {
             // Normal path: strict window.
             self.samples
@@ -124,11 +137,8 @@ impl AnchorBuffer {
         };
 
         if samples.len() < MIN_ANCHOR_SAMPLES {
-            // Window closed if we're past the end OR in late-discovery mode.
-            // Uses `now_us` (not `max_ts_seen`) because ticks may stop arriving;
-            // `now_us` always advances so we eventually fail instead of
-            // pending forever.
             if late_discovery || now_us > window_end_us {
+                self.pending_slug_ts = 0;
                 return AnchorResult::Failed;
             }
             return AnchorResult::Pending;

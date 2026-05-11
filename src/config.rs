@@ -216,7 +216,6 @@ impl Config {
                 name: "MINIMAL_ENTRY_SLIPPAGE",
                 reason: "out_of_range".into(),
             })?;
-
         Ok(Self {
             allow_live_orders,
             dry_run_orders,
@@ -318,9 +317,7 @@ impl LaunchConfig {
         let symbol = required_string(&mut lookup, "MINIRUST_BINANCE_SYMBOL")?.to_ascii_lowercase();
         let binance_ws_url = lookup("MINIRUST_BINANCE_WS_URL")
             .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| {
-                format!("wss://stream.binance.com:9443/ws/{symbol}@bookTicker?timeUnit=MICROSECOND")
-            });
+            .unwrap_or_else(|| format!("wss://stream-sbe.binance.com:9443/ws/{symbol}@bestBidAsk"));
         let poly_market_ws_url = lookup("MINIRUST_POLY_MARKET_WS_URL")
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| "wss://ws-subscriptions-clob.polymarket.com/ws/market".to_owned());
@@ -641,7 +638,7 @@ mod tests {
 
         assert_eq!(
             launch.binance_ws_url,
-            "wss://stream.binance.com:9443/ws/btcusdt@bookTicker?timeUnit=MICROSECOND"
+            "wss://stream-sbe.binance.com:9443/ws/btcusdt@bestBidAsk"
         );
         assert_eq!(
             launch.poly_market_ws_url,
