@@ -192,9 +192,6 @@ impl GammaClient {
                 condition_id: ConditionId::new(condition_id),
                 yes_token: yes_tok.token_id,
                 no_token: no_tok.token_id,
-                yes_label: yes_tok.outcome,
-                no_label: no_tok.outcome,
-                start_ts: slug_ts,
                 end_ts,
                 slug_ts,
             });

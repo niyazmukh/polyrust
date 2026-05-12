@@ -17,8 +17,6 @@
 //! * `Shares4(i64)`     — number of 0.0001-share units (signed-body taker step).
 //! * `Shares2(i64)`     — number of 0.01-share units (SELL maker step).
 //! * `UsdcCents(i64)`   — number of 1¢ units. BUY maker step.
-//! * `Usdc4(i64)`       — number of 0.0001¢-equivalent units, used in fee math.
-//! * `UsdcAtoms(i64)`   — number of 1e-6 dollar units (signed-body amount).
 //! * `SharesAtoms(i64)` — number of 1e-6 share units (signed-body amount).
 
 use std::fmt;
@@ -27,10 +25,6 @@ use std::fmt;
 pub const PRICE_TICKS_PER_DOLLAR: i32 = 100;
 /// Number of 0.0001-share units per share.
 pub const SHARES4_PER_SHARE: i64 = 10_000;
-/// Number of 0.01-share units per share.
-pub const SHARES2_PER_SHARE: i64 = 100;
-/// Number of cents (0.01 USDC) per dollar.
-pub const CENTS_PER_DOLLAR: i64 = 100;
 /// Atoms-per-dollar (and atoms-per-share) used in signed body amounts.
 pub const ATOMS_PER_DOLLAR: i64 = 1_000_000;
 
@@ -38,13 +32,6 @@ pub const ATOMS_PER_DOLLAR: i64 = 1_000_000;
 pub const MIN_PRICE_TICK: i32 = 1;
 /// Highest tradeable price in ticks ($0.99). Polymarket binary tokens cap at $0.99.
 pub const MAX_PRICE_TICK: i32 = 99;
-
-/// Polymarket marketable BUY notional floor: $1.00 exactly.
-///
-/// Verified 2026-05-07 via live probe; venue error verbatim:
-/// `"invalid amount for a marketable BUY order ($0.99), min size: $1"`.
-/// The current Python uses 1.01¢ as a 1¢ defensive buffer.
-pub const VENUE_MIN_BUY_MAKER_CENTS: i64 = 100;
 
 // ------------------------------------------------------------------
 // PriceTick
@@ -67,20 +54,6 @@ impl PriceTick {
         } else {
             Err(TypeError::PriceOutOfRange { ticks })
         }
-    }
-
-    /// Construct from a dollar value, taking the floor to a tick.
-    pub fn floor_from_cents(cents: i64) -> Result<Self, TypeError> {
-        // Cents already match tick granularity; just bounds-check.
-        let ticks = i32::try_from(cents).map_err(|_| TypeError::PriceOutOfRange { ticks: -1 })?;
-        Self::checked(ticks)
-    }
-
-    /// Construct from a dollar value, taking the ceiling to a tick.
-    /// (Cents already align to ticks; this exists for symmetry with the
-    /// Python `_ceil_to_step` call sites.)
-    pub fn ceil_from_cents(cents: i64) -> Result<Self, TypeError> {
-        Self::floor_from_cents(cents)
     }
 
     pub const fn ticks(self) -> i32 {
@@ -117,16 +90,6 @@ pub struct Shares4(pub i64);
 impl Shares4 {
     pub const fn new_unchecked(units: i64) -> Self {
         Self(units)
-    }
-
-    pub fn from_whole_shares(whole: i64) -> Self {
-        Self(whole.saturating_mul(SHARES4_PER_SHARE))
-    }
-
-    /// Convert from $0.01-share precision to $0.0001-share precision.
-    pub fn from_shares2(shares2: Shares2) -> Self {
-        // 0.01 -> 0.0001 is a 100x scale.
-        Self(shares2.0.saturating_mul(100))
     }
 
     pub const fn units(self) -> i64 {
@@ -182,11 +145,6 @@ impl UsdcCents {
     pub const fn cents(self) -> i64 {
         self.0
     }
-
-    /// Body amount in atoms (1e-6 dollar). One cent = 10_000 atoms.
-    pub const fn to_atoms(self) -> UsdcAtoms {
-        UsdcAtoms(self.0.saturating_mul(10_000))
-    }
 }
 
 impl fmt::Display for UsdcCents {
@@ -206,22 +164,6 @@ impl fmt::Display for UsdcCents {
 // ------------------------------------------------------------------
 // Body-atom amounts (1e-6 unit). These cross the signed-body boundary.
 // ------------------------------------------------------------------
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct UsdcAtoms(pub i64);
-
-impl UsdcAtoms {
-    pub const fn atoms(self) -> i64 {
-        self.0
-    }
-}
-
-impl fmt::Display for UsdcAtoms {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Render as integer atoms — body field is a JSON integer string.
-        write!(f, "{}", self.0)
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SharesAtoms(pub i64);
@@ -311,7 +253,7 @@ pub enum OrderSide {
 }
 
 impl OrderSide {
-    pub fn as_venue_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             OrderSide::Buy => "BUY",
             OrderSide::Sell => "SELL",
@@ -554,8 +496,7 @@ mod tests {
     }
 
     #[test]
-    fn cents_to_atoms() {
-        assert_eq!(UsdcCents(101).to_atoms(), UsdcAtoms(1_010_000));
+    fn shares4_to_atoms() {
         assert_eq!(Shares4(20_200).to_atoms(), SharesAtoms(2_020_000));
     }
 

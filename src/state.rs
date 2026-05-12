@@ -12,9 +12,6 @@ pub struct MarketContext {
     pub condition_id: ConditionId,
     pub yes_token: TokenId,
     pub no_token: TokenId,
-    pub yes_label: String,
-    pub no_label: String,
-    pub start_ts: i64,
     pub end_ts: i64,
     pub slug_ts: i64,
 }
@@ -111,11 +108,6 @@ impl RuntimeState {
     pub fn quote_for_token(&self, token: &TokenId) -> Option<&Quote> {
         self.side_for_token(token)?;
         self.quotes.get(token)
-    }
-
-    pub fn quote_age_us(&self, side: OutcomeSide, now: TsUs) -> Option<i64> {
-        let quote = self.quote_for_side(side)?;
-        Some(now.micros() - quote.ts_us.micros())
     }
 }
 

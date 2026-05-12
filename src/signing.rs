@@ -78,8 +78,6 @@ const DOMAIN_VERSION_V2: &str = "2";
 
 /// Polygon mainnet chain id.
 pub const POLYGON_CHAIN_ID: u64 = 137;
-/// Polygon Amoy testnet chain id.
-pub const AMOY_CHAIN_ID: u64 = 80_002;
 
 /// V2 CTF Exchange (normal markets) on Polygon mainnet.
 pub const EXCHANGE_V2_NORMAL: H160 = H160([
@@ -302,6 +300,14 @@ impl OrderSigner {
             signature_kind,
             domain_separator,
         })
+    }
+
+    pub fn signer_address(&self) -> H160 {
+        self.address
+    }
+
+    pub fn maker_address(&self) -> H160 {
+        self.maker
     }
 
     /// EOA address (recovered from the secp256k1 public key).
@@ -578,7 +584,7 @@ fn encode_signature(sig: &EcdsaSignature, recovery_id: RecoveryId) -> [u8; 65] {
 // JSON rendering helpers
 // ----------------------------------------------------------------------
 
-fn address_lower_hex(addr: H160) -> String {
+pub fn address_lower_hex(addr: H160) -> String {
     let mut s = String::with_capacity(42);
     s.push_str("0x");
     s.push_str(&hex::encode(addr.as_bytes()));

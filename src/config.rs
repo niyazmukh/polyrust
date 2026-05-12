@@ -341,7 +341,7 @@ impl LaunchConfig {
         }
         let clob_url = lookup("MINIRUST_CLOB_URL")
             .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| "https://clob.polymarket.com".to_owned());
+            .unwrap_or_else(|| "https://clob-v2.polymarket.com".to_owned());
         let gamma_url = lookup("MINIRUST_GAMMA_URL")
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| "https://gamma-api.polymarket.com".to_owned());

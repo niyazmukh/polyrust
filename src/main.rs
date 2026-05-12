@@ -108,7 +108,7 @@ async fn main() {
     let mut poly_api_key = std::env::var("POLY_API_KEY").unwrap_or_default();
     let mut poly_api_secret = std::env::var("POLY_API_SECRET").unwrap_or_default();
     let mut poly_passphrase = std::env::var("POLY_PASSPHRASE").unwrap_or_default();
-    let poly_address = std::env::var("POLY_ADDRESS").unwrap_or_default();
+    let mut poly_address = std::env::var("POLY_ADDRESS").unwrap_or_default();
     let poly_pk = std::env::var("POLY_PK").unwrap_or_default();
 
     // Derive API credentials from the private key if direct creds are
@@ -124,11 +124,15 @@ async fn main() {
         )
         .await
         {
-            Ok((key, secret, passphrase)) => {
+            Ok((key, secret, passphrase, eoa_address)) => {
                 logline::log_event(Level::Warn, "api_credentials_derived_from_pk", &[]);
                 poly_api_key = key;
                 poly_api_secret = secret;
                 poly_passphrase = passphrase;
+                // The API key is associated with the EOA address (the
+                // address that signed the derivation request). L2 auth
+                // headers must use this address, not the proxy/funder.
+                poly_address = eoa_address;
             }
             Err(e) => {
                 eprintln!(
@@ -213,17 +217,20 @@ async fn main() {
             );
             std::process::exit(2);
         }
-        if let Some(sub) = &submitter
-            && let Err(e) = sub.verify_flat_start().await
-        {
-            eprintln!("FATAL: flat_start check failed: {e}");
-            std::process::exit(3);
-        }
     }
 
     // 7. Signal ID counter for log correlation.
     let signal_id = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let sell_id = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    // Out-of-hotpath counters for periodic heartbeat — incremented with
+    // Relaxed ordering so the binance callback pays no fence cost.
+    let heartbeat_ticks: Arc<std::sync::atomic::AtomicU64> =
+        Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let heartbeat_parse_errs: Arc<std::sync::atomic::AtomicU64> =
+        Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let heartbeat_signals: Arc<std::sync::atomic::AtomicU64> =
+        Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     // 8. Market command channel for incremental WS subscribe on rotation.
     //    Traces to: market_ws.py:293-302 (incremental subscribe).
@@ -235,6 +242,36 @@ async fn main() {
     let (market_tx, market_rx) = mpsc::unbounded_channel::<String>();
 
     logline::log_event(Level::Warn, "minirust_initialized", &[]);
+
+    // Log signer/maker addresses once at startup for cross-ref with POLY_ADDRESS.
+    {
+        let s_addr = order_signer
+            .as_ref()
+            .map(|s| minirust::signing::address_lower_hex(s.signer_address()))
+            .unwrap_or_default();
+        let m_addr = order_signer
+            .as_ref()
+            .map(|s| minirust::signing::address_lower_hex(s.maker_address()))
+            .unwrap_or_default();
+        logline::log_event(
+            Level::Warn,
+            "order_signer_addresses",
+            &[
+                Field {
+                    key: "signer",
+                    value: &s_addr,
+                },
+                Field {
+                    key: "maker",
+                    value: &m_addr,
+                },
+                Field {
+                    key: "poly_address",
+                    value: &poly_address,
+                },
+            ],
+        );
+    }
 
     // ==================================================================
     // Spawn feed tasks
@@ -287,6 +324,17 @@ async fn main() {
         let sig_id = signal_id.clone();
         let sub = binance_sub;
         let sign = binance_sign;
+        let hb_ticks = heartbeat_ticks.clone();
+        let hb_parse_errs = heartbeat_parse_errs.clone();
+        let hb_signals = heartbeat_signals.clone();
+        let signer_addr = order_signer
+            .as_ref()
+            .map(|s| minirust::signing::address_lower_hex(s.signer_address()))
+            .unwrap_or_default();
+        let maker_addr = order_signer
+            .as_ref()
+            .map(|s| minirust::signing::address_lower_hex(s.maker_address()))
+            .unwrap_or_default();
         tokio::spawn(async move {
             let binance_key = std::env::var("BINANCE_SBE_API_KEY").ok();
             feed::binance_feed_loop(&binance_url, binance_key.as_deref(), move |raw| {
@@ -294,8 +342,21 @@ async fn main() {
                 // SBE @bestBidAsk provides exchange-origin eventTime.
                 let ticker = match minirust::binance::parse_book_ticker(&raw) {
                     Ok(Some(t)) => t,
-                    _ => return,
+                    Ok(None) => return,
+                    Err(e) => {
+                        hb_parse_errs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        logline::log_event(
+                            Level::Warn,
+                            "binance_parse_error",
+                            &[Field {
+                                key: "err",
+                                value: &format!("{e:?}").as_str(),
+                            }],
+                        );
+                        return;
+                    }
                 };
+                hb_ticks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let sample = match ticker.sample() {
                     Some(s) => s,
                     None => return,
@@ -375,6 +436,7 @@ async fn main() {
 
                 if let Some((intent, claim)) = claimed {
                     let id = sig_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    hb_signals.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if let Some((policy, claim_id)) = claim {
                         if let (Some(sub), Some(sign)) = (sub.as_ref(), sign.as_ref()) {
                             let sub = sub.clone();
@@ -382,6 +444,8 @@ async fn main() {
                             let core2 = core.clone();
                             let intent2 = intent.clone();
                             let claim_id2 = claim_id.clone();
+                            let s_addr = signer_addr.clone();
+                            let m_addr = maker_addr.clone();
                             tokio::spawn(async move {
                                 let prepared = match runtime::prepare_buy_submit(
                                     &intent2,
@@ -428,6 +492,7 @@ async fn main() {
                                 }
 
                                 let accepted = outcome.is_accepted();
+                                let err_text = outcome.error_text().unwrap_or("-");
                                 logline::log_event(
                                     Level::Warn,
                                     "buy_submit_outcome",
@@ -451,6 +516,18 @@ async fn main() {
                                         Field {
                                             key: "http_status",
                                             value: &(outcome.http_status() as i64),
+                                        },
+                                        Field {
+                                            key: "error",
+                                            value: &err_text,
+                                        },
+                                        Field {
+                                            key: "signer",
+                                            value: &s_addr,
+                                        },
+                                        Field {
+                                            key: "maker",
+                                            value: &m_addr,
                                         },
                                     ],
                                 );
@@ -492,19 +569,15 @@ async fn main() {
     };
 
     // --- User WS task ---
-    // Trade events own inventory (WSS authority). On BUY fill confirmation,
-    // immediately check for sellable inventory and fire SELL at bid.
-    // Traces to: minimal_live_bot.py user event → tracker.on_trade_event
-    //   → exit evaluation.
+    // Trade events own inventory (WSS authority). Inventory is applied
+    // only on CONFIRMED status (on-chain finality). The exit_task handles
+    // selling once confirmed balance exists.
     let user_task = {
         let core = core.clone();
         let user_url = launch.poly_user_ws_url.clone();
         let api_key = poly_api_key.clone();
         let api_secret = poly_api_secret.clone();
         let passphrase = poly_passphrase.clone();
-        let sub = submitter.clone();
-        let sign = order_signer.clone();
-        let sid = sell_id.clone();
         tokio::spawn(async move {
             if api_key.is_empty() || api_secret.is_empty() || passphrase.is_empty() {
                 logline::log_event(
@@ -517,7 +590,6 @@ async fn main() {
                 );
                 return;
             }
-            let core_auth = core.clone();
             let core_disconnect = core.clone();
             feed::user_feed_loop(
                 &user_url,
@@ -525,120 +597,48 @@ async fn main() {
                 &api_secret,
                 &passphrase,
                 move |raw| {
-                    let sell_target = {
-                        let mut c = match core.lock() {
-                            Ok(c) => c,
-                            Err(_) => return,
-                        };
-                        let ts = now_us();
-                        match c.apply_user_raw(&raw, ts) {
-                            Ok(minirust::user::UserMessage::Trades(_)) => {}
-                            Ok(_) => {}
-                            Err(e) => {
-                                logline::log_event(
-                                    Level::Error,
-                                    "user_wss_parse_failed",
-                                    &[Field {
-                                        key: "err",
-                                        value: &format!("{e:?}").as_str(),
-                                    }],
-                                );
-                            }
-                        }
-
-                        // Check sellable inventory after trade update.
-                        // WSS authority: trade events own inventory.
-                        // If a BUY just filled, sell immediately at bid.
-                        let tokens: Vec<_> = c
-                            .state_mut()
-                            .market()
-                            .map(|m| vec![m.yes_token.clone(), m.no_token.clone()])
-                            .unwrap_or_default();
-                        tokens.into_iter().find_map(|token| {
-                            let pos = c.inventory_mut().position(&token)?;
-                            if pos.sellable.units() > 0 {
-                                Some(token)
-                            } else {
-                                None
-                            }
-                        })
+                    let mut c = match core.lock() {
+                        Ok(c) => c,
+                        Err(_) => return,
                     };
-
-                    // Fire sell outside the lock.
-                    if let (Some(sub), Some(sign), Some(token)) =
-                        (sub.as_ref(), sign.as_ref(), sell_target)
-                    {
-                        let sub2 = sub.clone();
-                        let sign2 = sign.clone();
-                        let core2 = core.clone();
-                        let sid_val = sid.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        tokio::spawn(async move {
-                            // Plan under the lock (quote + inventory read only),
-                            // drop the lock, then sign + submit outside it.
-                            // Signing under `core.lock()` would serialize against
-                            // the Binance BUY hot path.
-                            let plan = {
-                                let c = match core2.lock() {
-                                    Ok(c) => c,
-                                    Err(_) => return,
-                                };
-                                match c.plan_sell_at_bid(&token) {
-                                    Some(p) => p,
-                                    None => return,
-                                }
-                            };
-                            let prepared = match plan.sign(
-                                &sign2,
-                                SignInputs {
-                                    salt: sid_val,
-                                    timestamp_ms: now_ms(),
-                                },
-                            ) {
-                                Ok(p) => p,
-                                Err(e) => {
-                                    logline::log_event(
-                                        Level::Error,
-                                        "sell_prepare_failed",
-                                        &[Field {
-                                            key: "error",
-                                            value: &e.to_string().as_str(),
-                                        }],
-                                    );
-                                    return;
-                                }
-                            };
-                            let outcome = sub2.submit_order(&prepared.body).await;
+                    let ts = now_us();
+                    match c.apply_user_raw(&raw, ts) {
+                        Ok(minirust::user::UserMessage::AuthSuccess) => {
+                            c.inventory_mut().set_user_wss_trusted(true);
+                            logline::log_event(Level::Warn, "user_wss_authenticated", &[]);
+                        }
+                        Ok(minirust::user::UserMessage::AuthError(ref msg)) => {
+                            c.inventory_mut().set_user_wss_trusted(false);
                             logline::log_event(
-                                Level::Warn,
-                                "sell_trade_trigger",
-                                &[
-                                    Field {
-                                        key: "token_id",
-                                        value: &token.as_str(),
-                                    },
-                                    Field {
-                                        key: "accepted",
-                                        value: &outcome.is_accepted(),
-                                    },
-                                ],
+                                Level::Error,
+                                "user_wss_auth_error",
+                                &[Field {
+                                    key: "msg",
+                                    value: &msg.as_str(),
+                                }],
                             );
-                        });
+                        }
+                        Ok(minirust::user::UserMessage::Trades(_)) => {}
+                        Ok(_) => {}
+                        Err(e) => {
+                            logline::log_event(
+                                Level::Error,
+                                "user_wss_parse_failed",
+                                &[Field {
+                                    key: "err",
+                                    value: &format!("{e:?}").as_str(),
+                                }],
+                            );
+                        }
                     }
+                    // No immediate sell trigger here. The exit_task (50ms loop)
+                    // handles selling once inventory is CONFIRMED on-chain.
                 },
                 {
                     let cd = core_disconnect.clone();
                     move || {
                         if let Ok(mut c) = cd.lock() {
                             c.inventory_mut().set_user_wss_trusted(false);
-                        }
-                    }
-                },
-                {
-                    let ca = core_auth.clone();
-                    move || {
-                        if let Ok(mut c) = ca.lock() {
-                            c.inventory_mut().set_user_wss_trusted(true);
-                            logline::log_event(Level::Info, "user_wss_authenticated", &[]);
                         }
                     }
                 },
@@ -716,6 +716,7 @@ async fn main() {
                     let sub2 = sub.clone();
                     tokio::spawn(async move {
                         let outcome = sub2.submit_order(&prepared.body).await;
+                        let err = outcome.error_text().unwrap_or("-");
                         logline::log_event(
                             Level::Warn,
                             "sell_submit_outcome",
@@ -731,6 +732,10 @@ async fn main() {
                                 Field {
                                     key: "http_status",
                                     value: &(outcome.http_status() as i64),
+                                },
+                                Field {
+                                    key: "error",
+                                    value: &err,
                                 },
                             ],
                         );
@@ -817,6 +822,7 @@ async fn main() {
                     let sub2 = sub.clone();
                     tokio::spawn(async move {
                         let outcome = sub2.submit_order(&prepared.body).await;
+                        let err = outcome.error_text().unwrap_or("-");
                         logline::log_event(
                             Level::Warn,
                             "force_sell_outcome",
@@ -828,6 +834,14 @@ async fn main() {
                                 Field {
                                     key: "accepted",
                                     value: &outcome.is_accepted(),
+                                },
+                                Field {
+                                    key: "http_status",
+                                    value: &(outcome.http_status() as i64),
+                                },
+                                Field {
+                                    key: "error",
+                                    value: &err,
                                 },
                             ],
                         );
@@ -844,11 +858,94 @@ async fn main() {
     let maint_task = {
         let core = core.clone();
         let anchor = anchor.clone();
+        let hb_ticks = heartbeat_ticks.clone();
+        let hb_parse_errs = heartbeat_parse_errs.clone();
+        let hb_signals = heartbeat_signals.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
             interval.tick().await; // skip initial burst
+            let mut heartbeat_tick: u64 = 0;
             loop {
                 interval.tick().await;
+
+                // Periodic heartbeat — every 60 s (6 × 10 s), out of hot path.
+                // Logs tick rate, parse health, signal rate, and inventory snapshot.
+                heartbeat_tick = heartbeat_tick.wrapping_add(1);
+                if heartbeat_tick.is_multiple_of(6) {
+                    let ticks = hb_ticks.swap(0, std::sync::atomic::Ordering::Relaxed);
+                    let parse_errs = hb_parse_errs.swap(0, std::sync::atomic::Ordering::Relaxed);
+                    let signals = hb_signals.swap(0, std::sync::atomic::Ordering::Relaxed);
+                    let (pos_count, sellable, yes_bid, no_bid, trading) = {
+                        let mut c = core.lock().unwrap();
+                        let cnt = c.inventory().open_position_count([]);
+                        let market = c.state_mut().market().cloned();
+                        let sell = market
+                            .as_ref()
+                            .map(|m| {
+                                [&m.yes_token, &m.no_token]
+                                    .iter()
+                                    .filter(|token| {
+                                        c.inventory()
+                                            .position(token)
+                                            .is_some_and(|p| p.sellable.units() > 0)
+                                    })
+                                    .count()
+                            })
+                            .unwrap_or(0);
+                        let yb = c
+                            .state_mut()
+                            .quote_for_side(minirust::types::OutcomeSide::Yes)
+                            .and_then(|q| q.bid)
+                            .map(|b| b.ticks())
+                            .unwrap_or(0);
+                        let nb = c
+                            .state_mut()
+                            .quote_for_side(minirust::types::OutcomeSide::No)
+                            .and_then(|q| q.bid)
+                            .map(|b| b.ticks())
+                            .unwrap_or(0);
+                        let active = c.state_mut().trading_active();
+                        (cnt, sell, yb, nb, active)
+                    };
+                    logline::log_event(
+                        Level::Info,
+                        "heartbeat",
+                        &[
+                            Field {
+                                key: "binance_ticks",
+                                value: &(ticks as i64),
+                            },
+                            Field {
+                                key: "parse_errs",
+                                value: &(parse_errs as i64),
+                            },
+                            Field {
+                                key: "signals_fired",
+                                value: &(signals as i64),
+                            },
+                            Field {
+                                key: "open_positions",
+                                value: &(pos_count as i64),
+                            },
+                            Field {
+                                key: "sellable_tokens",
+                                value: &(sellable as i64),
+                            },
+                            Field {
+                                key: "yes_bid_ticks",
+                                value: &yes_bid,
+                            },
+                            Field {
+                                key: "no_bid_ticks",
+                                value: &no_bid,
+                            },
+                            Field {
+                                key: "trading_active",
+                                value: &trading,
+                            },
+                        ],
+                    );
+                }
 
                 // 1. Expire unknown submits older than 30 s, and pending
                 //    claims older than 60 s (defensive — the spawned submit
@@ -880,68 +977,30 @@ async fn main() {
                         m.condition_id != discovered.condition_id || m.slug != discovered.slug
                     });
                     if is_new {
-                        // P0-4: fail-closed if old tokens have nonzero inventory.
-                        // Dropping nonzero inventory blindly could leave unhedged
-                        // positions that the bot doesn't know about.
-                        let can_rotate = if let Some(old_market) = c.state_mut().market() {
-                            let old_yes = old_market.yes_token.clone();
-                            let old_no = old_market.no_token.clone();
-                            let yes_atoms = c.inventory_mut().owned_atoms(&old_yes).atoms();
-                            let no_atoms = c.inventory_mut().owned_atoms(&old_no).atoms();
-                            if yes_atoms > 0 || no_atoms > 0 {
-                                logline::log_event(
-                                    Level::Error,
-                                    "rotation_blocked_nonzero_inventory",
-                                    &[
-                                        Field {
-                                            key: "yes_atoms",
-                                            value: &yes_atoms,
-                                        },
-                                        Field {
-                                            key: "no_atoms",
-                                            value: &no_atoms,
-                                        },
-                                    ],
-                                );
-                                false
-                            } else {
-                                true
-                            }
-                        } else {
-                            true
-                        };
-
-                        if can_rotate {
-                            let yes = discovered.yes_token.clone();
-                            let no = discovered.no_token.clone();
-                            logline::log_event(
-                                Level::Warn,
-                                "minirust_market_context",
-                                &[
-                                    Field {
-                                        key: "slug",
-                                        value: &discovered.slug.as_str(),
-                                    },
-                                    Field {
-                                        key: "condition_id",
-                                        value: &discovered.condition_id.as_str(),
-                                    },
-                                    Field {
-                                        key: "end_ts",
-                                        value: &discovered.end_ts,
-                                    },
-                                ],
-                            );
-                            c.inventory_mut().release_market_scope([&yes, &no]);
-                            // P0-4: clear signal strike so the bot does not
-                            // trade using the previous market's strike until
-                            // the anchor resolves a new one.
-                            c.signal_mut().set_strike(0.0, false);
-                            c.state_mut().set_market(discovered);
-                            true
-                        } else {
-                            false
-                        }
+                        let yes = discovered.yes_token.clone();
+                        let no = discovered.no_token.clone();
+                        logline::log_event(
+                            Level::Warn,
+                            "minirust_market_context",
+                            &[
+                                Field {
+                                    key: "slug",
+                                    value: &discovered.slug.as_str(),
+                                },
+                                Field {
+                                    key: "condition_id",
+                                    value: &discovered.condition_id.as_str(),
+                                },
+                                Field {
+                                    key: "end_ts",
+                                    value: &discovered.end_ts,
+                                },
+                            ],
+                        );
+                        c.inventory_mut().release_market_scope([&yes, &no]);
+                        c.signal_mut().set_strike(0.0, true);
+                        c.state_mut().set_market(discovered);
+                        true
                     } else {
                         false
                     }

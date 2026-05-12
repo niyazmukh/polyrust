@@ -29,7 +29,6 @@ use serde_json::Value;
 
 use crate::auth::L2AuthSigner;
 use crate::signing::SignedFakOrderBody;
-use crate::types::SharesAtoms;
 
 /// Path component of the order endpoint, relative to the configured
 /// base URL.
@@ -87,6 +86,15 @@ impl SubmitOutcome {
             | SubmitOutcome::Unknown { http_status, .. } => *http_status,
         }
     }
+
+    pub fn error_text(&self) -> Option<&str> {
+        match self {
+            SubmitOutcome::Accepted { .. } => None,
+            SubmitOutcome::Rejected { error, .. } | SubmitOutcome::Unknown { error, .. } => {
+                error.as_deref()
+            }
+        }
+    }
 }
 
 /// HTTP submitter wrapping a pooled reqwest client and the L2 auth
@@ -139,119 +147,6 @@ impl HttpSubmitter {
             auth,
             now_secs: default_now_secs,
         })
-    }
-
-    /// Retrieve positions to ensure the bot starts with a flat inventory.
-    /// This prevents risk overlap across restarts.
-    ///
-    /// Uses official Polymarket endpoints:
-    ///   Positions: GET https://data-api.polymarket.com/positions?user={addr}
-    ///     (unauthenticated, per core/get-current-positions-for-a-user)
-    ///   Orders:   GET https://clob.polymarket.com/data/orders
-    ///     (L2-authenticated, per trade/get-user-orders)
-    ///
-    /// Fail-closed on any nonzero position or any open order.
-    pub async fn verify_flat_start(&self) -> Result<(), String> {
-        let user_address = self.auth.address();
-
-        // 1. Positions via Data API — unauthenticated, different host.
-        let pos_url =
-            format!("https://data-api.polymarket.com/positions?user={user_address}&limit=1");
-        let resp = self
-            .client
-            .get(&pos_url)
-            .send()
-            .await
-            .map_err(|e| format!("flat_start positions http: {e}"))?;
-        if !resp.status().is_success() {
-            return Err(format!("flat_start positions API error: {}", resp.status()));
-        }
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| format!("flat_start positions read: {e}"))?;
-        let value: Value =
-            serde_json::from_str(&body).map_err(|e| format!("flat_start positions json: {e}"))?;
-
-        let positions = match value {
-            Value::Array(arr) => arr,
-            _ => {
-                return Err(format!(
-                    "flat_start positions unexpected schema: expected array, got: {}",
-                    body.chars().take(200).collect::<String>()
-                ));
-            }
-        };
-
-        let mut nonzero_count = 0;
-        for p in &positions {
-            let size_atoms = match p.get("size") {
-                Some(Value::String(s)) => SharesAtoms::parse_decimal(s)
-                    .map_err(|e| format!("flat_start invalid position size: {e}"))?,
-                Some(Value::Number(n)) => SharesAtoms::parse_decimal(&n.to_string())
-                    .map_err(|e| format!("flat_start invalid position size: {e}"))?,
-                _ => return Err(format!("flat_start unexpected position item schema: {p}")),
-            };
-            if size_atoms.atoms() != 0 {
-                nonzero_count += 1;
-            }
-        }
-
-        if nonzero_count > 0 {
-            return Err(format!(
-                "flat_start violation: {} nonzero position(s) found",
-                nonzero_count
-            ));
-        }
-
-        // 2. Open orders via CLOB API — L2-authenticated, /data/orders path.
-        let ts = (self.now_secs)();
-        let orders_url = format!("{}/data/orders", self.base_url);
-        let mut req = self.client.get(&orders_url);
-        let headers = self.auth.headers("GET", "/data/orders", b"", ts);
-        for (name, value) in headers.as_pairs() {
-            req = req.header(name, value);
-        }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| format!("flat_start orders http: {e}"))?;
-        if !resp.status().is_success() {
-            return Err(format!("flat_start orders API error: {}", resp.status()));
-        }
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| format!("flat_start orders read: {e}"))?;
-        let value: Value =
-            serde_json::from_str(&body).map_err(|e| format!("flat_start orders json: {e}"))?;
-
-        let orders = match value {
-            Value::Array(arr) => arr,
-            _ => {
-                return Err(format!(
-                    "flat_start orders unexpected schema: expected array, got: {}",
-                    body.chars().take(200).collect::<String>()
-                ));
-            }
-        };
-
-        if !orders.is_empty() {
-            return Err(format!(
-                "flat_start violation: {} open order(s) found. Cancel them manually.",
-                orders.len()
-            ));
-        }
-
-        Ok(())
-    }
-
-    /// Test-only override for the timestamp source so signatures are
-    /// reproducible in fixtures.
-    #[doc(hidden)]
-    pub fn with_now_secs(mut self, now_secs: fn() -> i64) -> Self {
-        self.now_secs = now_secs;
-        self
     }
 
     /// Submit a locally signed, locally validated FAK order body.

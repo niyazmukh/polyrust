@@ -154,21 +154,25 @@ pub fn canonical_buy_target_for_notional(
         maker.cents() >= inp.min_maker_cents && maker.cents() <= max_allowed_cents
     };
 
-    // Prefer ceil (slight overshoot) if within bounds.
-    if let Some(maker) = ceil_maker
-        && in_band(maker)
-        && ceil_size >= inp.min_size_taker_units
-    {
+    // Prefer ceil (smallest overshoot) if it meets the venue minimum.
+    // The band check is a preference — the lattice step at some prices
+    // exceeds the band width. Accepting the smallest valid ceiling is
+    // better than rejecting the signal.
+    let ceil_ok = ceil_maker.is_some_and(|m| m.cents() >= inp.min_maker_cents)
+        && ceil_size >= inp.min_size_taker_units;
+    let ceil_in_band = ceil_ok && ceil_maker.is_some_and(&in_band);
+
+    if ceil_in_band {
         return Ok(BuyCanonicalTarget {
             price: inp.price,
             size: Shares4::new_unchecked(ceil_size),
-            maker_amount: maker,
+            maker_amount: ceil_maker.unwrap(),
             raw_size_taker_units,
             policy: BuyCanonicalPolicy::Ceil,
         });
     }
 
-    // Otherwise accept floor (slight undershoot).
+    // Floor: only if within band.
     if let Some(maker) = floor_maker
         && in_band(maker)
         && floor_size >= inp.min_size_taker_units
@@ -179,6 +183,18 @@ pub fn canonical_buy_target_for_notional(
             maker_amount: maker,
             raw_size_taker_units,
             policy: BuyCanonicalPolicy::Floor,
+        });
+    }
+
+    // Lattice gap: ceil is above max_allowed, floor is below min_maker.
+    // Accept ceil — it's the smallest size that meets the venue minimum.
+    if ceil_ok {
+        return Ok(BuyCanonicalTarget {
+            price: inp.price,
+            size: Shares4::new_unchecked(ceil_size),
+            maker_amount: ceil_maker.unwrap(),
+            raw_size_taker_units,
+            policy: BuyCanonicalPolicy::Ceil,
         });
     }
 
@@ -254,21 +270,15 @@ mod tests {
     }
 
     #[test]
-    fn p067_target_101_rejects_no_band_fit() {
-        // Documented in docs/README.md (now removed) line ~103 of the prior
-        // version. floor=$0.67 < $1.00 floor; ceil=$1.34 > $1.02 cap.
-        let err = canonical_buy_target_for_notional(input(101, 67, 1)).unwrap_err();
-        match err {
-            BuyCanonicalError::NoValidSizeWithinNotionalBounds {
-                floor: Some((fs, fm)),
-                ceil: Some((cs, cm)),
-                ..
-            } => {
-                assert_eq!((fs, fm), (10_000, 67));
-                assert_eq!((cs, cm), (20_000, 134));
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
+    fn p067_target_101_accepts_ceil_outside_band_when_floor_below_min() {
+        // p=0.67: mult=10000 (1.0 share). raw=151 in 0.01 = 15100 taker.
+        // floor=10000 → maker=67¢ < $1.00 min. ceil=20000 → maker=134¢.
+        // Band is [100,102] — ceil is out of band, but floor is below min.
+        // Lattice gap: accept ceil as smallest venue-valid size.
+        let r = canonical_buy_target_for_notional(input(101, 67, 1)).unwrap();
+        assert_eq!(r.size.units(), 20_000);
+        assert_eq!(r.maker_amount.cents(), 134);
+        assert_eq!(r.policy, BuyCanonicalPolicy::Ceil);
     }
 
     #[test]
@@ -278,6 +288,17 @@ mod tests {
         let r = canonical_buy_target_for_notional(input(1000, 50, 1)).unwrap();
         assert_eq!(r.size.units(), 200_000);
         assert_eq!(r.maker_amount.cents(), 1000);
+    }
+
+    #[test]
+    fn p036_target_101_lattice_gap_accepts_ceil() {
+        // Live prod failure 2026-05-12: p=36 ticks, mult=2500, step=9¢.
+        // raw=281 in 0.01 = 28100 taker. floor=27500→99¢, ceil=30000→108¢.
+        // Band [100,102] contains no lattice point. Accept ceil (108¢).
+        let r = canonical_buy_target_for_notional(input(101, 36, 1)).unwrap();
+        assert_eq!(r.size.units(), 30_000);
+        assert_eq!(r.maker_amount.cents(), 108);
+        assert_eq!(r.policy, BuyCanonicalPolicy::Ceil);
     }
 
     #[test]

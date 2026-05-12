@@ -53,12 +53,6 @@ impl L2AuthSigner {
         })
     }
 
-    pub fn api_key(&self) -> &str {
-        &self.api_key
-    }
-    pub fn passphrase(&self) -> &str {
-        &self.passphrase
-    }
     pub fn address(&self) -> &str {
         &self.address
     }
@@ -176,12 +170,16 @@ const CLOB_AUTH_MESSAGE: &str = "This message attests that I control the given w
 /// (falling back to `POST /auth/api-key` on status errors), authenticated
 /// with an EIP-712 `ClobAuth` signature.
 ///
+/// Returns `(api_key, secret, passphrase, eoa_address_hex)`. The EOA
+/// address is the address the API key is associated with — callers must
+/// use it as `POLY_ADDRESS` in L2 headers.
+///
 /// This is a startup-only operation — never on the hot path.
 pub async fn derive_api_credentials(
     private_key_hex: &str,
     chain_id: u64,
     clob_url: &str,
-) -> Result<(String, String, String), AuthError> {
+) -> Result<(String, String, String, String), AuthError> {
     let pk_hex = private_key_hex
         .strip_prefix("0x")
         .unwrap_or(private_key_hex);
@@ -243,7 +241,12 @@ pub async fn derive_api_credentials(
                     {
                         return Err(AuthError::InvalidSecretBase64);
                     }
-                    return Ok((creds.api_key, creds.secret, creds.passphrase));
+                    return Ok((
+                        creds.api_key,
+                        creds.secret,
+                        creds.passphrase,
+                        address_hex.clone(),
+                    ));
                 }
                 if (400..500).contains(&status) {
                     continue; // 4xx on derive → try create (SDK fallback)

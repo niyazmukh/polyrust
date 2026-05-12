@@ -61,15 +61,6 @@ pub fn set_level(level: Level) {
     LEVEL_THRESHOLD.store(level as u8, Ordering::Relaxed);
 }
 
-pub fn level_threshold() -> Level {
-    match LEVEL_THRESHOLD.load(Ordering::Relaxed) {
-        x if x >= Level::Error as u8 => Level::Error,
-        x if x >= Level::Warn as u8 => Level::Warn,
-        x if x >= Level::Info as u8 => Level::Info,
-        _ => Level::Debug,
-    }
-}
-
 /// Single key/value entry for a log line.
 pub struct Field<'a> {
     pub key: &'a str,
@@ -198,8 +189,8 @@ mod tests {
     #[test]
     fn level_round_trip() {
         set_level(Level::Info);
-        assert_eq!(level_threshold(), Level::Info);
+        assert_eq!(LEVEL_THRESHOLD.load(Ordering::Relaxed), Level::Info as u8);
         set_level(Level::Warn);
-        assert_eq!(level_threshold(), Level::Warn);
+        assert_eq!(LEVEL_THRESHOLD.load(Ordering::Relaxed), Level::Warn as u8);
     }
 }
