@@ -5,6 +5,7 @@
 
 use std::collections::VecDeque;
 
+use crate::logline::{self, Field, Level};
 use crate::state::{MarketContext, Quote};
 use crate::types::{OutcomeSide, PriceTick, TokenId, TsUs};
 
@@ -208,15 +209,37 @@ impl SignalEngine {
             OutcomeSide::No => market.no_token.clone(),
         };
 
-        let ask = quote.ask?;
+        let ask = match quote.ask {
+            Some(a) => a,
+            None => {
+                Self::debug_reject("no_ask", move_usd, ofi_sum, latest.imbalance, 0, 0);
+                return None;
+            }
+        };
         let quote_age = now.micros() - quote.ts_us.micros();
         if quote_age < 0 || quote_age > self.cfg.max_quote_age_us {
+            Self::debug_reject(
+                "quote_stale",
+                move_usd,
+                ofi_sum,
+                latest.imbalance,
+                quote_age,
+                0,
+            );
             return None;
         }
 
         let limit =
             PriceTick::checked(ask.ticks().checked_add(self.cfg.entry_slippage_ticks)?).ok()?;
         if limit < self.cfg.min_buy_limit || limit > self.cfg.max_buy_limit {
+            Self::debug_reject(
+                "limit_band",
+                move_usd,
+                ofi_sum,
+                latest.imbalance,
+                quote_age,
+                limit.ticks(),
+            );
             return None;
         }
 
@@ -234,6 +257,14 @@ impl SignalEngine {
             .max(0);
         let min_edge_ticks = self.cfg.min_edge_ticks.max(live_spread_ticks);
         if edge_ticks < min_edge_ticks {
+            Self::debug_reject(
+                "edge_low",
+                move_usd,
+                ofi_sum,
+                latest.imbalance,
+                edge_ticks as i64,
+                min_edge_ticks,
+            );
             return None;
         }
 
@@ -243,6 +274,39 @@ impl SignalEngine {
             limit,
             edge_ticks,
         })
+    }
+
+    fn debug_reject(gate: &str, move_usd: f64, ofi: f64, imbalance: f64, a: i64, b: i32) {
+        logline::log_event(
+            Level::Debug,
+            "signal_reject",
+            &[
+                Field {
+                    key: "gate",
+                    value: &gate,
+                },
+                Field {
+                    key: "move_usd",
+                    value: &move_usd,
+                },
+                Field {
+                    key: "ofi",
+                    value: &ofi,
+                },
+                Field {
+                    key: "imbalance",
+                    value: &imbalance,
+                },
+                Field {
+                    key: "a",
+                    value: &a,
+                },
+                Field {
+                    key: "b",
+                    value: &(b as i64),
+                },
+            ],
+        );
     }
 
     fn compute_ofi(&self, sample: BinanceSample) -> f64 {
