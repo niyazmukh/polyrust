@@ -190,6 +190,7 @@ pub async fn user_feed_loop(
     api_secret: &str,
     api_passphrase: &str,
     on_event: impl Fn(Bytes) + Send + 'static,
+    on_authenticated: impl Fn() + Send + 'static,
     on_disconnect: impl Fn() + Send + 'static,
 ) {
     let mut backoff = Backoff::new(250.0, 1.7, 5_000.0);
@@ -218,6 +219,7 @@ pub async fn user_feed_loop(
                     continue;
                 }
                 logline::log_event(Level::Warn, "user_ws_auth_sent", &[]);
+                on_authenticated();
 
                 let mut ping = tokio::time::interval(std::time::Duration::from_secs_f64(
                     ws::POLY_PING_INTERVAL_S,
@@ -336,7 +338,7 @@ mod tests {
 
         // Spawn feed — will send auth then block waiting for echo.
         let feed = tokio::spawn(async move {
-            user_feed_loop(&url, "key", "secret", "phrase", |_| {}, || {}).await;
+            user_feed_loop(&url, "key", "secret", "phrase", |_| {}, || {}, || {}).await;
         });
 
         // Wait for server to receive auth frame.

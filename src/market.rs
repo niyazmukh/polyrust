@@ -81,7 +81,7 @@ fn parse_one(value: &Value, out: &mut Vec<MarketEvent>) {
     let event_type = optional_str(value, &["event_type", "eventType", "type"]).unwrap_or_default();
     if event_type.eq_ignore_ascii_case("market_resolved") {
         out.push(MarketEvent::Resolved {
-            condition_id: optional_str(value, &["condition_id", "conditionId"])
+            condition_id: optional_str(value, &["market", "condition_id", "conditionId"])
                 .map(ConditionId::new),
         });
         return;
@@ -147,7 +147,8 @@ fn resolution_matches_active_market(
     state: &RuntimeState,
 ) -> bool {
     let Some(condition_id) = condition_id else {
-        return true;
+        // Can't verify which market resolved — don't kill the active one.
+        return false;
     };
     state
         .market()

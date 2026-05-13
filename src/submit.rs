@@ -149,6 +149,13 @@ impl HttpSubmitter {
         })
     }
 
+    /// Fire a lightweight GET to warm the TLS connection pool.
+    /// Called on market rotation so the first POST doesn't hit a cold connection.
+    pub async fn warm_connection(&self) {
+        let url = format!("{}/tick-size", self.base_url);
+        let _ = self.client.get(&url).send().await;
+    }
+
     /// Submit a locally signed, locally validated FAK order body.
     pub async fn submit_order(&self, body: &SignedFakOrderBody) -> SubmitOutcome {
         let url = format!("{}{}", self.base_url, ORDER_PATH);
@@ -156,7 +163,11 @@ impl HttpSubmitter {
         let bytes = body.as_bytes();
         let headers = self.auth.headers("POST", ORDER_PATH, bytes, ts);
 
-        let mut req = self.client.post(&url).body(bytes.to_vec());
+        let mut req = self
+            .client
+            .post(&url)
+            .body(bytes.to_vec())
+            .header("Content-Type", "application/json");
         for (name, value) in headers.as_pairs() {
             req = req.header(name, value);
         }

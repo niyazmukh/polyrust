@@ -635,6 +635,15 @@ async fn main() {
                     // handles selling once inventory is CONFIRMED on-chain.
                 },
                 {
+                    let ca = core_disconnect.clone();
+                    move || {
+                        if let Ok(mut c) = ca.lock() {
+                            c.inventory_mut().set_user_wss_trusted(true);
+                            logline::log_event(Level::Warn, "user_wss_trusted", &[]);
+                        }
+                    }
+                },
+                {
                     let cd = core_disconnect.clone();
                     move || {
                         if let Ok(mut c) = cd.lock() {
@@ -745,112 +754,6 @@ async fn main() {
         })
     };
 
-    // --- Force-exit task: close positions near market expiry ---
-    // Traces to: bot_orchestrator.py force_exit_tte_us check in evaluate_exit.
-    // Sells owned_atoms at best bid when TTE < 5s.
-    // Uses prepare_sell_for_size_at_bid — FAK at current bid, not a limit order.
-    let force_exit_task = {
-        let core = core.clone();
-        let sub = submitter.clone();
-        let sign = order_signer.clone();
-        let sid = sell_id.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_millis(500));
-            tick.tick().await;
-            loop {
-                tick.tick().await;
-                let (sub, sign) = match (sub.as_ref(), sign.as_ref()) {
-                    (Some(s), Some(g)) => (s.clone(), g.clone()),
-                    _ => continue,
-                };
-
-                let force_plans: Vec<_> = {
-                    let mut c = match core.lock() {
-                        Ok(c) => c,
-                        Err(_) => continue,
-                    };
-                    let market = match c.state_mut().market() {
-                        Some(m) => m.clone(),
-                        None => continue,
-                    };
-                    let tte_us = market
-                        .end_ts
-                        .saturating_mul(1_000_000)
-                        .saturating_sub(now_us());
-                    // Fire force sells when TTE < 5 s.
-                    if tte_us > 5_000_000 {
-                        continue;
-                    }
-
-                    let tokens = [market.yes_token.clone(), market.no_token.clone()];
-                    tokens
-                        .into_iter()
-                        .filter_map(|token| {
-                            let pos = c.inventory().position(&token)?;
-                            let size_atoms = pos.owned_atoms;
-                            if size_atoms.atoms() <= 0 {
-                                return None;
-                            }
-                            c.plan_sell_for_size_at_bid(&token, size_atoms)
-                        })
-                        .collect()
-                };
-
-                // Sign and fire force sells outside the lock.
-                for plan in force_plans {
-                    let token = plan.token.clone();
-                    let prepared = match plan.sign(
-                        &sign,
-                        SignInputs {
-                            salt: sid.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                            timestamp_ms: now_ms(),
-                        },
-                    ) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            logline::log_event(
-                                Level::Error,
-                                "force_sell_prepare_failed",
-                                &[Field {
-                                    key: "error",
-                                    value: &e.to_string().as_str(),
-                                }],
-                            );
-                            continue;
-                        }
-                    };
-                    let sub2 = sub.clone();
-                    tokio::spawn(async move {
-                        let outcome = sub2.submit_order(&prepared.body).await;
-                        let err = outcome.error_text().unwrap_or("-");
-                        logline::log_event(
-                            Level::Warn,
-                            "force_sell_outcome",
-                            &[
-                                Field {
-                                    key: "token_id",
-                                    value: &token.as_str(),
-                                },
-                                Field {
-                                    key: "accepted",
-                                    value: &outcome.is_accepted(),
-                                },
-                                Field {
-                                    key: "http_status",
-                                    value: &(outcome.http_status() as i64),
-                                },
-                                Field {
-                                    key: "error",
-                                    value: &err,
-                                },
-                            ],
-                        );
-                    });
-                }
-            }
-        })
-    };
-
     // --- Maintenance task (market discovery + rotation, every 10 s) ---
     // Traces to: market_ws.py:284-302 (reconcile),
     //   bot_orchestrator.py:542-571 (_apply_market_context on rotation),
@@ -858,26 +761,35 @@ async fn main() {
     let maint_task = {
         let core = core.clone();
         let anchor = anchor.clone();
+        let maint_sub = submitter.clone();
         let hb_ticks = heartbeat_ticks.clone();
         let hb_parse_errs = heartbeat_parse_errs.clone();
         let hb_signals = heartbeat_signals.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
-            interval.tick().await; // skip initial burst
+            let mut periodic = tokio::time::interval(std::time::Duration::from_secs(10));
+            periodic.tick().await; // skip initial burst
             let mut heartbeat_tick: u64 = 0;
-            loop {
-                interval.tick().await;
+            // Next rotation discovery deadline. Fires 5s before market end_ts.
+            // Initialized to now (immediate first discovery).
+            let mut rotation_deadline = tokio::time::Instant::now();
 
-                // Periodic heartbeat — every 60 s (6 × 10 s), out of hot path.
-                // Logs tick rate, parse health, signal rate, and inventory snapshot.
-                heartbeat_tick = heartbeat_tick.wrapping_add(1);
-                if heartbeat_tick.is_multiple_of(6) {
+            loop {
+                // Wait for either the periodic tick or the rotation deadline.
+                let is_rotation = tokio::select! {
+                    _ = periodic.tick() => false,
+                    _ = tokio::time::sleep_until(rotation_deadline) => true,
+                };
+
+                // Periodic heartbeat — every 60 s (6 × 10 s).
+                if !is_rotation {
+                    heartbeat_tick = heartbeat_tick.wrapping_add(1);
+                }
+                if heartbeat_tick.is_multiple_of(6) && !is_rotation {
                     let ticks = hb_ticks.swap(0, std::sync::atomic::Ordering::Relaxed);
                     let parse_errs = hb_parse_errs.swap(0, std::sync::atomic::Ordering::Relaxed);
                     let signals = hb_signals.swap(0, std::sync::atomic::Ordering::Relaxed);
-                    let (pos_count, sellable, yes_bid, no_bid, trading) = {
+                    let (sellable, yes_bid, no_bid, trading) = {
                         let mut c = core.lock().unwrap();
-                        let cnt = c.inventory().open_position_count([]);
                         let market = c.state_mut().market().cloned();
                         let sell = market
                             .as_ref()
@@ -905,7 +817,7 @@ async fn main() {
                             .map(|b| b.ticks())
                             .unwrap_or(0);
                         let active = c.state_mut().trading_active();
-                        (cnt, sell, yb, nb, active)
+                        (sell, yb, nb, active)
                     };
                     logline::log_event(
                         Level::Info,
@@ -922,10 +834,6 @@ async fn main() {
                             Field {
                                 key: "signals_fired",
                                 value: &(signals as i64),
-                            },
-                            Field {
-                                key: "open_positions",
-                                value: &(pos_count as i64),
                             },
                             Field {
                                 key: "sellable_tokens",
@@ -963,10 +871,26 @@ async fn main() {
                     c.inventory_mut().expire_pending(pending_cutoff);
                 }
 
-                // 2. Discover current market.
-                let discovered = match gamma.discover().await {
-                    Some(ctx) => ctx,
-                    None => continue,
+                // 2. Discover current/next market.
+                // On rotation deadline, we know the next slug_ts = current end_ts.
+                let next_slug_ts = {
+                    let mut c = core.lock().unwrap();
+                    c.state_mut().market().map(|m| m.end_ts)
+                };
+                let discovered = if is_rotation && let Some(nts) = next_slug_ts {
+                    // Precise: query the exact next market by its known slug_ts.
+                    match gamma.discover_for_ts(nts).await {
+                        Some(ctx) => ctx,
+                        None => match gamma.discover().await {
+                            Some(ctx) => ctx,
+                            None => continue,
+                        },
+                    }
+                } else {
+                    match gamma.discover().await {
+                        Some(ctx) => ctx,
+                        None => continue,
+                    }
                 };
 
                 // 3. Rotate if new market found.
@@ -997,11 +921,24 @@ async fn main() {
                                 },
                             ],
                         );
+                        // Schedule next rotation discovery 5s before this market ends.
+                        let now_secs = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
+                        let secs_until_prefetch =
+                            (discovered.end_ts - 5).saturating_sub(now_secs).max(1);
+                        rotation_deadline = tokio::time::Instant::now()
+                            + std::time::Duration::from_secs(secs_until_prefetch as u64);
+
                         c.inventory_mut().release_market_scope([&yes, &no]);
                         c.signal_mut().set_strike(0.0, true);
                         c.state_mut().set_market(discovered);
                         true
                     } else {
+                        // Market unchanged — keep polling every 2s until we find the next one.
+                        rotation_deadline =
+                            tokio::time::Instant::now() + std::time::Duration::from_secs(2);
                         false
                     }
                 };
@@ -1034,6 +971,12 @@ async fn main() {
                         let _ = market_tx.send(frame.to_string());
                     }
                 }
+
+                // Pre-warm HTTP connection pool every 10s so POST
+                // never hits a cold/expired TLS connection.
+                if let Some(ref sub) = maint_sub {
+                    sub.warm_connection().await;
+                }
             }
         })
     };
@@ -1059,13 +1002,6 @@ async fn main() {
             match r {
                 Ok(()) => {}
                 Err(e) => panic!("exit task panicked: {e}"),
-            }
-        }
-        r = force_exit_task => {
-            logline::log_event(Level::Error, "force_exit_task_exited", &[]);
-            match r {
-                Ok(()) => {}
-                Err(e) => panic!("force-exit task panicked: {e}"),
             }
         }
         r = maint_task => {

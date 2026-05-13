@@ -14,14 +14,14 @@
 //! `ClobAuth` signature, matching the official SDK's L1 auth flow.
 //! Derivation runs once at startup; it is never on the hot path.
 
+use crate::signing::{address_lower_hex, derive_address, keccak256};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE as BASE64_URL_SAFE;
 use hmac::{Hmac, Mac};
-use k256::ecdsa::{RecoveryId, Signature as EcdsaSignature, SigningKey, VerifyingKey};
+use k256::ecdsa::{RecoveryId, Signature as EcdsaSignature, SigningKey};
 use primitive_types::{H160, H256};
 use serde::Deserialize;
 use sha2::Sha256;
-use sha3::{Digest, Keccak256};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -319,27 +319,6 @@ fn compute_clob_auth_domain(chain_id: u64) -> H256 {
 // ---------------------------------------------------------------------------
 // EIP-712 / ABI helpers (shared with signing.rs — keep in sync)
 // ---------------------------------------------------------------------------
-
-fn keccak256(input: &[u8]) -> H256 {
-    let mut hasher = Keccak256::new();
-    hasher.update(input);
-    H256::from_slice(&hasher.finalize())
-}
-
-fn derive_address(vk: &VerifyingKey) -> H160 {
-    let point = vk.to_encoded_point(false);
-    let bytes = point.as_bytes();
-    debug_assert_eq!(bytes.len(), 65);
-    let hash = keccak256(&bytes[1..]);
-    H160::from_slice(&hash.as_bytes()[12..])
-}
-
-fn address_lower_hex(addr: H160) -> String {
-    let mut s = String::with_capacity(42);
-    s.push_str("0x");
-    s.push_str(&hex::encode(addr.as_bytes()));
-    s
-}
 
 fn u64_to_uint256_be(v: u64) -> [u8; 32] {
     let mut out = [0u8; 32];

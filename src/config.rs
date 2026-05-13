@@ -30,7 +30,6 @@ pub struct Config {
     /// No-entry window before market expiry, in microseconds.
     pub min_decision_tte_us: i64,
     pub max_decision_tte_us: i64,
-    pub max_concurrent_positions: usize,
     pub signal_max_lag_us: i64,
     pub signal_min_window_us: i64,
     pub signal_max_window_us: i64,
@@ -41,6 +40,7 @@ pub struct Config {
     pub signal_min_total_qty: f64,
     pub decision_min_edge_cents: i32,
     pub entry_slippage_cents: i32,
+    pub sell_slippage_cents: i32,
     pub prob_sigma_scale: f64,
     pub prob_sigma_floor_usd: f64,
     pub prob_floor: f64,
@@ -216,6 +216,13 @@ impl Config {
                 name: "MINIMAL_ENTRY_SLIPPAGE",
                 reason: "out_of_range".into(),
             })?;
+        let sell_slippage_cents = env_dec_cents_lookup(&mut lookup, "MINIMAL_SELL_SLIPPAGE")
+            .unwrap_or(0)
+            .try_into()
+            .map_err(|_| ConfigError::Invalid {
+                name: "MINIMAL_SELL_SLIPPAGE",
+                reason: "out_of_range".into(),
+            })?;
         Ok(Self {
             allow_live_orders,
             dry_run_orders,
@@ -226,12 +233,6 @@ impl Config {
             max_buy_limit_cents,
             min_decision_tte_us,
             max_decision_tte_us,
-            max_concurrent_positions: env_i64_lookup(
-                &mut lookup,
-                "MINIMAL_MAX_CONCURRENT_POSITIONS",
-            )
-            .unwrap_or(3)
-            .max(0) as usize,
             signal_max_lag_us: env_i64_lookup(&mut lookup, "MINIMAL_SIGNAL_MAX_LAG_US")
                 .unwrap_or(250_000),
             signal_min_window_us: env_i64_lookup(&mut lookup, "MINIMAL_SIGNAL_MIN_WINDOW_US")
@@ -250,6 +251,7 @@ impl Config {
                 .unwrap_or(0.000001),
             decision_min_edge_cents,
             entry_slippage_cents,
+            sell_slippage_cents,
             prob_sigma_scale: env_f64_lookup(&mut lookup, "MINIMAL_PROB_SIGMA_SCALE")
                 .unwrap_or(1.5),
             prob_sigma_floor_usd: env_f64_lookup(&mut lookup, "MINIMAL_PROB_SIGMA_FLOOR_USD")
@@ -341,7 +343,7 @@ impl LaunchConfig {
         }
         let clob_url = lookup("MINIRUST_CLOB_URL")
             .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| "https://clob-v2.polymarket.com".to_owned());
+            .unwrap_or_else(|| "https://clob.polymarket.com".to_owned());
         let gamma_url = lookup("MINIRUST_GAMMA_URL")
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| "https://gamma-api.polymarket.com".to_owned());
@@ -588,7 +590,6 @@ mod tests {
             ("MINIMAL_MIN_BUY_LIMIT", "0.35"),
             ("MINIMAL_MAX_BUY_LIMIT", "0.65"),
             ("MINIMAL_DECISION_MIN_TTE_US", "45000000"),
-            ("MINIMAL_MAX_CONCURRENT_POSITIONS", "3"),
             ("MINIMAL_SIGNAL_MAX_LAG_US", "250000"),
             ("MINIMAL_SIGNAL_MIN_WINDOW_US", "250000"),
             ("MINIMAL_SIGNAL_MAX_WINDOW_US", "2000000"),
@@ -599,6 +600,7 @@ mod tests {
             ("MINIMAL_SIGNAL_MIN_TOTAL_QTY", "0.000001"),
             ("MINIMAL_DECISION_MIN_EDGE", "0.05"),
             ("MINIMAL_ENTRY_SLIPPAGE", "0.03"),
+            ("MINIMAL_SELL_SLIPPAGE", "0.03"),
             ("MINIMAL_PROB_SIGMA_SCALE", "1.5"),
             ("MINIMAL_PROB_SIGMA_FLOOR_USD", "2.0"),
             ("MINIMAL_PROB_FLOOR", "0.02"),

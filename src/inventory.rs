@@ -87,10 +87,11 @@ impl TradeStatus {
     }
 
     fn inventory_applying(self) -> bool {
-        // Only CONFIRMED means the trade achieved on-chain finality.
-        // MATCHED is off-chain only — the on-chain balance doesn't exist
-        // yet, so selling against it would get INVALID_ORDER_NOT_ENOUGH_BALANCE.
-        matches!(self, TradeStatus::Confirmed)
+        // Apply on MATCHED for fast SELL (Python bot does the same).
+        // If FAILED arrives later, the delta is reversed. SELL against
+        // a MATCHED-but-not-yet-CONFIRMED balance may get rejected by
+        // the venue — that's cheap (FAK rejection).
+        matches!(self, TradeStatus::Matched | TradeStatus::Confirmed)
     }
 
     fn terminal(self) -> bool {
@@ -271,6 +272,19 @@ impl Inventory {
             );
             record.applied = true;
         }
+        // Reverse the delta if FAILED arrives after MATCHED already applied.
+        if trade.status == TradeStatus::Failed && record.applied && !record.finalized {
+            let reverse_side = match record.side {
+                OrderSide::Buy => OrderSide::Sell,
+                OrderSide::Sell => OrderSide::Buy,
+            };
+            apply_inventory_delta(
+                &mut self.owned_by_token,
+                &record.token,
+                reverse_side,
+                record.size_atoms,
+            );
+        }
         if trade.status.terminal() {
             record.finalized = true;
         }
@@ -312,34 +326,14 @@ impl Inventory {
         if !self.user_wss_trusted {
             return true;
         }
-        self.owned_atoms(token).atoms() > 0
+        // Ignore dust below the sell quantum (0.01 shares = 10,000 atoms).
+        // Partial fills leave sub-quantum residue that can never be sold
+        // and resolves on-chain at market expiry.
+        self.owned_atoms(token).atoms() >= 10_000
             || self
                 .pending
                 .values()
                 .any(|p| p.token == *token && p.status.blocks_entry())
-    }
-
-    pub fn open_position_count<'a>(&self, scope: impl IntoIterator<Item = &'a TokenId>) -> usize {
-        let scope: Vec<&TokenId> = scope.into_iter().collect();
-        let in_scope = |t: &TokenId| scope.is_empty() || scope.contains(&t);
-        // Count unique tokens with exposure (owned or pending).
-        // With release_market_scope clearing old tokens, owned_by_token
-        // has at most 2 entries and pending at most max_concurrent_positions.
-        let mut count = 0;
-        for (token, atoms) in &self.owned_by_token {
-            if *atoms > 0 && in_scope(token) {
-                count += 1;
-            }
-        }
-        for p in self.pending.values() {
-            if p.status.blocks_entry()
-                && in_scope(&p.token)
-                && self.owned_by_token.get(&p.token).copied().unwrap_or(0) <= 0
-            {
-                count += 1;
-            }
-        }
-        count
     }
 
     pub fn release_market_scope<'a>(
@@ -432,9 +426,11 @@ mod tests {
             OrderSide::Buy,
             TradeStatus::Matched,
         ));
-        assert!(!first.applied);
-        assert_eq!(inv.owned_atoms(&t), SharesAtoms(0));
+        // MATCHED now applies inventory immediately for fast SELL.
+        assert!(first.applied);
+        assert_eq!(inv.owned_atoms(&t), SharesAtoms(1_416_664));
 
+        // CONFIRMED is idempotent — already applied.
         let confirmed = inv.apply_user_trade(trade(
             "tr1",
             t.clone(),
@@ -499,7 +495,7 @@ mod tests {
         assert!(!inv.has_entry_exposure_or_pending(&t));
 
         // MATCHED: pending is matched but NOT removed (not terminal yet).
-        // Inventory NOT applied (only CONFIRMED applies).
+        // Inventory IS applied on MATCHED for fast SELL.
         let state = inv.apply_user_trade(UserTrade {
             trade_id: TradeId::new("late"),
             token: t.clone(),
@@ -512,9 +508,9 @@ mod tests {
         });
         assert_eq!(state.matched_submit, Some(id.clone()));
         assert!(inv.pending(&id).is_some()); // still alive until terminal
-        assert_eq!(inv.owned_atoms(&t), SharesAtoms(0));
+        assert_eq!(inv.owned_atoms(&t), SharesAtoms(1_000_000));
 
-        // CONFIRMED: inventory applied, pending removed.
+        // CONFIRMED: idempotent (already applied), pending removed.
         let confirmed = inv.apply_user_trade(UserTrade {
             trade_id: TradeId::new("late"),
             token: t.clone(),
@@ -544,7 +540,6 @@ mod tests {
         inv.claim_entry(old.clone(), OrderSide::Buy, SharesAtoms(1_000_000), 1);
         inv.release_market_scope([&new]);
         assert_eq!(inv.owned_atoms(&old), SharesAtoms(0));
-        assert_eq!(inv.open_position_count([&old, &new]), 0);
     }
 
     #[test]

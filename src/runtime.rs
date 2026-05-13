@@ -4,7 +4,6 @@
 //! proven call sites: Binance book-ticker frame -> signal sample -> optional
 //! BUY intent after current state and inventory risk checks.
 
-use crate::binance::BinanceParseError;
 use crate::config::{Config, ConfigError};
 use crate::inventory::{Inventory, SubmitId};
 use crate::market::{MarketParseError, apply_market_events, parse_market_events};
@@ -16,12 +15,11 @@ use crate::signal::{BuyIntent, SignalEngine};
 use crate::signing::{OrderSigner, SignInputs, SignedFakOrderBody, SigningError};
 use crate::state::RuntimeState;
 use crate::submit::SubmitOutcome;
-use crate::types::{OrderId, OutcomeSide, PriceTick, Shares2, SharesAtoms, TokenId, TsUs};
+use crate::types::{OrderId, OutcomeSide, PriceTick, Shares2, TokenId, TsUs};
 use crate::user::{UserMessage, UserParseError, parse_user_message};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeError {
-    Binance(BinanceParseError),
     Market(MarketParseError),
     User(UserParseError),
     BuyCanonical(BuyCanonicalError),
@@ -31,7 +29,6 @@ pub enum RuntimeError {
 impl std::fmt::Display for RuntimeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RuntimeError::Binance(e) => write!(f, "binance: {e}"),
             RuntimeError::Market(e) => write!(f, "market: {e}"),
             RuntimeError::User(e) => write!(f, "user: {e}"),
             RuntimeError::BuyCanonical(e) => write!(f, "buy_canonical: {e}"),
@@ -41,12 +38,6 @@ impl std::fmt::Display for RuntimeError {
 }
 
 impl std::error::Error for RuntimeError {}
-
-impl From<BinanceParseError> for RuntimeError {
-    fn from(value: BinanceParseError) -> Self {
-        RuntimeError::Binance(value)
-    }
-}
 
 impl From<MarketParseError> for RuntimeError {
     fn from(value: MarketParseError) -> Self {
@@ -132,7 +123,6 @@ pub struct RuntimeCore {
     inventory: Inventory,
     signal: SignalEngine,
     buy_policy: BuySubmitPolicy,
-    max_open_positions: usize,
     sell_slippage_ticks: i32,
 }
 
@@ -143,8 +133,7 @@ impl RuntimeCore {
             inventory: Inventory::new(),
             signal: SignalEngine::new(config.signal_config()?),
             buy_policy: config.buy_submit_policy(),
-            sell_slippage_ticks: config.entry_slippage_cents,
-            max_open_positions: config.max_concurrent_positions,
+            sell_slippage_ticks: config.sell_slippage_cents,
         })
     }
 
@@ -181,7 +170,6 @@ impl RuntimeCore {
             &self.inventory,
             now,
             tte_us,
-            self.max_open_positions,
         )
     }
 
@@ -219,17 +207,6 @@ impl RuntimeCore {
             self.sell_slippage_ticks,
         )
     }
-
-    /// Build a `SellPlan` for a specific size (in atoms) at the current
-    /// bid. Returns `None` if no bid exists or the size rounds to zero
-    /// sellable units.
-    pub fn plan_sell_for_size_at_bid(
-        &self,
-        token: &TokenId,
-        size_atoms: SharesAtoms,
-    ) -> Option<SellPlan> {
-        plan_sell_for_size_at_bid(token, size_atoms, &self.state, self.sell_slippage_ticks)
-    }
 }
 
 pub fn on_binance_sample(
@@ -239,7 +216,6 @@ pub fn on_binance_sample(
     inventory: &Inventory,
     now: TsUs,
     tte_us: i64,
-    max_open_positions: usize,
 ) -> Result<Option<BuyIntent>, RuntimeError> {
     if !state.trading_active() {
         signal.push(sample);
@@ -261,10 +237,6 @@ pub fn on_binance_sample(
     let Some(intent) = signal.on_sample(sample, market, yes_quote, no_quote, now, tte_us) else {
         return Ok(None);
     };
-    let scope = [&market.yes_token, &market.no_token];
-    if max_open_positions == 0 || inventory.open_position_count(scope) >= max_open_positions {
-        return Ok(None);
-    }
     if inventory.has_entry_exposure_or_pending(&intent.token) {
         return Ok(None);
     }
@@ -341,31 +313,6 @@ pub fn plan_sell_at_bid(
     let limit_ticks = (bid.ticks() - slippage_ticks).max(1);
     let limit = PriceTick::checked(limit_ticks).ok()?;
     let (price, size) = canonical_sell_params(limit, position.sellable.units() * 100).ok()?;
-    if size.units() <= 0 {
-        return None;
-    }
-    Some(SellPlan {
-        token: token.clone(),
-        price,
-        size,
-    })
-}
-
-/// Compute a `SellPlan` for an explicit size (in atoms) at the current
-/// bid. Unlike `plan_sell_at_bid`, this does not require WSS inventory
-/// — it trusts the caller-supplied `size_atoms`. Used by the force-exit
-/// path which sells `owned_atoms` directly.
-pub fn plan_sell_for_size_at_bid(
-    token: &TokenId,
-    size_atoms: SharesAtoms,
-    state: &RuntimeState,
-    slippage_ticks: i32,
-) -> Option<SellPlan> {
-    let bid = state.quote_for_token(token).and_then(|q| q.bid)?;
-    let limit_ticks = (bid.ticks() - slippage_ticks).max(1);
-    let limit = PriceTick::checked(limit_ticks).ok()?;
-    let raw_size_taker_units = size_atoms.atoms().div_euclid(100);
-    let (price, size) = canonical_sell_params(limit, raw_size_taker_units).ok()?;
     if size.units() <= 0 {
         return None;
     }

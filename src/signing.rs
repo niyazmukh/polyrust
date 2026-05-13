@@ -528,7 +528,7 @@ fn compute_domain_separator(
     keccak256(&buf)
 }
 
-fn keccak256(input: &[u8]) -> H256 {
+pub(crate) fn keccak256(input: &[u8]) -> H256 {
     let mut hasher = Keccak256::new();
     hasher.update(input);
     H256::from_slice(&hasher.finalize())
@@ -536,7 +536,7 @@ fn keccak256(input: &[u8]) -> H256 {
 
 /// Derive the Ethereum address from a secp256k1 verifying key:
 /// keccak256(uncompressed_pubkey[1..])[12..32] is the lower 20 bytes.
-fn derive_address(vk: &VerifyingKey) -> H160 {
+pub fn derive_address(vk: &VerifyingKey) -> H160 {
     let point = vk.to_encoded_point(false); // uncompressed: 0x04 || X || Y
     let bytes = point.as_bytes();
     debug_assert_eq!(bytes.len(), 65);

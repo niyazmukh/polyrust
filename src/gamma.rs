@@ -112,6 +112,12 @@ impl GammaClient {
         None
     }
 
+    /// Discover a market for a specific slug timestamp (e.g., the next window).
+    pub async fn discover_for_ts(&self, slug_ts: i64) -> Option<MarketContext> {
+        let slug = self.slug_fmt.replace("{ts}", &slug_ts.to_string());
+        self.try_discover_slug(&slug, slug_ts).await
+    }
+
     async fn try_discover_slug(&self, slug: &str, slug_ts: i64) -> Option<MarketContext> {
         let url = format!("{}/events/slug/{}", self.gamma_url, slug);
         let resp = self.client.get(&url).send().await.ok()?;
