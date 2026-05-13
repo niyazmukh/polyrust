@@ -171,11 +171,6 @@ impl RuntimeCore {
         Ok(apply_market_events(&events, &mut self.state, ts_us))
     }
 
-    pub fn apply_user_raw(&mut self, raw: &[u8], ts_us: i64) -> Result<UserMessage, RuntimeError> {
-        self.apply_user_raw_with_states(raw, ts_us)
-            .map(|(msg, _states)| msg)
-    }
-
     pub fn apply_user_raw_with_states(
         &mut self,
         raw: &[u8],
@@ -202,15 +197,6 @@ impl RuntimeCore {
     /// outside any shared mutex. Returns `None` if no bid exists, the
     /// sellable inventory is zero, or the size rounds to zero sellable
     /// units after venue-quantum snap.
-    pub fn plan_sell_at_bid(&self, token: &TokenId) -> Option<SellPlan> {
-        plan_sell_at_bid(
-            token,
-            &self.state,
-            &self.inventory,
-            self.sell_slippage_ticks,
-        )
-    }
-
     pub fn plan_sells_at_bid_excluding(
         &self,
         tokens: impl IntoIterator<Item = TokenId>,
