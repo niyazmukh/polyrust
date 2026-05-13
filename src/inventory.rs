@@ -139,7 +139,6 @@ struct TradeRecord {
     token: TokenId,
     side: OrderSide,
     size_atoms: SharesAtoms,
-    lifecycle: Vec<TradeStatus>,
     applied: bool,
     finalized: bool,
 }
@@ -265,14 +264,9 @@ impl Inventory {
                 token: trade.token.clone(),
                 side: trade.side,
                 size_atoms: trade.size_atoms,
-                lifecycle: Vec::with_capacity(3),
                 applied: false,
                 finalized: false,
             });
-
-        if !record.lifecycle.contains(&trade.status) {
-            record.lifecycle.push(trade.status);
-        }
 
         if trade.status.inventory_applying() && !record.applied {
             apply_inventory_delta(
