@@ -5,7 +5,7 @@
 //! BUY intent after current state and inventory risk checks.
 
 use crate::config::{Config, ConfigError};
-use crate::inventory::{Inventory, SubmitId};
+use crate::inventory::{Inventory, SubmitId, TradeState};
 use crate::market::{MarketParseError, apply_market_events, parse_market_events};
 use crate::orders::{
     BuyCanonicalError, BuyCanonicalInput, BuyCanonicalTarget, canonical_buy_target_for_notional,
@@ -17,6 +17,7 @@ use crate::state::RuntimeState;
 use crate::submit::SubmitOutcome;
 use crate::types::{OrderId, OutcomeSide, PriceTick, Shares2, TokenId, TsUs};
 use crate::user::{UserMessage, UserParseError, parse_user_message};
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeError {
@@ -179,13 +180,23 @@ impl RuntimeCore {
     }
 
     pub fn apply_user_raw(&mut self, raw: &[u8], ts_us: i64) -> Result<UserMessage, RuntimeError> {
+        self.apply_user_raw_with_states(raw, ts_us)
+            .map(|(msg, _states)| msg)
+    }
+
+    pub fn apply_user_raw_with_states(
+        &mut self,
+        raw: &[u8],
+        ts_us: i64,
+    ) -> Result<(UserMessage, Vec<TradeState>), RuntimeError> {
         let msg = parse_user_message(raw, ts_us)?;
+        let mut states = Vec::new();
         if let UserMessage::Trades(ref trades) = msg {
             for trade in trades {
-                self.inventory.apply_user_trade(trade.clone());
+                states.push(self.inventory.apply_user_trade(trade.clone()));
             }
         }
-        Ok(msg)
+        Ok((msg, states))
     }
 
     // Sell convenience methods. `&self` benefits from field-level borrow splitting.
@@ -205,6 +216,20 @@ impl RuntimeCore {
             &self.state,
             &self.inventory,
             self.sell_slippage_ticks,
+        )
+    }
+
+    pub fn plan_sells_at_bid_excluding(
+        &self,
+        tokens: impl IntoIterator<Item = TokenId>,
+        in_flight: &HashSet<TokenId>,
+    ) -> Vec<SellPlan> {
+        plan_sells_at_bid_excluding(
+            tokens,
+            &self.state,
+            &self.inventory,
+            self.sell_slippage_ticks,
+            in_flight,
         )
     }
 }
@@ -321,4 +346,18 @@ pub fn plan_sell_at_bid(
         price,
         size,
     })
+}
+
+pub fn plan_sells_at_bid_excluding(
+    tokens: impl IntoIterator<Item = TokenId>,
+    state: &RuntimeState,
+    inventory: &Inventory,
+    slippage_ticks: i32,
+    in_flight: &HashSet<TokenId>,
+) -> Vec<SellPlan> {
+    tokens
+        .into_iter()
+        .filter(|token| !in_flight.contains(token))
+        .filter_map(|token| plan_sell_at_bid(&token, state, inventory, slippage_ticks))
+        .collect()
 }

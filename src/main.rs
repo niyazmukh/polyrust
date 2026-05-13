@@ -22,8 +22,8 @@ use minirust::gamma::GammaClient;
 use minirust::logline::{self, Field, Level};
 use minirust::runtime::{self, RuntimeCore};
 use minirust::signing::{EXCHANGE_V2_NORMAL, OrderSigner, POLYGON_CHAIN_ID, SignInputs};
-use minirust::submit::HttpSubmitter;
-use minirust::types::TsUs;
+use minirust::submit::{HttpSubmitter, SubmitOutcome};
+use minirust::types::{TokenId, TsUs};
 use tokio::sync::mpsc;
 
 // ---------------------------------------------------------------------------
@@ -255,6 +255,11 @@ async fn main() {
                 },
             ],
         );
+    }
+
+    // Pre-warm TLS connection pool so the first BUY POST doesn't hit a cold connection.
+    if let Some(ref sub) = submitter {
+        sub.warm_connection().await;
     }
 
     // ==================================================================
@@ -647,8 +652,8 @@ async fn main() {
                         Err(_) => return,
                     };
                     let ts = now_us();
-                    match c.apply_user_raw(&raw, ts) {
-                        Ok(minirust::user::UserMessage::AuthError(ref msg)) => {
+                    match c.apply_user_raw_with_states(&raw, ts) {
+                        Ok((minirust::user::UserMessage::AuthError(ref msg), _)) => {
                             c.inventory_mut().set_user_wss_trusted(false);
                             logline::log_event(
                                 Level::Error,
@@ -659,7 +664,50 @@ async fn main() {
                                 }],
                             );
                         }
-                        Ok(_) => {}
+                        Ok((_msg, states)) => {
+                            for state in states {
+                                let matched_submit = state
+                                    .matched_submit
+                                    .as_ref()
+                                    .map(|id| id.as_str())
+                                    .unwrap_or("-");
+                                let sellable_after = c.inventory().sellable(&state.token).units();
+                                logline::log_event(
+                                    Level::Warn,
+                                    "user_trade_applied",
+                                    &[
+                                        Field {
+                                            key: "trade_id",
+                                            value: &state.trade_id.as_str(),
+                                        },
+                                        Field {
+                                            key: "token_id",
+                                            value: &state.token.as_str(),
+                                        },
+                                        Field {
+                                            key: "side",
+                                            value: &state.side.as_str(),
+                                        },
+                                        Field {
+                                            key: "status",
+                                            value: &state.status.as_str(),
+                                        },
+                                        Field {
+                                            key: "size_atoms",
+                                            value: &state.size_atoms.atoms(),
+                                        },
+                                        Field {
+                                            key: "matched_submit",
+                                            value: &matched_submit,
+                                        },
+                                        Field {
+                                            key: "sellable_after",
+                                            value: &sellable_after,
+                                        },
+                                    ],
+                                );
+                            }
+                        }
                         Err(e) => {
                             logline::log_event(
                                 Level::Error,
@@ -697,11 +745,12 @@ async fn main() {
         })
     };
 
-    // --- Exit task: periodic SELL at executable bid, no gating ---
+    // --- Exit task: periodic SELL at executable bid, one in-flight per token ---
     // Traces to: minimal_live_bot.py:309-312 (_exit_loop),
     //   bot_orchestrator.py:464-538 (evaluate_exit).
-    // Principle: SELL is not locally over-gated. FAK rejection is cheap.
-    // No reservations, balance locks, cooldowns, or in-flight blockers.
+    // Principle: SELL does not own inventory, but submit concurrency is
+    // single-flight per token. Live evidence showed full-size FAK storms
+    // during transport uncertainty can consume venue-side reservations.
     let exit_task = {
         let core = core.clone();
         let sub = submitter.clone();
@@ -709,9 +758,38 @@ async fn main() {
         let sid = sell_id.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_micros(50_000));
+            let (done_tx, mut done_rx) = mpsc::channel::<(TokenId, SubmitOutcome)>(4);
+            let mut sell_in_flight = std::collections::HashSet::<TokenId>::new();
             tick.tick().await;
             loop {
                 tick.tick().await;
+                while let Ok((token, outcome)) = done_rx.try_recv() {
+                    sell_in_flight.remove(&token);
+                    let err = outcome.error_text().unwrap_or("-");
+                    logline::log_event(
+                        Level::Warn,
+                        "sell_submit_outcome",
+                        &[
+                            Field {
+                                key: "token_id",
+                                value: &token.as_str(),
+                            },
+                            Field {
+                                key: "accepted",
+                                value: &outcome.is_accepted(),
+                            },
+                            Field {
+                                key: "http_status",
+                                value: &(outcome.http_status() as i64),
+                            },
+                            Field {
+                                key: "error",
+                                value: &err,
+                            },
+                        ],
+                    );
+                }
+
                 let sub = match sub.as_ref() {
                     Some(s) => s.clone(),
                     None => continue,
@@ -734,10 +812,7 @@ async fn main() {
                         .market()
                         .map(|m| vec![m.yes_token.clone(), m.no_token.clone()])
                         .unwrap_or_default();
-                    tokens
-                        .into_iter()
-                        .filter_map(|token| c.plan_sell_at_bid(&token))
-                        .collect()
+                    c.plan_sells_at_bid_excluding(tokens, &sell_in_flight)
                 };
 
                 // Sign and fire sells outside the lock.
@@ -763,32 +838,12 @@ async fn main() {
                             continue;
                         }
                     };
+                    sell_in_flight.insert(token.clone());
                     let sub2 = sub.clone();
+                    let done_tx = done_tx.clone();
                     tokio::spawn(async move {
                         let outcome = sub2.submit_order(&prepared.body).await;
-                        let err = outcome.error_text().unwrap_or("-");
-                        logline::log_event(
-                            Level::Warn,
-                            "sell_submit_outcome",
-                            &[
-                                Field {
-                                    key: "token_id",
-                                    value: &token.as_str(),
-                                },
-                                Field {
-                                    key: "accepted",
-                                    value: &outcome.is_accepted(),
-                                },
-                                Field {
-                                    key: "http_status",
-                                    value: &(outcome.http_status() as i64),
-                                },
-                                Field {
-                                    key: "error",
-                                    value: &err,
-                                },
-                            ],
-                        );
+                        let _ = done_tx.send((token, outcome)).await;
                     });
                 }
             }

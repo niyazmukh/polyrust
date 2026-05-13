@@ -20,9 +20,9 @@ Rust-first low-latency FAK trading bot for Polymarket 5-minute binary options.
 
 7. **Fixed-point precision.** No f64 crosses the signed body boundary. Venue-facing values are integer ticks/cents/atoms. Silent rounding is forbidden.
 
-8. **WSS is inventory truth.** User WSS CONFIRMED trades own the balance. HTTP responses classify outcomes but don't own inventory. User WSS must subscribe to the active condition ID and receive rotation subscription updates. Trust starts false, granted on successful auth frame send (venue has no explicit auth ACK per official SDK — invalid creds cause server disconnect), revoked on disconnect/error.
+8. **WSS is inventory truth.** User WSS trade events own inventory. MATCHED applies inventory immediately for SELL; CONFIRMED is idempotent finality; FAILED after MATCHED reverses. HTTP responses classify outcomes but don't own inventory. User WSS must subscribe to the active condition ID and receive rotation subscription updates. Trust starts false, granted on successful auth frame send (venue has no explicit auth ACK per official SDK — invalid creds cause server disconnect), revoked on disconnect/error.
 
-9. **FAK rejection is cheap.** Don't over-protect BUY no-match, SELL no-match, or SELL balance rejection. Rejected BUY deletes the claim. SELL creates zero local state.
+9. **FAK rejection is cheap, submit storms are not.** Don't over-protect BUY no-match, SELL no-match, or definitive SELL balance rejection. Rejected BUY deletes the claim. SELL does not own inventory, but SELL submission is single-flight per token until the HTTP outcome returns; this prevents repeated full-size FAKs from colliding with venue-side matched/open reservations during transport uncertainty.
 
 10. **Official docs rule.** When in doubt, consult Polymarket/Binance official docs. Priority: live evidence > official docs > source code > tests > Graphify > comments > AI summaries.
 
@@ -47,15 +47,26 @@ Rust-first low-latency FAK trading bot for Polymarket 5-minute binary options.
 ### SELL Lifecycle
 
 - Read sellable inventory → read bid → sign FAK SELL → submit → log.
-- No SELL reservations, locks, cooldowns, balance locks, in-flight blockers, or pending state.
-- Exit task fires every 50ms. That's the only sell mechanism needed.
+- Inventory remains WSS-owned; HTTP SELL responses do not mutate balance.
+- At most one SELL submit may be in flight per token. The next retry is allowed only after the prior HTTP outcome returns.
+- No cooldown knobs, balance locks, REST reconciliation, force-exit tasks, or pending-inventory state.
+- Exit task wakes every 50ms, but token-level single-flight bounds submit concurrency.
 
 ### Market Rotation
 
-- Unconditional. When Gamma discovers a new market, rotate immediately.
+- Discovery and rotation have one source of truth: Gamma by slug timestamp.
+- Ordinary discovery is initial/current slug only. It must not promote the next window early.
+- Rotation is scheduled exactly 5 seconds before current market expiry (`end_ts - 5s`) and discovers only the exact next slug (`slug_ts = current.end_ts`).
 - Old inventory/pending/state is forgotten. Old markets resolve on-chain at expiry.
 - Signal ring cleared on rotation (prevents stale momentum).
 - Strike disabled until anchor resolves for the new market.
+
+### WebSockets
+
+- Market WSS subscribes by token/asset IDs: `assets_ids = [yes_token, no_token]`.
+- User WSS subscribes by market condition IDs: `markets = [condition_id]`.
+- On Gamma rotation, the same `MarketContext` must update both channels: market WSS gets YES/NO token IDs; user WSS gets the condition ID.
+- Missing user-channel market subscription is a P0/P1 inventory-truth failure, because matched/confirmed trades may not reach the runtime.
 
 ### Signing
 
@@ -74,7 +85,9 @@ Rust-first low-latency FAK trading bot for Polymarket 5-minute binary options.
 - force-exit tasks (exit task already sells everything)
 - max-position caps (same-token duplicate protection is sufficient in 2-token markets)
 - max-TTE gates (the 5-min market window IS the product boundary)
-- SELL state of any kind
+- SELL inventory state of any kind
+- overlapping SELL submits for the same token
+- periodic rediscovery that can promote a future market before `end_ts - 5s`
 - old-market pending/inventory reconciliation
 - SDK network calls on the signal path
 - subprocess wrappers, JSON file writes, raw event dumps on hot path
@@ -132,11 +145,12 @@ All must be true:
 - user WSS subscription includes active condition ID and updates on rotation
 - BUY claim atomic with intent, deleted on rejection, removed on CONFIRMED
 - UNKNOWN stays matchable, Accepted doesn't expire blindly
-- SELL has zero local state
+- SELL submit concurrency is single-flight per token; SELL does not own inventory
 - inventory applies on MATCHED; CONFIRMED is idempotent; FAILED reverses
 - decimal validation is fixed-point
 - signature kind/funder fails closed
-- rotation is unconditional, forgets old state, clears signal ring
+- rotation occurs only at `end_ts - 5s`, forgets old state, clears signal ring
+- no periodic next-window promotion before the scheduled rotation deadline
 - no SDK order builder on signal path
 - docs/tests/Graphify match runtime
 - `cargo fmt` + `cargo test` + `cargo clippy -D warnings` pass
@@ -148,6 +162,24 @@ Shadow/live evidence still needed before deployment:
 - Gamma discovery + rotation observed
 - Binance signal → BUY submit → outcome classification observed
 - WSS trade → inventory update → SELL fire observed
+
+---
+
+## Official Docs Used
+
+- Polymarket POST order: https://docs.polymarket.com/api-reference/trade/post-a-new-order
+- Polymarket create order: https://docs.polymarket.com/trading/orders/create
+- Polymarket user WSS API: https://docs.polymarket.com/api-reference/wss/user
+- Polymarket market WSS API: https://docs.polymarket.com/api-reference/wss/market
+- Polymarket user channel guide: https://docs.polymarket.com/market-data/websocket/user-channel
+- Polymarket market channel guide: https://docs.polymarket.com/market-data/websocket/market-channel
+
+Runtime conclusions from those docs:
+
+- Market channel subscriptions are asset/token scoped.
+- User channel subscriptions are condition/market scoped.
+- User channel trade statuses include MATCHED, CONFIRMED, and FAILED lifecycle events.
+- SELL failures with insufficient balance/allowance are venue-side rejections; they must not create local SELL state.
 
 ---
 

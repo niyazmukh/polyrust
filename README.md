@@ -33,8 +33,8 @@ src/
 
 ## Key Design Decisions
 
-**WSS is inventory truth.** User-channel CONFIRMED trades own the balance.
-HTTP submit responses classify outcomes but don't own inventory.
+**WSS is inventory truth.** User-channel trade events own inventory. HTTP
+submit responses classify outcomes but don't own inventory.
 
 **Inventory applies on MATCHED.** MATCHED is the first on-chain signal; inventory
 is applied immediately so SELL can fire without waiting for CONFIRMED. If FAILED
@@ -44,20 +44,30 @@ SELL only fires once MATCHED balance exists.
 **No flat-start check.** Old positions on expired markets resolve automatically.
 The bot only trades the current 5-minute window discovered via Gamma.
 
-**Unconditional market rotation.** When Gamma discovers a new market, the bot
-rotates immediately. Old inventory is forgotten — it resolves on-chain at expiry.
+**Scheduled market rotation.** Gamma discovery is the only market source, but
+ordinary discovery is current-slug only. The bot rotates exactly 5 seconds
+before market expiry by querying the next slug (`slug_ts = current.end_ts`).
+Old inventory is forgotten; old markets resolve on-chain at expiry.
 
 **BUY duplicate protection via atomic claim.** `claim_entry()` runs inside the
 same `core.lock()` as the signal decision. Pending stays alive until CONFIRMED
 (blocks same-token re-entry). Rejected → claim deleted.
 
-**SELL is fire-and-forget.** No SELL state, no locks, no cooldowns. Exit task
-fires every 50ms at the executable bid. FAK rejection is cheap.
+**SELL submit is single-flight per token.** Inventory remains WSS-owned, and
+HTTP SELL responses never own balance. The exit task wakes every 50ms, but a
+token cannot submit another FAK SELL until the prior HTTP outcome returns. This
+prevents repeated full-size SELLs from colliding with venue-side reservations
+under transport uncertainty.
 
 **User WSS scoped to the active market.** `user_wss_trusted` starts false,
 set true after the auth frame with the active condition ID is successfully
 sent. Rotation sends a user-channel subscription update for the next condition
 ID. Revoked on disconnect/error. BUY blocked while untrusted.
+
+**WSS subscription split.** Market WSS subscribes by token IDs
+(`assets_ids: [yes_token, no_token]`). User WSS subscribes by condition IDs
+(`markets: [condition_id]`). The Gamma-discovered `MarketContext` feeds both
+channels on startup and rotation.
 
 **Signal ring cleared on rotation.** Prevents stale microprice samples from
 producing spurious momentum against the new market's strike.
@@ -84,6 +94,10 @@ src_ts_us → recv_us → decide_us → submit_us → outcome (rtt_us)
 **Post-signal price tracker** (INFO level): logs the token ask price at
 1s intervals for 15s after each signal fires. Zero hot-path overhead —
 runs in a spawned task off the critical path.
+
+**User trade application** (WARNING level): logs `user_trade_applied` after a
+parsed user-channel trade updates inventory, including trade id, token, side,
+status, size atoms, matched submit id, and sellable balance after the update.
 
 ## Build / Test
 
@@ -118,13 +132,32 @@ $env:MINIRUST_MARKET_SLUG_FMT="btc-updown-5m-{ts}"
 cargo run --release
 ```
 
+## Official Polymarket Docs Used
+
+- POST order: https://docs.polymarket.com/api-reference/trade/post-a-new-order
+- Create order: https://docs.polymarket.com/trading/orders/create
+- User WSS API: https://docs.polymarket.com/api-reference/wss/user
+- Market WSS API: https://docs.polymarket.com/api-reference/wss/market
+- User channel guide: https://docs.polymarket.com/market-data/websocket/user-channel
+- Market channel guide: https://docs.polymarket.com/market-data/websocket/market-channel
+
+Runtime mapping from docs:
+
+- Market channel subscription uses token/asset IDs.
+- User channel subscription uses condition/market IDs.
+- User trade lifecycle includes MATCHED, CONFIRMED, and FAILED updates.
+- Insufficient balance/allowance on SELL is a venue rejection, not a reason to
+  add local SELL state.
+
 ## What Is NOT Here
 
 * No position cap — in a 2-token market, `has_entry_exposure_or_pending` is sufficient.
 * No flat-start check — WSS authority handles restart-with-position.
+* No early next-window promotion — rotation is scheduled at `end_ts - 5s`.
 * No rotation blocker — old markets resolve automatically at expiry.
 * No force-exit task — exit task (50ms) already sells all sellable inventory.
-* No SELL state/locks/cooldowns — FAK rejection is cheap.
+* No SELL inventory state/locks/cooldowns — submit concurrency is single-flight
+  per token to avoid duplicate full-size FAKs while an HTTP outcome is pending.
 * No full SDK order builder — signing is local, synchronous, on-demand.
 * No analyzer — off-runtime by doctrine.
 * No GTC/GTD — FAK only.

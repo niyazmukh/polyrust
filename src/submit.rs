@@ -34,11 +34,11 @@ use crate::signing::SignedFakOrderBody;
 /// base URL.
 pub const ORDER_PATH: &str = "/order";
 
-/// Per-request HTTP timeout. The Python value (`total=2.0s,
-/// sock_connect=0.5s, sock_read=2.0s`) was chosen against eu-west-1 →
-/// Polymarket-US RTT (~300-400ms p95). 2 s gives p99 headroom while
-/// failing fast on FAK orders that would expire well before 5 s.
-pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+/// Per-request HTTP timeout. Live evidence (2026-05-13) showed 10/16 BUY
+/// submits timing out at exactly 2000ms from eu-west-1 during volatile
+/// moments (Cloudflare/venue backend latency spikes). 3 s gives headroom
+/// while still failing fast relative to the 5-min market window.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 pub const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Outcome of a submit attempt, after the classifier has run on the

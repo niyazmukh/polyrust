@@ -86,6 +86,17 @@ impl TradeStatus {
         }
     }
 
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Matched => "MATCHED",
+            Self::Mined => "MINED",
+            Self::Confirmed => "CONFIRMED",
+            Self::Failed => "FAILED",
+            Self::Retrying => "RETRYING",
+            Self::Other => "OTHER",
+        }
+    }
+
     fn inventory_applying(self) -> bool {
         // Apply on MATCHED for fast SELL (Python bot does the same).
         // If FAILED arrives later, the delta is reversed. SELL against
@@ -116,6 +127,7 @@ pub struct TradeState {
     pub trade_id: TradeId,
     pub token: TokenId,
     pub side: OrderSide,
+    pub size_atoms: SharesAtoms,
     pub status: TradeStatus,
     pub lifecycle: Vec<TradeStatus>,
     pub applied: bool,
@@ -215,7 +227,7 @@ impl Inventory {
     /// `claim_entry` (synchronous, under the core lock) and the spawned
     /// submit task's call to `mark_submit_accepted` /
     /// `mark_submit_unknown` / `release_claim`. In normal operation this
-    /// window is ≤ HTTP timeout (2 s). If a submit task panics or is
+    /// window is ≤ HTTP timeout (3 s). If a submit task panics or is
     /// cancelled before resolving the outcome, the Pending claim lingers
     /// forever and blocks same-token BUYs (because `blocks_entry()` is
     /// true for Pending).
@@ -293,6 +305,7 @@ impl Inventory {
             trade_id: trade.trade_id,
             token: record.token.clone(),
             side: record.side,
+            size_atoms: record.size_atoms,
             status: trade.status,
             lifecycle: record.lifecycle.clone(),
             applied: record.applied,
