@@ -8,8 +8,7 @@ use crate::config::{Config, ConfigError};
 use crate::inventory::{Inventory, SubmitId, TradeState};
 use crate::market::{MarketParseError, apply_market_events, parse_market_events};
 use crate::orders::{
-    BuyCanonicalError, BuyCanonicalInput, BuyCanonicalTarget, canonical_buy_target_for_notional,
-    canonical_sell_params,
+    BuyCanonicalError, BuyCanonicalInput, canonical_buy_target_for_notional, canonical_sell_params,
 };
 use crate::signal::{BuyIntent, SignalEngine};
 use crate::signing::{OrderSigner, SignInputs, SignedFakOrderBody, SigningError};
@@ -76,7 +75,6 @@ pub struct BuySubmitPolicy {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparedBuySubmit {
     pub submit_id: SubmitId,
-    pub target: BuyCanonicalTarget,
     pub body: SignedFakOrderBody,
 }
 
@@ -293,7 +291,6 @@ pub fn prepare_buy_submit(
     let body = signer.sign_fak_buy(&intent.token, &target, sign_inputs)?;
     Ok(PreparedBuySubmit {
         submit_id: claim_id,
-        target,
         body,
     })
 }

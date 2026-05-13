@@ -14,22 +14,10 @@ use crate::types::{
     buy_size_multiple_taker_units, ceil_to_multiple, floor_to_multiple, maker_cents_for,
 };
 
-/// Which side of the lattice the chosen size came from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BuyCanonicalPolicy {
-    /// `ceil`: smallest valid size at-or-above the target — slight overshoot.
-    Ceil,
-    /// `floor`: largest valid size below the target — slight undershoot.
-    Floor,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BuyCanonicalTarget {
-    pub price: PriceTick,
     pub size: Shares4,
     pub maker_amount: UsdcCents,
-    pub raw_size_taker_units: i64,
-    pub policy: BuyCanonicalPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,11 +152,8 @@ pub fn canonical_buy_target_for_notional(
 
     if ceil_in_band {
         return Ok(BuyCanonicalTarget {
-            price: inp.price,
             size: Shares4::new_unchecked(ceil_size),
             maker_amount: ceil_maker.unwrap(),
-            raw_size_taker_units,
-            policy: BuyCanonicalPolicy::Ceil,
         });
     }
 
@@ -178,11 +163,8 @@ pub fn canonical_buy_target_for_notional(
         && floor_size >= inp.min_size_taker_units
     {
         return Ok(BuyCanonicalTarget {
-            price: inp.price,
             size: Shares4::new_unchecked(floor_size),
             maker_amount: maker,
-            raw_size_taker_units,
-            policy: BuyCanonicalPolicy::Floor,
         });
     }
 
@@ -190,11 +172,8 @@ pub fn canonical_buy_target_for_notional(
     // Accept ceil — it's the smallest size that meets the venue minimum.
     if ceil_ok {
         return Ok(BuyCanonicalTarget {
-            price: inp.price,
             size: Shares4::new_unchecked(ceil_size),
             maker_amount: ceil_maker.unwrap(),
-            raw_size_taker_units,
-            policy: BuyCanonicalPolicy::Ceil,
         });
     }
 
@@ -250,10 +229,8 @@ mod tests {
         // p=0.50 with target=$1.01 lands at 2.02 shares and $1.01 maker
         // amount exactly.
         let r = canonical_buy_target_for_notional(input(101, 50, 1)).unwrap();
-        assert_eq!(r.price.ticks(), 50);
         assert_eq!(r.size.units(), 20_200);
         assert_eq!(r.maker_amount.cents(), 101);
-        assert_eq!(r.policy, BuyCanonicalPolicy::Ceil);
     }
 
     #[test]
@@ -266,7 +243,6 @@ mod tests {
         let r = canonical_buy_target_for_notional(input(101, 51, 1)).unwrap();
         assert_eq!(r.size.units(), 20_000);
         assert_eq!(r.maker_amount.cents(), 102);
-        assert_eq!(r.policy, BuyCanonicalPolicy::Ceil);
     }
 
     #[test]
@@ -278,7 +254,6 @@ mod tests {
         let r = canonical_buy_target_for_notional(input(101, 67, 1)).unwrap();
         assert_eq!(r.size.units(), 20_000);
         assert_eq!(r.maker_amount.cents(), 134);
-        assert_eq!(r.policy, BuyCanonicalPolicy::Ceil);
     }
 
     #[test]
@@ -298,7 +273,6 @@ mod tests {
         let r = canonical_buy_target_for_notional(input(101, 36, 1)).unwrap();
         assert_eq!(r.size.units(), 30_000);
         assert_eq!(r.maker_amount.cents(), 108);
-        assert_eq!(r.policy, BuyCanonicalPolicy::Ceil);
     }
 
     #[test]
