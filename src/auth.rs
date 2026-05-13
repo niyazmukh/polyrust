@@ -53,10 +53,6 @@ impl L2AuthSigner {
         })
     }
 
-    pub fn address(&self) -> &str {
-        &self.address
-    }
-
     /// Build the six L2 headers for a request. `ts_secs` is the Unix
     /// timestamp in seconds; the caller supplies it so tests can lock the
     /// timestamp and live code uses `SystemTime::now()`.

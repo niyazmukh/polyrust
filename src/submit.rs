@@ -135,7 +135,7 @@ impl HttpSubmitter {
         let client = Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
-            .pool_idle_timeout(Duration::from_secs(75))
+            .pool_idle_timeout(Duration::from_secs(40))
             .pool_max_idle_per_host(8)
             .https_only(false) // base_url scheme controls; allows mock servers in tests.
             .user_agent("minirust/0.0.1")

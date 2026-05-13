@@ -84,11 +84,6 @@ pub const EXCHANGE_V2_NORMAL: H160 = H160([
     0xE1, 0x11, 0x18, 0x00, 0x00, 0xd2, 0x66, 0x3C, 0x00, 0x91, 0xe4, 0xf4, 0x00, 0x23, 0x75, 0x45,
     0xB8, 0x7B, 0x99, 0x6B,
 ]);
-/// V2 CTF Exchange (negative-risk markets) on Polygon mainnet.
-pub const EXCHANGE_V2_NEG_RISK: H160 = H160([
-    0xe2, 0x22, 0x2d, 0x27, 0x9d, 0x74, 0x40, 0x50, 0xd2, 0x8e, 0x00, 0x52, 0x00, 0x10, 0x52, 0x00,
-    0x00, 0x31, 0x0F, 0x59,
-]);
 
 // ----------------------------------------------------------------------
 // Public types
@@ -251,8 +246,7 @@ impl OrderSigner {
     /// Construct from a hex private key (0x-prefixed or bare), the API key
     /// UUID (the `owner` field in body envelopes), an optional funder
     /// (required for `PolyProxy` / `PolyGnosisSafe`; forbidden for `Eoa`),
-    /// the signature kind, and the verifying-contract address (use one of
-    /// `EXCHANGE_V2_NORMAL` / `EXCHANGE_V2_NEG_RISK`).
+    /// the signature kind, and the verifying-contract address (`EXCHANGE_V2_NORMAL`).
     pub fn new(
         private_key_hex: &str,
         api_key: &str,
@@ -308,11 +302,6 @@ impl OrderSigner {
 
     pub fn maker_address(&self) -> H160 {
         self.maker
-    }
-
-    /// EOA address (recovered from the secp256k1 public key).
-    pub fn address(&self) -> H160 {
-        self.address
     }
 
     /// Sign a FAK BUY for the canonical target. Returns the JSON body
@@ -646,7 +635,7 @@ mod tests {
     #[test]
     fn address_derives_from_test_vector() {
         let s = signer();
-        assert_eq!(address_lower_hex(s.address()), TEST_ADDRESS);
+        assert_eq!(address_lower_hex(s.signer_address()), TEST_ADDRESS);
     }
 
     #[test]

@@ -69,6 +69,21 @@ alias — POST requests must go directly to `clob.polymarket.com`.
 `POLY_ADDRESS` header uses the EOA (the address the API key is associated
 with), not the proxy/funder.
 
+## Observability
+
+Structured key=value logs to stderr via non-blocking background thread.
+Level filter: `MINIRUST_LOG_LEVEL` (DEBUG/INFO/WARNING/ERROR, default WARNING).
+
+**Latency fields** on signal/submit logs enable pipeline breakdown:
+```
+src_ts_us → recv_us → decide_us → submit_us → outcome (rtt_us)
+ [network]  [signal]   [spawn+sign]  [HTTP RTT]
+```
+
+**Post-signal price tracker** (INFO level): logs the token ask price at
+1s intervals for 15s after each signal fires. Zero hot-path overhead —
+runs in a spawned task off the critical path.
+
 ## Build / Test
 
 ```powershell
@@ -113,3 +128,4 @@ cargo run --release
 * No full SDK order builder — signing is local, synchronous, on-demand.
 * No analyzer — off-runtime by doctrine.
 * No GTC/GTD — FAK only.
+* No max-TTE gate — the 5-min market window IS the product boundary.

@@ -41,7 +41,6 @@ pub struct SignalConfig {
     pub entry_slippage_ticks: i32,
     pub max_quote_age_us: i64,
     pub min_tte_us: i64,
-    pub max_tte_us: i64,
     pub min_buy_limit: PriceTick,
     pub max_buy_limit: PriceTick,
     pub prob_sigma_floor_usd: f64,
@@ -168,7 +167,7 @@ impl SignalEngine {
         now: TsUs,
         tte_us: i64,
     ) -> Option<BuyIntent> {
-        if self.strike <= 0.0 || tte_us < self.cfg.min_tte_us || tte_us > self.cfg.max_tte_us {
+        if self.strike <= 0.0 || tte_us < self.cfg.min_tte_us {
             return None;
         }
         let latest = *self.samples.back()?;

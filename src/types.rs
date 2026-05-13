@@ -23,8 +23,6 @@ use std::fmt;
 
 /// Number of $0.01 ticks per dollar.
 pub const PRICE_TICKS_PER_DOLLAR: i32 = 100;
-/// Number of 0.0001-share units per share.
-pub const SHARES4_PER_SHARE: i64 = 10_000;
 /// Atoms-per-dollar (and atoms-per-share) used in signed body amounts.
 pub const ATOMS_PER_DOLLAR: i64 = 1_000_000;
 

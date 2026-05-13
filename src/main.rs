@@ -241,8 +241,6 @@ async fn main() {
     // Reversing it (core→anchor) will deadlock against these paths.
     let (market_tx, market_rx) = mpsc::unbounded_channel::<String>();
 
-    logline::log_event(Level::Warn, "minirust_initialized", &[]);
-
     // Log signer/maker addresses once at startup for cross-ref with POLY_ADDRESS.
     {
         let s_addr = order_signer
@@ -327,14 +325,6 @@ async fn main() {
         let hb_ticks = heartbeat_ticks.clone();
         let hb_parse_errs = heartbeat_parse_errs.clone();
         let hb_signals = heartbeat_signals.clone();
-        let signer_addr = order_signer
-            .as_ref()
-            .map(|s| minirust::signing::address_lower_hex(s.signer_address()))
-            .unwrap_or_default();
-        let maker_addr = order_signer
-            .as_ref()
-            .map(|s| minirust::signing::address_lower_hex(s.maker_address()))
-            .unwrap_or_default();
         tokio::spawn(async move {
             let binance_key = std::env::var("BINANCE_SBE_API_KEY").ok();
             feed::binance_feed_loop(&binance_url, binance_key.as_deref(), move |raw| {
@@ -346,7 +336,7 @@ async fn main() {
                     Err(e) => {
                         hb_parse_errs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         logline::log_event(
-                            Level::Warn,
+                            Level::Debug,
                             "binance_parse_error",
                             &[Field {
                                 key: "err",
@@ -436,6 +426,7 @@ async fn main() {
 
                 if let Some((intent, claim)) = claimed {
                     let id = sig_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let decide_us = now_us();
                     hb_signals.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if let Some((policy, claim_id)) = claim {
                         if let (Some(sub), Some(sign)) = (sub.as_ref(), sign.as_ref()) {
@@ -444,8 +435,8 @@ async fn main() {
                             let core2 = core.clone();
                             let intent2 = intent.clone();
                             let claim_id2 = claim_id.clone();
-                            let s_addr = signer_addr.clone();
-                            let m_addr = maker_addr.clone();
+                            let src_ts = sample.ts_us.micros();
+                            let recv_ts = ts.micros();
                             tokio::spawn(async move {
                                 let prepared = match runtime::prepare_buy_submit(
                                     &intent2,
@@ -476,7 +467,9 @@ async fn main() {
                                     }
                                 };
 
+                                let submit_us = now_us();
                                 let outcome = sub.submit_order(&prepared.body).await;
+                                let rtt_us = now_us() - submit_us;
 
                                 {
                                     let mut c = match core2.lock() {
@@ -522,12 +515,24 @@ async fn main() {
                                             value: &err_text,
                                         },
                                         Field {
-                                            key: "signer",
-                                            value: &s_addr,
+                                            key: "src_ts_us",
+                                            value: &src_ts,
                                         },
                                         Field {
-                                            key: "maker",
-                                            value: &m_addr,
+                                            key: "recv_us",
+                                            value: &recv_ts,
+                                        },
+                                        Field {
+                                            key: "decide_us",
+                                            value: &decide_us,
+                                        },
+                                        Field {
+                                            key: "submit_us",
+                                            value: &submit_us,
+                                        },
+                                        Field {
+                                            key: "rtt_us",
+                                            value: &rtt_us,
                                         },
                                     ],
                                 );
@@ -559,8 +564,62 @@ async fn main() {
                                     key: "edge_ticks",
                                     value: &intent.edge_ticks,
                                 },
+                                Field {
+                                    key: "src_ts_us",
+                                    value: &sample.ts_us.micros(),
+                                },
+                                Field {
+                                    key: "recv_us",
+                                    value: &ts.micros(),
+                                },
+                                Field {
+                                    key: "decide_us",
+                                    value: &decide_us,
+                                },
                             ],
                         );
+                    }
+
+                    // Off hot path: spawn a lightweight task to log the
+                    // Polymarket token price at 1s intervals for 15s after
+                    // the signal. Gives post-signal price trajectory for
+                    // signal quality assessment.
+                    {
+                        let core3 = core.clone();
+                        let tok = intent.token.clone();
+                        tokio::spawn(async move {
+                            for i in 1..=15u8 {
+                                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                                let ask_ticks = core3
+                                    .lock()
+                                    .ok()
+                                    .and_then(|mut c| {
+                                        c.state_mut()
+                                            .quote_for_token(&tok)
+                                            .and_then(|q| q.ask)
+                                            .map(|p| p.ticks())
+                                    })
+                                    .unwrap_or(0);
+                                logline::log_event(
+                                    Level::Info,
+                                    "signal_price_after",
+                                    &[
+                                        Field {
+                                            key: "signal_id",
+                                            value: &(id as i64),
+                                        },
+                                        Field {
+                                            key: "sec",
+                                            value: &(i as i32),
+                                        },
+                                        Field {
+                                            key: "ask_ticks",
+                                            value: &ask_ticks,
+                                        },
+                                    ],
+                                );
+                            }
+                        });
                     }
                 }
             })
@@ -579,17 +638,6 @@ async fn main() {
         let api_secret = poly_api_secret.clone();
         let passphrase = poly_passphrase.clone();
         tokio::spawn(async move {
-            if api_key.is_empty() || api_secret.is_empty() || passphrase.is_empty() {
-                logline::log_event(
-                    Level::Warn,
-                    "user_feed_skipped",
-                    &[Field {
-                        key: "reason",
-                        value: &"missing POLY_API_KEY, POLY_API_SECRET, or POLY_PASSPHRASE",
-                    }],
-                );
-                return;
-            }
             let core_disconnect = core.clone();
             feed::user_feed_loop(
                 &user_url,
@@ -634,7 +682,6 @@ async fn main() {
                     // No immediate sell trigger here. The exit_task (50ms loop)
                     // handles selling once inventory is CONFIRMED on-chain.
                 },
-                || {}, // auth frame sent — trust not granted until AuthSuccess
                 {
                     let cd = core_disconnect.clone();
                     move || {

@@ -71,6 +71,7 @@ Rust-first low-latency FAK trading bot for Polymarket 5-minute binary options.
 - rotation blockers (old markets resolve automatically)
 - force-exit tasks (exit task already sells everything)
 - max-position caps (same-token duplicate protection is sufficient in 2-token markets)
+- max-TTE gates (the 5-min market window IS the product boundary)
 - SELL state of any kind
 - old-market pending/inventory reconciliation
 - SDK network calls on the signal path
@@ -92,7 +93,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 Stale-symbol grep:
 ```bash
-rg -n "create_and_post_order|SubmitStatus::Rejected|record_sell_submit_outcome|mark_submit_rejected|MINIRUST_CONDITION_ID|MINIRUST_MARKET_SLUG|cached signed body|std::process::Command|serde_json::to_writer|pretty|raw event" src/
+rg -n "create_and_post_order|SubmitStatus::Rejected|record_sell_submit_outcome|mark_submit_rejected|MINIRUST_CONDITION_ID|cached signed body|std::process::Command|serde_json::to_writer|pretty|raw event|max_decision_tte|EXCHANGE_V2_NEG_RISK|SHARES4_PER_SHARE" src/
 ```
 
 Update Graphify after structural changes.

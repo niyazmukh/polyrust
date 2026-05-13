@@ -29,7 +29,6 @@ pub struct Config {
     pub max_buy_limit_cents: i32,
     /// No-entry window before market expiry, in microseconds.
     pub min_decision_tte_us: i64,
-    pub max_decision_tte_us: i64,
     pub signal_max_lag_us: i64,
     pub signal_min_window_us: i64,
     pub signal_max_window_us: i64,
@@ -192,14 +191,6 @@ impl Config {
                 reason: format!("non_positive value={min_decision_tte_us}"),
             });
         }
-        let max_decision_tte_us =
-            env_i64_lookup(&mut lookup, "MINIMAL_DECISION_MAX_TTE_US").unwrap_or(600_000_000);
-        if max_decision_tte_us <= min_decision_tte_us {
-            return Err(ConfigError::Invalid {
-                name: "MINIMAL_DECISION_MAX_TTE_US",
-                reason: format!("lte_min value={max_decision_tte_us} min={min_decision_tte_us}"),
-            });
-        }
 
         let decision_min_edge_cents =
             env_dec_cents_lookup(&mut lookup, "MINIMAL_DECISION_MIN_EDGE")
@@ -232,7 +223,6 @@ impl Config {
             min_buy_limit_cents,
             max_buy_limit_cents,
             min_decision_tte_us,
-            max_decision_tte_us,
             signal_max_lag_us: env_i64_lookup(&mut lookup, "MINIMAL_SIGNAL_MAX_LAG_US")
                 .unwrap_or(250_000),
             signal_min_window_us: env_i64_lookup(&mut lookup, "MINIMAL_SIGNAL_MIN_WINDOW_US")
@@ -278,7 +268,6 @@ impl Config {
             entry_slippage_ticks: self.entry_slippage_cents,
             max_quote_age_us: 250_000,
             min_tte_us: self.min_decision_tte_us,
-            max_tte_us: self.max_decision_tte_us,
             min_buy_limit: PriceTick::checked(self.min_buy_limit_cents).map_err(|e| {
                 ConfigError::Invalid {
                     name: "MINIMAL_MIN_BUY_LIMIT",
