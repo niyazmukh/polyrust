@@ -13,10 +13,8 @@ use crate::types::PriceTick;
 /// Fully validated, frozen configuration.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
-    /// Required env var; if false, refuse to start a live runtime.
+    /// POLY_ALLOW_LIVE_ORDERS: true = live trading, false/missing = dry-run.
     pub allow_live_orders: bool,
-    /// Optional dry-run mode: connect to feeds but do not submit.
-    pub dry_run_orders: bool,
     /// Minimum acceptable USDC notional per BUY, in cents. Venue floor is 100¢.
     pub usdc_per_trade_cents: i64,
     /// Hard cap on absolute notional overrun above the target, in cents.
@@ -70,24 +68,9 @@ pub struct LaunchConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigError {
-    Missing {
-        name: &'static str,
-    },
-    Invalid {
-        name: &'static str,
-        reason: String,
-    },
-    LiveDisallowed,
-    /// Both `MINIMAL_DRY_RUN_ORDERS` and `POLY_ALLOW_LIVE_ORDERS` are true.
-    /// They are mutually exclusive: dry-run means no live submit infrastructure
-    /// is built; live means BUY/SELL submit infrastructure is built and used.
-    /// Accepting both silently is a live-funds risk because SELL paths key off
-    /// the presence of live submit infra (not the `dry_run` flag).
-    ModeConflict,
-    BandIncoherent {
-        min: i32,
-        max: i32,
-    },
+    Missing { name: &'static str },
+    Invalid { name: &'static str, reason: String },
+    BandIncoherent { min: i32, max: i32 },
 }
 
 impl fmt::Display for ConfigError {
@@ -97,14 +80,6 @@ impl fmt::Display for ConfigError {
             ConfigError::Invalid { name, reason } => {
                 write!(f, "invalid_env name={name} reason={reason}")
             }
-            ConfigError::LiveDisallowed => write!(
-                f,
-                "refusing_live_runtime: set POLY_ALLOW_LIVE_ORDERS=true or MINIMAL_DRY_RUN_ORDERS=true"
-            ),
-            ConfigError::ModeConflict => write!(
-                f,
-                "mode_conflict: MINIMAL_DRY_RUN_ORDERS and POLY_ALLOW_LIVE_ORDERS are mutually exclusive"
-            ),
             ConfigError::BandIncoherent { min, max } => {
                 write!(f, "buy_band_incoherent min_cents={min} max_cents={max}")
             }
@@ -127,17 +102,6 @@ impl Config {
     fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Self, ConfigError> {
         let allow_live_orders =
             env_bool_lookup(&mut lookup, "POLY_ALLOW_LIVE_ORDERS").unwrap_or(false);
-        let dry_run_orders =
-            env_bool_lookup(&mut lookup, "MINIMAL_DRY_RUN_ORDERS").unwrap_or(false);
-        if !allow_live_orders && !dry_run_orders {
-            return Err(ConfigError::LiveDisallowed);
-        }
-        // Mutually exclusive: dry-run disables live submit infra; live enables
-        // it and drives SELL paths. Accepting both silently means a shadow
-        // operator can fire real FAK SELLs without intending to. Fail closed.
-        if allow_live_orders && dry_run_orders {
-            return Err(ConfigError::ModeConflict);
-        }
 
         let usdc_per_trade_cents = env_dec_cents_lookup(&mut lookup, "MINIMAL_USDC_PER_TRADE")
             .ok_or(ConfigError::Missing {
@@ -216,7 +180,6 @@ impl Config {
             })?;
         Ok(Self {
             allow_live_orders,
-            dry_run_orders,
             usdc_per_trade_cents,
             max_notional_overrun_cents,
             max_notional_overrun_bps,
@@ -513,50 +476,19 @@ mod tests {
     }
 
     #[test]
-    fn config_rejects_both_dry_run_and_live_true() {
-        // Live-safety invariant: dry-run and live are mutually exclusive.
-        // Both-true must fail before any live submit infra is built.
-        let err = cfg_from_pairs(&[
-            ("POLY_ALLOW_LIVE_ORDERS", "true"),
-            ("MINIMAL_DRY_RUN_ORDERS", "true"),
-            ("MINIMAL_USDC_PER_TRADE", "1.01"),
-            ("MINIMAL_MIN_BUY_LIMIT", "0.35"),
-            ("MINIMAL_MAX_BUY_LIMIT", "0.65"),
-            ("MINIMAL_DECISION_MIN_TTE_US", "45000000"),
-        ])
-        .unwrap_err();
-        assert_eq!(err, ConfigError::ModeConflict);
-    }
-
-    #[test]
-    fn config_rejects_both_dry_run_and_live_false() {
-        // Pre-existing invariant: at least one mode must be set.
-        let err = cfg_from_pairs(&[
-            ("MINIMAL_USDC_PER_TRADE", "1.01"),
-            ("MINIMAL_MIN_BUY_LIMIT", "0.35"),
-            ("MINIMAL_MAX_BUY_LIMIT", "0.65"),
-            ("MINIMAL_DECISION_MIN_TTE_US", "45000000"),
-        ])
-        .unwrap_err();
-        assert_eq!(err, ConfigError::LiveDisallowed);
-    }
-
-    #[test]
-    fn config_accepts_dry_run_only() {
+    fn config_defaults_to_dry_run() {
         let cfg = cfg_from_pairs(&[
-            ("MINIMAL_DRY_RUN_ORDERS", "true"),
             ("MINIMAL_USDC_PER_TRADE", "1.01"),
             ("MINIMAL_MIN_BUY_LIMIT", "0.35"),
             ("MINIMAL_MAX_BUY_LIMIT", "0.65"),
             ("MINIMAL_DECISION_MIN_TTE_US", "45000000"),
         ])
         .unwrap();
-        assert!(cfg.dry_run_orders);
         assert!(!cfg.allow_live_orders);
     }
 
     #[test]
-    fn config_accepts_live_only() {
+    fn config_accepts_live() {
         let cfg = cfg_from_pairs(&[
             ("POLY_ALLOW_LIVE_ORDERS", "true"),
             ("MINIMAL_USDC_PER_TRADE", "1.01"),
@@ -566,7 +498,6 @@ mod tests {
         ])
         .unwrap();
         assert!(cfg.allow_live_orders);
-        assert!(!cfg.dry_run_orders);
     }
 
     #[test]

@@ -2,12 +2,9 @@
 //! into RuntimeCore with anchor strike resolution, Gamma market discovery,
 //! and gated live order submission.
 //!
-//! Shadow mode:  set `MINIMAL_DRY_RUN_ORDERS=true`.  Signals are logged;
-//!               no orders reach the venue.
-//! Live mode:    set `POLY_ALLOW_LIVE_ORDERS=true`.  BUY intent decisions
-//!               are signed and submitted to the CLOB via `POST /order`.
-//!               Requires POLY_PK + POLY_API_KEY / POLY_API_SECRET /
-//!               POLY_PASSPHRASE / POLY_ADDRESS.
+//! Mode switch: `POLY_ALLOW_LIVE_ORDERS=true` for live, omit/false for dry-run.
+//! Live mode signs and submits to the CLOB via `POST /order`.
+//! Dry-run connects all feeds but only logs signals.
 //!
 //! Traces to:
 //!   shadow_signal_probe.py:main          (shadow probe wiring)
@@ -45,14 +42,6 @@ async fn main() {
     let cfg = Config::from_env().expect("FATAL: invalid config");
 
     // Safety gate: refuse to start without explicit mode.
-    if !cfg.dry_run_orders && !cfg.allow_live_orders {
-        eprintln!(
-            "FATAL: set MINIMAL_DRY_RUN_ORDERS=true for shadow mode, \
-             or POLY_ALLOW_LIVE_ORDERS=true for live trading"
-        );
-        std::process::exit(2);
-    }
-
     let log_level = std::env::var("MINIRUST_LOG_LEVEL")
         .ok()
         .and_then(|s| match s.to_ascii_uppercase().as_str() {
@@ -71,10 +60,6 @@ async fn main() {
         Level::Warn,
         "minirust_start",
         &[
-            Field {
-                key: "dry_run",
-                value: &cfg.dry_run_orders,
-            },
             Field {
                 key: "live",
                 value: &cfg.allow_live_orders,
@@ -318,7 +303,7 @@ async fn main() {
         let core = core.clone();
         let anchor = anchor.clone();
         let binance_url = launch.binance_ws_url.clone();
-        let dry_run = cfg.dry_run_orders;
+        let live = cfg.allow_live_orders;
         let sig_id = signal_id.clone();
         let sub = binance_sub;
         let sign = binance_sign;
@@ -406,7 +391,7 @@ async fn main() {
 
                     match c.on_binance_sample(sample, ts, tte_us) {
                         Ok(Some(intent)) => {
-                            let claim = if dry_run {
+                            let claim = if !live {
                                 None
                             } else {
                                 let policy = c.buy_submit_policy();
