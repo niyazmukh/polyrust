@@ -93,11 +93,6 @@ impl Shares4 {
     pub const fn units(self) -> i64 {
         self.0
     }
-
-    /// Body amount in atoms (1e-6 share units). One Shares4 unit = 100 atoms.
-    pub const fn to_atoms(self) -> SharesAtoms {
-        SharesAtoms(self.0.saturating_mul(100))
-    }
 }
 
 // ------------------------------------------------------------------
@@ -120,12 +115,6 @@ impl Shares2 {
     pub const fn units(self) -> i64 {
         self.0
     }
-
-    /// Body amount in atoms (1e-6 share units). One Shares2 unit = 0.01
-    /// share = 10_000 atoms.
-    pub const fn to_atoms(self) -> SharesAtoms {
-        SharesAtoms(self.0.saturating_mul(10_000))
-    }
 }
 
 // ------------------------------------------------------------------
@@ -136,10 +125,6 @@ impl Shares2 {
 pub struct UsdcCents(pub i64);
 
 impl UsdcCents {
-    pub const fn new_unchecked(cents: i64) -> Self {
-        Self(cents)
-    }
-
     pub const fn cents(self) -> i64 {
         self.0
     }
@@ -498,11 +483,6 @@ mod tests {
             Ok(SharesAtoms(1_416_664))
         );
         assert!(SharesAtoms::parse_decimal("1.4166641").is_err());
-    }
-
-    #[test]
-    fn shares4_to_atoms() {
-        assert_eq!(Shares4(20_200).to_atoms(), SharesAtoms(2_020_000));
     }
 
     #[test]
