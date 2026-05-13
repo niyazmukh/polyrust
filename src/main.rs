@@ -898,12 +898,18 @@ async fn main() {
                     c.inventory_mut().expire_pending(pending_cutoff);
                 }
 
-                // 2. Discover current/next market.
-                // On rotation deadline, we know the next slug_ts = current end_ts.
-                let next_slug_ts = {
+                // 2. Discover initial market or scheduled next market.
+                // Periodic maintenance must not rediscover while a market is
+                // active; rotation is only the explicit end_ts - 5s deadline.
+                let (has_market, next_slug_ts) = {
                     let mut c = core.lock().unwrap();
-                    c.state_mut().market().map(|m| m.end_ts)
+                    let market = c.state_mut().market();
+                    (market.is_some(), market.map(|m| m.end_ts))
                 };
+                if !is_rotation && has_market {
+                    continue;
+                }
+
                 let discovered = if is_rotation && let Some(nts) = next_slug_ts {
                     // Rotation is only allowed on the scheduled deadline:
                     // 5s before current market expiry.
@@ -965,9 +971,11 @@ async fn main() {
                         c.state_mut().set_market(discovered);
                         true
                     } else {
-                        // Market unchanged — keep polling every 2s until we find the next one.
-                        rotation_deadline =
-                            tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+                        // On scheduled rotation, retry until the exact next slug is available.
+                        if is_rotation {
+                            rotation_deadline =
+                                tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+                        }
                         false
                     }
                 };
