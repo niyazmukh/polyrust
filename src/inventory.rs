@@ -417,7 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn matched_does_not_apply_inventory_confirmed_does() {
+    fn matched_applies_inventory_confirmed_is_idempotent() {
         let mut inv = Inventory::new();
         let t = token("asset");
         let first = inv.apply_user_trade(trade(

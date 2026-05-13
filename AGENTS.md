@@ -12,17 +12,19 @@ Rust-first low-latency FAK trading bot for Polymarket 5-minute binary options.
 
 3. **No monkey job.** No fake safety gates. No defensive code for impossible states. No broad rewrites hiding clutter. No "robustness" layers without a proven failure mode. If it doesn't protect live correctness, reduce latency, enforce precision, or make docs truthful — don't add it.
 
-4. **Less code is good code.** Every pub function must have a live caller. Every struct field must be read. Every enum variant must be constructed. Dead code is a bug.
+4. **Hunt overwiring.** Treat overcomplication as a live-risk smell. Actively remove speculative abstractions, fallback ladders without a timed/typed invariant, duplicate sources of authority, state machines for one-bit facts, helper functions used only to satisfy test scaffolding, adapters around direct calls, "future-proof" knobs with no operator decision, cached/stale artifacts presented as truth, and any code path whose only defense is "maybe useful later." Classify these as P2 unless they can alter trading, inventory, signing, or rotation; then classify as P1/P0.
 
-5. **Hot path discipline.** Binance tick → BUY submit must cross the fewest useful functions, locks, and allocations. No blocking I/O, no pretty-printing, no subprocess wrappers, no unnecessary branches.
+5. **Less code is good code.** Every pub function must have a live caller. Every struct field must be read. Every enum variant must be constructed. Dead code is a bug.
 
-6. **Fixed-point precision.** No f64 crosses the signed body boundary. Venue-facing values are integer ticks/cents/atoms. Silent rounding is forbidden.
+6. **Hot path discipline.** Binance tick → BUY submit must cross the fewest useful functions, locks, and allocations. No blocking I/O, no pretty-printing, no subprocess wrappers, no unnecessary branches.
 
-7. **WSS is inventory truth.** User WSS CONFIRMED trades own the balance. HTTP responses classify outcomes but don't own inventory. Trust starts false, granted only on venue AuthSuccess, revoked on disconnect/error.
+7. **Fixed-point precision.** No f64 crosses the signed body boundary. Venue-facing values are integer ticks/cents/atoms. Silent rounding is forbidden.
 
-8. **FAK rejection is cheap.** Don't over-protect BUY no-match, SELL no-match, or SELL balance rejection. Rejected BUY deletes the claim. SELL creates zero local state.
+8. **WSS is inventory truth.** User WSS CONFIRMED trades own the balance. HTTP responses classify outcomes but don't own inventory. Trust starts false, granted on successful auth frame send (venue has no explicit auth ACK per official SDK — invalid creds cause server disconnect), revoked on disconnect/error.
 
-9. **Official docs rule.** When in doubt, consult Polymarket/Binance official docs. Priority: live evidence > official docs > source code > tests > Graphify > comments > AI summaries.
+9. **FAK rejection is cheap.** Don't over-protect BUY no-match, SELL no-match, or SELL balance rejection. Rejected BUY deletes the claim. SELL creates zero local state.
+
+10. **Official docs rule.** When in doubt, consult Polymarket/Binance official docs. Priority: live evidence > official docs > source code > tests > Graphify > comments > AI summaries.
 
 ---
 
@@ -126,7 +128,7 @@ Before editing:
 All must be true:
 
 - startup fails fast on missing credentials
-- user WSS trust gates BUY (AuthSuccess required, revoked on disconnect)
+- user WSS trust gates BUY (trust on auth frame sent, revoked on disconnect)
 - BUY claim atomic with intent, deleted on rejection, removed on CONFIRMED
 - UNKNOWN stays matchable, Accepted doesn't expire blindly
 - SELL has zero local state

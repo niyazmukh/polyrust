@@ -614,8 +614,7 @@ async fn main() {
 
     // --- User WS task ---
     // Trade events own inventory (WSS authority). Inventory is applied
-    // only on CONFIRMED status (on-chain finality). The exit_task handles
-    // selling once confirmed balance exists.
+    // on MATCHED for fast SELL; CONFIRMED is idempotent.
     let user_task = {
         let core = core.clone();
         let user_url = launch.poly_user_ws_url.clone();
@@ -660,7 +659,7 @@ async fn main() {
                         }
                     }
                     // No immediate sell trigger here. The exit_task (50ms loop)
-                    // handles selling once inventory is CONFIRMED on-chain.
+                    // handles selling once MATCHED inventory is visible.
                 },
                 {
                     let ca = core_disconnect.clone();
@@ -906,13 +905,15 @@ async fn main() {
                     c.state_mut().market().map(|m| m.end_ts)
                 };
                 let discovered = if is_rotation && let Some(nts) = next_slug_ts {
-                    // Precise: query the exact next market by its known slug_ts.
+                    // Rotation is only allowed on the scheduled deadline:
+                    // 5s before current market expiry.
                     match gamma.discover_for_ts(nts).await {
                         Some(ctx) => ctx,
-                        None => match gamma.discover().await {
-                            Some(ctx) => ctx,
-                            None => continue,
-                        },
+                        None => {
+                            rotation_deadline =
+                                tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+                            continue;
+                        }
                     }
                 } else {
                     match gamma.discover().await {

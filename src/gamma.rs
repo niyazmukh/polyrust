@@ -93,8 +93,8 @@ impl GammaClient {
     /// Discover the current active binary-option market.
     ///
     /// 1. Get CLOB server time.
-    /// 2. Compute current window `slug_ts`, try it and the next window.
-    /// 3. For each: GET `gamma-api.polymarket.com/events/slug/{slug}`.
+    /// 2. Compute current window `slug_ts`.
+    /// 3. GET `gamma-api.polymarket.com/events/slug/{slug}`.
     /// 4. Find the first active, accepting-orders, non-closed market.
     /// 5. Parse `clobTokenIds` and select YES/NO tokens by label.
     ///
@@ -103,13 +103,8 @@ impl GammaClient {
         let server_ts = self.get_clob_time().await.ok()?;
         let base_slug_ts = self.slug_ts(server_ts);
 
-        for candidate_ts in [base_slug_ts, base_slug_ts + self.window_s] {
-            let slug = self.slug_fmt.replace("{ts}", &candidate_ts.to_string());
-            if let Some(ctx) = self.try_discover_slug(&slug, candidate_ts).await {
-                return Some(ctx);
-            }
-        }
-        None
+        let slug = self.slug_fmt.replace("{ts}", &base_slug_ts.to_string());
+        self.try_discover_slug(&slug, base_slug_ts).await
     }
 
     /// Discover a market for a specific slug timestamp (e.g., the next window).
@@ -353,6 +348,8 @@ fn parse_gamma_iso8601(raw: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn slug_ts_snaps_to_window() {
@@ -440,5 +437,86 @@ mod tests {
         let ts_z = parse_gamma_iso8601("2026-05-10T12:00:00Z").unwrap();
         let ts_offset = parse_gamma_iso8601("2026-05-10T12:00:00+00:00").unwrap();
         assert_eq!(ts_z, ts_offset);
+    }
+
+    fn event_with_market(slug_ts: i64) -> serde_json::Value {
+        serde_json::json!({
+            "active": true,
+            "closed": false,
+            "markets": [{
+                "active": true,
+                "acceptingOrders": true,
+                "closed": false,
+                "conditionId": format!("0xcond{slug_ts}"),
+                "clobTokenIds": [
+                    {"id": format!("yes{slug_ts}"), "outcome": "Up"},
+                    {"id": format!("no{slug_ts}"), "outcome": "Down"}
+                ],
+                "endDate": "2030-01-01T00:10:00Z"
+            }]
+        })
+    }
+
+    #[tokio::test]
+    async fn periodic_discover_does_not_promote_next_window_early() {
+        let clob = MockServer::start().await;
+        let gamma = MockServer::start().await;
+
+        let now: i64 = 1_893_456_123;
+        let base = now - now.rem_euclid(300);
+        let next = base + 300;
+
+        Mock::given(method("GET"))
+            .and(path("/time"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(now.to_string()))
+            .mount(&clob)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(format!("/events/slug/btc-updown-5m-{base}")))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&gamma)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(format!("/events/slug/btc-updown-5m-{next}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(event_with_market(next)))
+            .mount(&gamma)
+            .await;
+
+        let client = GammaClient::new(&clob.uri(), &gamma.uri(), "btc-updown-5m-{ts}", 300);
+
+        assert_eq!(
+            client.discover().await.map(|m| m.slug_ts),
+            None,
+            "periodic discovery must not switch to the next window before the rotation deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_discover_for_ts_can_fetch_next_window() {
+        let gamma = MockServer::start().await;
+
+        let now: i64 = 1_893_456_123;
+        let base = now - now.rem_euclid(300);
+        let next = base + 300;
+
+        Mock::given(method("GET"))
+            .and(path(format!("/events/slug/btc-updown-5m-{next}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(event_with_market(next)))
+            .mount(&gamma)
+            .await;
+
+        let client = GammaClient::new(
+            "http://unused.local",
+            &gamma.uri(),
+            "btc-updown-5m-{ts}",
+            300,
+        );
+
+        assert_eq!(
+            client.discover_for_ts(next).await.map(|m| m.slug_ts),
+            Some(next)
+        );
     }
 }

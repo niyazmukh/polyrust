@@ -54,9 +54,10 @@ same `core.lock()` as the signal decision. Pending stays alive until CONFIRMED
 **SELL is fire-and-forget.** No SELL state, no locks, no cooldowns. Exit task
 fires every 50ms at the executable bid. FAK rejection is cheap.
 
-**Auth trust gated on venue response.** `user_wss_trusted` starts false, set
-true only on `AuthSuccess` message from the venue, revoked on disconnect/error.
-BUY blocked while untrusted.
+**Auth trust gated on frame sent.** `user_wss_trusted` starts false, set
+true after auth frame is successfully sent (venue has no explicit auth ACK
+per official SDK — invalid creds cause server disconnect). Revoked on
+disconnect/error. BUY blocked while untrusted.
 
 **Signal ring cleared on rotation.** Prevents stale microprice samples from
 producing spurious momentum against the new market's strike.
@@ -95,7 +96,6 @@ cargo fmt --check
 ## Shadow Mode
 
 ```powershell
-$env:MINIMAL_DRY_RUN_ORDERS="true"
 $env:MINIRUST_BINANCE_SYMBOL="BTCUSDT"
 $env:MINIRUST_MARKET_SLUG_FMT="btc-updown-5m-{ts}"
 $env:POLY_PK="0x..."  # API creds derived automatically
@@ -103,8 +103,8 @@ cargo run --release
 ```
 
 Requires `POLY_PK` (private key). API credentials are derived at startup
-via `/auth/derive-api-key`. The bot gates BUY signals on authenticated
-user WSS even in dry-run — without WSS auth, no signals fire.
+via `/auth/derive-api-key`. Without `POLY_ALLOW_LIVE_ORDERS=true`, the bot
+runs in dry-run mode (signals fire, no orders submitted).
 
 ## Live Mode
 
