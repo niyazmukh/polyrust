@@ -533,7 +533,7 @@ pub fn derive_address(vk: &VerifyingKey) -> H160 {
     H160::from_slice(&hash.as_bytes()[12..])
 }
 
-fn u64_to_uint256_be(v: u64) -> [u8; 32] {
+pub(crate) fn u64_to_uint256_be(v: u64) -> [u8; 32] {
     let mut out = [0u8; 32];
     out[24..].copy_from_slice(&v.to_be_bytes());
     out
@@ -551,7 +551,7 @@ fn u8_to_uint256_be(v: u8) -> [u8; 32] {
     out
 }
 
-fn address_to_uint256_be(addr: H160) -> [u8; 32] {
+pub(crate) fn address_to_uint256_be(addr: H160) -> [u8; 32] {
     let mut out = [0u8; 32];
     out[12..].copy_from_slice(addr.as_bytes());
     out

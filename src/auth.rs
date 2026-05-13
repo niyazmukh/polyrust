@@ -14,7 +14,9 @@
 //! `ClobAuth` signature, matching the official SDK's L1 auth flow.
 //! Derivation runs once at startup; it is never on the hot path.
 
-use crate::signing::{address_lower_hex, derive_address, keccak256};
+use crate::signing::{
+    address_lower_hex, address_to_uint256_be, derive_address, keccak256, u64_to_uint256_be,
+};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE as BASE64_URL_SAFE;
 use hmac::{Hmac, Mac};
@@ -316,21 +318,9 @@ fn compute_clob_auth_domain(chain_id: u64) -> H256 {
 // EIP-712 / ABI helpers (shared with signing.rs — keep in sync)
 // ---------------------------------------------------------------------------
 
-fn u64_to_uint256_be(v: u64) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    out[24..].copy_from_slice(&v.to_be_bytes());
-    out
-}
-
 fn u32_to_uint256_be(v: u32) -> [u8; 32] {
     let mut out = [0u8; 32];
     out[28..].copy_from_slice(&v.to_be_bytes());
-    out
-}
-
-fn address_to_uint256_be(addr: H160) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    out[12..].copy_from_slice(addr.as_bytes());
     out
 }
 
