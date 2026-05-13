@@ -636,10 +636,6 @@ async fn main() {
                     };
                     let ts = now_us();
                     match c.apply_user_raw(&raw, ts) {
-                        Ok(minirust::user::UserMessage::AuthSuccess) => {
-                            c.inventory_mut().set_user_wss_trusted(true);
-                            logline::log_event(Level::Warn, "user_wss_authenticated", &[]);
-                        }
                         Ok(minirust::user::UserMessage::AuthError(ref msg)) => {
                             c.inventory_mut().set_user_wss_trusted(false);
                             logline::log_event(
@@ -651,7 +647,6 @@ async fn main() {
                                 }],
                             );
                         }
-                        Ok(minirust::user::UserMessage::Trades(_)) => {}
                         Ok(_) => {}
                         Err(e) => {
                             logline::log_event(
@@ -666,6 +661,15 @@ async fn main() {
                     }
                     // No immediate sell trigger here. The exit_task (50ms loop)
                     // handles selling once inventory is CONFIRMED on-chain.
+                },
+                {
+                    let ca = core_disconnect.clone();
+                    move || {
+                        if let Ok(mut c) = ca.lock() {
+                            c.inventory_mut().set_user_wss_trusted(true);
+                            logline::log_event(Level::Warn, "user_wss_authenticated", &[]);
+                        }
+                    }
                 },
                 {
                     let cd = core_disconnect.clone();
