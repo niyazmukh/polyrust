@@ -25,23 +25,18 @@ pub enum MarketEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MarketParseError {
-    InvalidJson(String),
-}
+pub struct MarketParseError(pub String);
 
 impl std::fmt::Display for MarketParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            MarketParseError::InvalidJson(e) => write!(f, "invalid_json {e}"),
-        }
+        write!(f, "invalid_json {}", self.0)
     }
 }
 
 impl std::error::Error for MarketParseError {}
 
 pub fn parse_market_events(raw: &[u8]) -> Result<Vec<MarketEvent>, MarketParseError> {
-    let value: Value =
-        serde_json::from_slice(raw).map_err(|e| MarketParseError::InvalidJson(e.to_string()))?;
+    let value: Value = serde_json::from_slice(raw).map_err(|e| MarketParseError(e.to_string()))?;
     let mut out = Vec::new();
     match value {
         Value::Array(items) => {

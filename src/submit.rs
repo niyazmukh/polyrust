@@ -46,17 +46,12 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubmitOutcome {
     /// 2xx with parseable body and a usable `orderID`.
-    Accepted {
-        order_id: String,
-        http_status: u16,
-        raw_body: Bytes,
-    },
+    Accepted { order_id: String, http_status: u16 },
     /// 4xx, or 2xx with `success: false`, or 5xx with explicit
     /// `success: false` and a non-transport error message.
     Rejected {
         http_status: u16,
         error: Option<String>,
-        raw_body: Bytes,
     },
     /// Transport-level failure, ambiguous 5xx, or 2xx that confirmed
     /// acceptance but lacked `orderID`. Caller must keep pending submit
@@ -64,7 +59,6 @@ pub enum SubmitOutcome {
     Unknown {
         http_status: u16,
         error: Option<String>,
-        raw_body: Bytes,
     },
 }
 
@@ -181,7 +175,6 @@ impl HttpSubmitter {
                         return SubmitOutcome::Unknown {
                             http_status: status,
                             error: Some(format!("read_body: {e}")),
-                            raw_body: Bytes::new(),
                         };
                     }
                 };
@@ -190,7 +183,6 @@ impl HttpSubmitter {
             Err(e) => SubmitOutcome::Unknown {
                 http_status: 0,
                 error: Some(format!("transport_error: {e}")),
-                raw_body: Bytes::new(),
             },
         }
     }
@@ -225,11 +217,7 @@ pub fn classify(http_status: u16, raw_body: Bytes) -> SubmitOutcome {
 
     // Transport error / status==0 → unknown.
     if http_status == 0 || error.as_deref() == Some("transport_error") {
-        return SubmitOutcome::Unknown {
-            http_status,
-            error,
-            raw_body,
-        };
+        return SubmitOutcome::Unknown { http_status, error };
     }
 
     // 5xx: ambiguous unless body explicitly says "no order placed".
@@ -239,36 +227,20 @@ pub fn classify(http_status: u16, raw_body: Bytes) -> SubmitOutcome {
                 .as_deref()
                 .is_some_and(|e| !e.to_ascii_lowercase().contains("transport"));
         return if definitive_reject {
-            SubmitOutcome::Rejected {
-                http_status,
-                error,
-                raw_body,
-            }
+            SubmitOutcome::Rejected { http_status, error }
         } else {
-            SubmitOutcome::Unknown {
-                http_status,
-                error,
-                raw_body,
-            }
+            SubmitOutcome::Unknown { http_status, error }
         };
     }
 
     // 4xx: definitive rejection.
     if http_status >= 400 {
-        return SubmitOutcome::Rejected {
-            http_status,
-            error,
-            raw_body,
-        };
+        return SubmitOutcome::Rejected { http_status, error };
     }
 
     // 2xx: check for explicit failure flag.
     if success == Some(false) {
-        return SubmitOutcome::Rejected {
-            http_status,
-            error,
-            raw_body,
-        };
+        return SubmitOutcome::Rejected { http_status, error };
     }
 
     // 2xx accepted: extract orderID. Missing orderID → unknown (the
@@ -278,12 +250,10 @@ pub fn classify(http_status: u16, raw_body: Bytes) -> SubmitOutcome {
         Some(id) if !id.is_empty() => SubmitOutcome::Accepted {
             order_id: id,
             http_status,
-            raw_body,
         },
         _ => SubmitOutcome::Unknown {
             http_status,
             error: Some("accepted_missing_order_id".into()),
-            raw_body,
         },
     }
 }

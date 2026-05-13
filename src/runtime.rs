@@ -314,7 +314,7 @@ pub fn plan_sell_at_bid(
     }
     let limit_ticks = (bid.ticks() - slippage_ticks).max(1);
     let limit = PriceTick::checked(limit_ticks).ok()?;
-    let (price, size) = canonical_sell_params(limit, position.sellable.units() * 100).ok()?;
+    let (price, size) = canonical_sell_params(limit, position.sellable.units() * 100);
     if size.units() <= 0 {
         return None;
     }

@@ -195,16 +195,9 @@ pub fn canonical_buy_target_for_notional(
 ///
 /// Returns the (price, size) pair in canonical units. Caller is responsible
 /// for verifying `q_size > 0` against actual sellable inventory.
-pub fn canonical_sell_params(
-    price: PriceTick,
-    raw_size_taker_units: i64,
-) -> Result<(PriceTick, Shares2), BuyCanonicalError> {
-    let price_ticks = price.ticks();
-    if !(MIN_PRICE_TICK..=MAX_PRICE_TICK).contains(&price_ticks) {
-        return Err(BuyCanonicalError::PriceOutOfRange { ticks: price_ticks });
-    }
+pub fn canonical_sell_params(price: PriceTick, raw_size_taker_units: i64) -> (PriceTick, Shares2) {
     let shares2 = Shares2::floor_from_shares4(Shares4::new_unchecked(raw_size_taker_units));
-    Ok((price, shares2))
+    (price, shares2)
 }
 
 #[cfg(test)]
@@ -290,7 +283,7 @@ mod tests {
     #[test]
     fn sell_floors_to_2dp() {
         // 1.235 shares = 12_350 taker units → 1.23 shares.
-        let (p, s) = canonical_sell_params(PriceTick::checked(50).unwrap(), 12_350).unwrap();
+        let (p, s) = canonical_sell_params(PriceTick::checked(50).unwrap(), 12_350);
         assert_eq!(p.ticks(), 50);
         assert_eq!(s.units(), 123);
     }
