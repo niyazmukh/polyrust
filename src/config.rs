@@ -399,7 +399,7 @@ fn env_dec_cents_lookup(
 
 /// Parse "1.01" -> 101 cents, "0.5" -> 50 cents, "10" -> 1000 cents.
 /// Internal helper, exposed for tests.
-pub(crate) fn parse_dec_cents(raw: &str) -> Option<i64> {
+fn parse_dec_cents(raw: &str) -> Option<i64> {
     if raw.is_empty() {
         return None;
     }

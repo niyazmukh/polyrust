@@ -61,7 +61,7 @@ use crate::types::{OrderSide, PriceTick, Shares2, TokenId};
 // ----------------------------------------------------------------------
 
 /// Solidity type string for the V2 Order struct.
-pub(crate) const ORDER_TYPE_STRING_V2: &str = concat!(
+const ORDER_TYPE_STRING_V2: &str = concat!(
     "Order(uint256 salt,address maker,address signer,uint256 tokenId,",
     "uint256 makerAmount,uint256 takerAmount,uint8 side,uint8 signatureType,",
     "uint256 timestamp,bytes32 metadata,bytes32 builder)"

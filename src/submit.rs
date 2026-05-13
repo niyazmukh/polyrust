@@ -99,7 +99,6 @@ pub struct HttpSubmitter {
     client: Client,
     base_url: String,
     auth: L2AuthSigner,
-    now_secs: fn() -> i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,7 +138,6 @@ impl HttpSubmitter {
             client,
             base_url: base_url.to_owned(),
             auth,
-            now_secs: default_now_secs,
         })
     }
 
@@ -153,7 +151,7 @@ impl HttpSubmitter {
     /// Submit a locally signed, locally validated FAK order body.
     pub async fn submit_order(&self, body: &SignedFakOrderBody) -> SubmitOutcome {
         let url = format!("{}{}", self.base_url, ORDER_PATH);
-        let ts = (self.now_secs)();
+        let ts = default_now_secs();
         let bytes = body.as_bytes();
         let headers = self.auth.headers("POST", ORDER_PATH, bytes, ts);
 
