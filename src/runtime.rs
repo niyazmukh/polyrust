@@ -80,8 +80,6 @@ pub struct PreparedBuySubmit {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparedSellSubmit {
-    pub price: PriceTick,
-    pub size: Shares2,
     pub body: SignedFakOrderBody,
 }
 
@@ -109,11 +107,7 @@ impl SellPlan {
         sign_inputs: SignInputs,
     ) -> Result<PreparedSellSubmit, RuntimeError> {
         let body = signer.sign_fak_sell(&self.token, self.price, self.size, sign_inputs)?;
-        Ok(PreparedSellSubmit {
-            price: self.price,
-            size: self.size,
-            body,
-        })
+        Ok(PreparedSellSubmit { body })
     }
 }
 
