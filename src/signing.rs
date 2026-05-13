@@ -52,7 +52,7 @@ use serde::Serialize;
 use sha3::{Digest, Keccak256};
 
 use crate::orders::BuyCanonicalTarget;
-use crate::types::{PriceTick, Shares2, TokenId};
+use crate::types::{OrderSide, PriceTick, Shares2, TokenId};
 
 // ----------------------------------------------------------------------
 // Schema constants — copied from the SDK source (which copies them from
@@ -102,24 +102,6 @@ pub enum SignatureKind {
 impl SignatureKind {
     pub fn as_u8(self) -> u8 {
         self as u8
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum OrderSide {
-    Buy = 0,
-    Sell = 1,
-}
-
-impl OrderSide {
-    pub fn as_u8(self) -> u8 {
-        self as u8
-    }
-    pub fn as_str(self) -> &'static str {
-        match self {
-            OrderSide::Buy => "BUY",
-            OrderSide::Sell => "SELL",
-        }
     }
 }
 

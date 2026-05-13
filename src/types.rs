@@ -257,6 +257,13 @@ impl OrderSide {
             OrderSide::Sell => "SELL",
         }
     }
+
+    pub fn as_u8(self) -> u8 {
+        match self {
+            OrderSide::Buy => 0,
+            OrderSide::Sell => 1,
+        }
+    }
 }
 
 /// "YES" / "NO" leg of a binary outcome market.
