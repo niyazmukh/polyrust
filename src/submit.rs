@@ -35,11 +35,13 @@ use crate::signing::SignedFakOrderBody;
 pub const ORDER_PATH: &str = "/order";
 
 /// Per-request HTTP timeout. Live evidence (2026-05-13, 69 submits):
+///
 /// - All 30 transport_errors hit exactly 3000-3002ms (server non-response)
 /// - All 14 accepted orders responded in 301-2693ms (never timed out)
 /// - 25 FAK no-match rejections responded in 460-2901ms
 /// - Timeouts cluster in time (venue congestion), NOT correlated with
 ///   connection idle gap (42% timeout at gap≤40s vs 50% at gap>40s).
+///
 /// The venue simply doesn't respond within 3s during congestion.
 /// Increasing this timeout would recover some orders that matched on-chain
 /// despite the HTTP timeout (confirmed via WSS reconciliation in live logs).
@@ -184,10 +186,21 @@ impl HttpSubmitter {
                 };
                 classify(status, raw)
             }
-            Err(e) => SubmitOutcome::Unknown {
-                http_status: 0,
-                error: Some(format!("transport_error: {e}")),
-            },
+            Err(e) => {
+                let kind = if e.is_timeout() {
+                    "timeout"
+                } else if e.is_connect() {
+                    "connect"
+                } else if e.is_request() {
+                    "request"
+                } else {
+                    "other"
+                };
+                SubmitOutcome::Unknown {
+                    http_status: 0,
+                    error: Some(format!("transport_{kind}: {e}")),
+                }
+            }
         }
     }
 }
