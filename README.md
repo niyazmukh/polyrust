@@ -54,10 +54,10 @@ same `core.lock()` as the signal decision. Pending stays alive until CONFIRMED
 **SELL is fire-and-forget.** No SELL state, no locks, no cooldowns. Exit task
 fires every 50ms at the executable bid. FAK rejection is cheap.
 
-**Auth trust gated on frame sent.** `user_wss_trusted` starts false, set
-true after auth frame is successfully sent (venue has no explicit auth ACK
-per official SDK — invalid creds cause server disconnect). Revoked on
-disconnect/error. BUY blocked while untrusted.
+**User WSS scoped to the active market.** `user_wss_trusted` starts false,
+set true after the auth frame with the active condition ID is successfully
+sent. Rotation sends a user-channel subscription update for the next condition
+ID. Revoked on disconnect/error. BUY blocked while untrusted.
 
 **Signal ring cleared on rotation.** Prevents stale microprice samples from
 producing spurious momentum against the new market's strike.

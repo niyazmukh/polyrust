@@ -20,7 +20,7 @@ Rust-first low-latency FAK trading bot for Polymarket 5-minute binary options.
 
 7. **Fixed-point precision.** No f64 crosses the signed body boundary. Venue-facing values are integer ticks/cents/atoms. Silent rounding is forbidden.
 
-8. **WSS is inventory truth.** User WSS CONFIRMED trades own the balance. HTTP responses classify outcomes but don't own inventory. Trust starts false, granted on successful auth frame send (venue has no explicit auth ACK per official SDK — invalid creds cause server disconnect), revoked on disconnect/error.
+8. **WSS is inventory truth.** User WSS CONFIRMED trades own the balance. HTTP responses classify outcomes but don't own inventory. User WSS must subscribe to the active condition ID and receive rotation subscription updates. Trust starts false, granted on successful auth frame send (venue has no explicit auth ACK per official SDK — invalid creds cause server disconnect), revoked on disconnect/error.
 
 9. **FAK rejection is cheap.** Don't over-protect BUY no-match, SELL no-match, or SELL balance rejection. Rejected BUY deletes the claim. SELL creates zero local state.
 
@@ -129,6 +129,7 @@ All must be true:
 
 - startup fails fast on missing credentials
 - user WSS trust gates BUY (trust on auth frame sent, revoked on disconnect)
+- user WSS subscription includes active condition ID and updates on rotation
 - BUY claim atomic with intent, deleted on rejection, removed on CONFIRMED
 - UNKNOWN stays matchable, Accepted doesn't expire blindly
 - SELL has zero local state

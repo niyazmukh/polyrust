@@ -225,6 +225,7 @@ async fn main() {
     // This order is observed in: binance callback, maint_task rotation.
     // Reversing it (core→anchor) will deadlock against these paths.
     let (market_tx, market_rx) = mpsc::unbounded_channel::<String>();
+    let (user_tx, user_rx) = mpsc::unbounded_channel::<String>();
 
     // Log signer/maker addresses once at startup for cross-ref with POLY_ADDRESS.
     {
@@ -625,9 +626,21 @@ async fn main() {
             let core_disconnect = core.clone();
             feed::user_feed_loop(
                 &user_url,
-                &api_key,
-                &api_secret,
-                &passphrase,
+                feed::UserFeedAuth {
+                    api_key: &api_key,
+                    api_secret: &api_secret,
+                    api_passphrase: &passphrase,
+                },
+                {
+                    let core = core.clone();
+                    move || {
+                        core.lock()
+                            .ok()
+                            .and_then(|mut c| c.state_mut().market().cloned())
+                            .map(|m| vec![m.condition_id.as_str().to_owned()])
+                            .unwrap_or_default()
+                    }
+                },
                 move |raw| {
                     let mut c = match core.lock() {
                         Ok(c) => c,
@@ -678,6 +691,7 @@ async fn main() {
                         }
                     }
                 },
+                user_rx,
             )
             .await;
         })
@@ -984,11 +998,13 @@ async fn main() {
                 // Lock order: anchor → core (see invariant at §8).
                 if rotated {
                     let mut a = anchor.lock().unwrap();
-                    let (slug_ts, yes_tok, no_tok) = {
+                    let (slug_ts, condition_id, yes_tok, no_tok) = {
                         let mut c = core.lock().unwrap();
                         let m = c.state_mut().market();
                         (
                             m.map(|m| m.slug_ts).unwrap_or(0),
+                            m.map(|m| m.condition_id.as_str().to_owned())
+                                .unwrap_or_default(),
                             m.map(|m| m.yes_token.as_str().to_owned())
                                 .unwrap_or_default(),
                             m.map(|m| m.no_token.as_str().to_owned())
@@ -1006,6 +1022,13 @@ async fn main() {
                             "custom_feature_enabled": true,
                         });
                         let _ = market_tx.send(frame.to_string());
+                    }
+                    if !condition_id.is_empty() {
+                        let frame = serde_json::json!({
+                            "operation": "subscribe",
+                            "markets": [condition_id],
+                        });
+                        let _ = user_tx.send(frame.to_string());
                     }
                 }
 
