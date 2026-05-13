@@ -1,0 +1,27 @@
+/target
+**/*.rs.bk
+*.pdb
+.claude/
+.env*
+
+# Non-runtime documents
+DEEPSEEK_DELIVERY_REPORT.md
+GEMINI_REVIEW_REPORT.md
+GPT_REVIEW_REPORT.md
+CLAUDE_REVIEW_REPORT.md
+PRODUCTION_REVIEW.md
+claude_report.md
+deepseek_report.md
+refactor_report.md
+TODO.md
+.gitignore
+.graphifyignore
+/docs/
+
+# Tests
+/tests/
+/scripts/
+/.kiro/
+/graphify-out/
+.venv/
+.ssh_tmp/
