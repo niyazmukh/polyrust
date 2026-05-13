@@ -634,15 +634,7 @@ async fn main() {
                     // No immediate sell trigger here. The exit_task (50ms loop)
                     // handles selling once inventory is CONFIRMED on-chain.
                 },
-                {
-                    let ca = core_disconnect.clone();
-                    move || {
-                        if let Ok(mut c) = ca.lock() {
-                            c.inventory_mut().set_user_wss_trusted(true);
-                            logline::log_event(Level::Warn, "user_wss_trusted", &[]);
-                        }
-                    }
-                },
+                || {}, // auth frame sent — trust not granted until AuthSuccess
                 {
                     let cd = core_disconnect.clone();
                     move || {

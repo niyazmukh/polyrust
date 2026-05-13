@@ -3,6 +3,14 @@
 *.pdb
 .claude/
 .env*
+.kiro/
+graphify-out/
+.venv/
+.ssh_tmp/
+docs/
+tests/
+scripts/
+NUL
 
 # Non-runtime documents
 DEEPSEEK_DELIVERY_REPORT.md
@@ -14,14 +22,4 @@ claude_report.md
 deepseek_report.md
 refactor_report.md
 TODO.md
-.gitignore
 .graphifyignore
-/docs/
-
-# Tests
-/tests/
-/scripts/
-/.kiro/
-/graphify-out/
-.venv/
-.ssh_tmp/

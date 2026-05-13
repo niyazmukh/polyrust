@@ -30,7 +30,7 @@ Rust-first low-latency FAK trading bot for Polymarket 5-minute binary options.
 
 ### Inventory
 
-- Inventory applies on **CONFIRMED only** (not MATCHED — on-chain balance doesn't exist until then).
+- Inventory applies on **MATCHED** (not CONFIRMED — MATCHED is the first on-chain signal; SELL fires immediately). CONFIRMED is idempotent. FAILED after MATCHED reverses the delta.
 - Pending claim stays alive until terminal status (CONFIRMED/FAILED) to block duplicate BUY.
 - WSS-confirmed trade removes pending claim. Inventory is then the sole authority.
 
@@ -129,7 +129,7 @@ All must be true:
 - BUY claim atomic with intent, deleted on rejection, removed on CONFIRMED
 - UNKNOWN stays matchable, Accepted doesn't expire blindly
 - SELL has zero local state
-- inventory applies on CONFIRMED only
+- inventory applies on MATCHED; CONFIRMED is idempotent; FAILED reverses
 - decimal validation is fixed-point
 - signature kind/funder fails closed
 - rotation is unconditional, forgets old state, clears signal ring

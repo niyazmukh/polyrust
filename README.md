@@ -9,7 +9,7 @@ That's the entire hot path. Everything else is startup or periodic maintenance.
 
 ```
 src/
-├── main.rs       ← orchestrator: 4 async tasks (market, binance, user, exit/maint)
+├── main.rs       ← orchestrator: 5 async tasks (market, binance, user, exit, maint)
 ├── runtime.rs    ← RuntimeCore: signal + inventory + state behind one Mutex
 ├── signal.rs     ← microprice momentum + OFI + imbalance → BuyIntent | None
 ├── inventory.rs  ← WSS-authoritative inventory, pending claim lifecycle
@@ -36,8 +36,10 @@ src/
 **WSS is inventory truth.** User-channel CONFIRMED trades own the balance.
 HTTP submit responses classify outcomes but don't own inventory.
 
-**Inventory applies on CONFIRMED only.** MATCHED is off-chain; on-chain
-balance doesn't exist until CONFIRMED. SELL only fires after CONFIRMED.
+**Inventory applies on MATCHED.** MATCHED is the first on-chain signal; inventory
+is applied immediately so SELL can fire without waiting for CONFIRMED. If FAILED
+arrives after MATCHED the delta is reversed. CONFIRMED is idempotent (already applied).
+SELL only fires once MATCHED balance exists.
 
 **No flat-start check.** Old positions on expired markets resolve automatically.
 The bot only trades the current 5-minute window discovered via Gamma.
