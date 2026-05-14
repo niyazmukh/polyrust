@@ -130,6 +130,7 @@ pub struct TradeState {
     pub size_atoms: SharesAtoms,
     pub status: TradeStatus,
     pub applied: bool,
+    pub inventory_changed: bool,
     pub finalized: bool,
     pub matched_submit: Option<SubmitId>,
 }
@@ -268,6 +269,7 @@ impl Inventory {
                 finalized: false,
             });
 
+        let mut inventory_changed = false;
         if trade.status.inventory_applying() && !record.applied {
             apply_inventory_delta(
                 &mut self.owned_by_token,
@@ -276,6 +278,7 @@ impl Inventory {
                 record.size_atoms,
             );
             record.applied = true;
+            inventory_changed = true;
         }
         // Reverse the delta if FAILED arrives after MATCHED already applied.
         if trade.status == TradeStatus::Failed && record.applied && !record.finalized {
@@ -289,6 +292,7 @@ impl Inventory {
                 reverse_side,
                 record.size_atoms,
             );
+            inventory_changed = true;
         }
         if trade.status.terminal() {
             record.finalized = true;
@@ -301,6 +305,7 @@ impl Inventory {
             size_atoms: record.size_atoms,
             status: trade.status,
             applied: record.applied,
+            inventory_changed,
             finalized: record.finalized,
             matched_submit,
         }

@@ -5,7 +5,7 @@
 //! BUY intent after current state and inventory risk checks.
 
 use crate::config::{Config, ConfigError};
-use crate::inventory::{Inventory, SubmitId, TradeState};
+use crate::inventory::{Inventory, SubmitId, TradeState, TradeStatus, UserTrade};
 use crate::market::{MarketParseError, apply_market_events, parse_market_events};
 use crate::orders::{
     BuyCanonicalError, BuyCanonicalInput, canonical_buy_target_for_notional, canonical_sell_params,
@@ -16,7 +16,7 @@ use crate::state::RuntimeState;
 use crate::submit::SubmitOutcome;
 use crate::types::{OrderId, OutcomeSide, PriceTick, Shares2, TokenId, TsUs};
 use crate::user::{UserMessage, UserParseError, parse_user_message};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeError {
@@ -83,6 +83,39 @@ pub struct PreparedSellSubmit {
     pub body: SignedFakOrderBody,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExitReason {
+    Drop,
+    Hold,
+}
+
+impl ExitReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ExitReason::Drop => "drop",
+            ExitReason::Hold => "hold",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExitDecision {
+    pub plan: SellPlan,
+    pub reason: ExitReason,
+    pub entry_price: PriceTick,
+    pub peak_bid: PriceTick,
+    pub bid: PriceTick,
+    pub hold_us: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExitTracker {
+    entry_price: PriceTick,
+    peak_bid: PriceTick,
+    fill_ts_us: i64,
+    fired: Option<ExitReason>,
+}
+
 /// Snapshot of the inputs needed to sign a FAK SELL, computable purely
 /// from WSS-owned inventory and state under the core lock, with no
 /// signing or JSON serialization required. Callers on the hot path are
@@ -117,6 +150,10 @@ pub struct RuntimeCore {
     signal: SignalEngine,
     buy_policy: BuySubmitPolicy,
     sell_slippage_ticks: i32,
+    exit_drop_ticks: i32,
+    exit_arm_ticks: i32,
+    exit_hold_us: i64,
+    exit_trackers: HashMap<TokenId, ExitTracker>,
 }
 
 impl RuntimeCore {
@@ -127,6 +164,10 @@ impl RuntimeCore {
             signal: SignalEngine::new(config.signal_config()?),
             buy_policy: config.buy_submit_policy(),
             sell_slippage_ticks: config.sell_slippage_cents,
+            exit_drop_ticks: config.exit_drop_ticks,
+            exit_arm_ticks: config.exit_arm_ticks,
+            exit_hold_us: config.exit_hold_us,
+            exit_trackers: HashMap::new(),
         })
     }
 
@@ -180,35 +221,120 @@ impl RuntimeCore {
         let mut states = Vec::new();
         if let UserMessage::Trades(ref trades) = msg {
             for trade in trades {
-                states.push(self.inventory.apply_user_trade(trade.clone()));
+                let state = self.inventory.apply_user_trade(trade.clone());
+                self.track_user_trade_for_exit(trade, &state);
+                states.push(state);
             }
         }
         Ok((msg, states))
     }
 
-    // Sell convenience methods. `&self` benefits from field-level borrow splitting.
+    fn track_user_trade_for_exit(&mut self, trade: &UserTrade, state: &TradeState) {
+        if !state.inventory_changed {
+            return;
+        }
+        match state.side {
+            crate::types::OrderSide::Buy => {
+                if matches!(state.status, TradeStatus::Matched | TradeStatus::Confirmed)
+                    && self.inventory.sellable(&state.token).units() > 0
+                {
+                    let current_bid = self
+                        .state
+                        .quote_for_token(&state.token)
+                        .and_then(|quote| quote.bid)
+                        .unwrap_or(trade.price);
+                    self.exit_trackers.insert(
+                        state.token.clone(),
+                        ExitTracker {
+                            entry_price: trade.price,
+                            peak_bid: current_bid.max(trade.price),
+                            fill_ts_us: trade.ts_us,
+                            fired: None,
+                        },
+                    );
+                }
+            }
+            crate::types::OrderSide::Sell => {
+                if self.inventory.sellable(&state.token).units() <= 0 {
+                    self.exit_trackers.remove(&state.token);
+                }
+            }
+        }
+    }
 
-    /// Build a `SellPlan` for a FAK SELL at the current executable bid.
-    /// Returns `None` if no bid quote exists or sellable inventory is
-    /// zero. This does no signing — callers must hand the plan to
-    /// `SellPlan::sign` outside the core lock.
-    /// Compute a `SellPlan` for a FAK SELL at the current executable bid,
-    /// without signing. The returned plan can be handed to `SellPlan::sign`
-    /// outside any shared mutex. Returns `None` if no bid exists, the
-    /// sellable inventory is zero, or the size rounds to zero sellable
-    /// units after venue-quantum snap.
-    pub fn plan_sells_at_bid_excluding(
-        &self,
-        tokens: impl IntoIterator<Item = TokenId>,
+    /// Build FAK SELL plans for active-market inventory only when the
+    /// bid-trailing exit has fired and no SELL is already in flight.
+    pub fn plan_exits(
+        &mut self,
         in_flight: &HashSet<TokenId>,
-    ) -> Vec<SellPlan> {
-        plan_sells_at_bid_excluding(
-            tokens,
-            &self.state,
-            &self.inventory,
-            self.sell_slippage_ticks,
-            in_flight,
-        )
+        now_ts_us: i64,
+    ) -> Vec<ExitDecision> {
+        let mut out = Vec::new();
+        let tokens: Vec<_> = self
+            .state
+            .market()
+            .map(|m| vec![m.yes_token.clone(), m.no_token.clone()])
+            .unwrap_or_default();
+        for token in tokens {
+            if in_flight.contains(&token) {
+                continue;
+            }
+            let Some(position) = self.inventory.position(&token) else {
+                self.exit_trackers.remove(&token);
+                continue;
+            };
+            if position.sellable.units() <= 0 {
+                self.exit_trackers.remove(&token);
+                continue;
+            }
+            let Some(bid) = self.state.quote_for_token(&token).and_then(|q| q.bid) else {
+                continue;
+            };
+            let Some(tracker) = self.exit_trackers.get_mut(&token) else {
+                continue;
+            };
+            tracker.peak_bid = tracker.peak_bid.max(bid);
+            let hold_us = now_ts_us.saturating_sub(tracker.fill_ts_us);
+            let reason = tracker.fired.or_else(|| {
+                let profit_ticks = tracker.peak_bid.ticks() - tracker.entry_price.ticks();
+                let drawdown_ticks = tracker.peak_bid.ticks() - bid.ticks();
+                if profit_ticks >= self.exit_arm_ticks && drawdown_ticks >= self.exit_drop_ticks {
+                    Some(ExitReason::Drop)
+                } else if hold_us >= self.exit_hold_us {
+                    Some(ExitReason::Hold)
+                } else {
+                    None
+                }
+            });
+            if let Some(reason) = reason {
+                tracker.fired = Some(reason);
+                if let Some(plan) = plan_sell_at_bid(
+                    &token,
+                    &self.state,
+                    &self.inventory,
+                    self.sell_slippage_ticks,
+                ) {
+                    out.push(ExitDecision {
+                        plan,
+                        reason,
+                        entry_price: tracker.entry_price,
+                        peak_bid: tracker.peak_bid,
+                        bid,
+                        hold_us,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    pub fn release_market_scope<'a>(
+        &mut self,
+        active_tokens: impl IntoIterator<Item = &'a TokenId>,
+    ) {
+        let active: HashSet<TokenId> = active_tokens.into_iter().cloned().collect();
+        self.inventory.release_market_scope(active.iter());
+        self.exit_trackers.retain(|token, _| active.contains(token));
     }
 }
 
@@ -323,18 +449,4 @@ pub fn plan_sell_at_bid(
         price,
         size,
     })
-}
-
-pub fn plan_sells_at_bid_excluding(
-    tokens: impl IntoIterator<Item = TokenId>,
-    state: &RuntimeState,
-    inventory: &Inventory,
-    slippage_ticks: i32,
-    in_flight: &HashSet<TokenId>,
-) -> Vec<SellPlan> {
-    tokens
-        .into_iter()
-        .filter(|token| !in_flight.contains(token))
-        .filter_map(|token| plan_sell_at_bid(&token, state, inventory, slippage_ticks))
-        .collect()
 }

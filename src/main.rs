@@ -581,16 +581,18 @@ async fn main() {
                         tokio::spawn(async move {
                             for i in 1..=15u8 {
                                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                                let ask_ticks = core3
+                                let (bid_ticks, ask_ticks) = core3
                                     .lock()
                                     .ok()
                                     .and_then(|mut c| {
-                                        c.state_mut()
-                                            .quote_for_token(&tok)
-                                            .and_then(|q| q.ask)
-                                            .map(|p| p.ticks())
+                                        c.state_mut().quote_for_token(&tok).map(|q| {
+                                            (
+                                                q.bid.map(|p| p.ticks()).unwrap_or(0),
+                                                q.ask.map(|p| p.ticks()).unwrap_or(0),
+                                            )
+                                        })
                                     })
-                                    .unwrap_or(0);
+                                    .unwrap_or((0, 0));
                                 logline::log_event(
                                     Level::Info,
                                     "signal_price_after",
@@ -602,6 +604,10 @@ async fn main() {
                                         Field {
                                             key: "sec",
                                             value: &(i as i32),
+                                        },
+                                        Field {
+                                            key: "bid_ticks",
+                                            value: &bid_ticks,
                                         },
                                         Field {
                                             key: "ask_ticks",
@@ -802,23 +808,48 @@ async fn main() {
                 // Collect sellable plans under lock. Signing is done
                 // outside the lock to avoid serializing against the
                 // Binance BUY hot path.
-                let plans: Vec<_> = {
+                let exits: Vec<_> = {
                     let mut c = match core.lock() {
                         Ok(c) => c,
                         Err(_) => continue,
                     };
-                    let tokens: Vec<_> = c
-                        .state_mut()
-                        .market()
-                        .map(|m| vec![m.yes_token.clone(), m.no_token.clone()])
-                        .unwrap_or_default();
-                    c.plan_sells_at_bid_excluding(tokens, &sell_in_flight)
+                    c.plan_exits(&sell_in_flight, now_us())
                 };
 
                 // Sign and fire sells outside the lock.
-                for plan in plans {
-                    let token = plan.token.clone();
-                    let prepared = match plan.sign(
+                for exit in exits {
+                    logline::log_event(
+                        Level::Warn,
+                        "exit_triggered",
+                        &[
+                            Field {
+                                key: "token_id",
+                                value: &exit.plan.token.as_str(),
+                            },
+                            Field {
+                                key: "reason",
+                                value: &exit.reason.as_str(),
+                            },
+                            Field {
+                                key: "entry_ticks",
+                                value: &exit.entry_price.ticks(),
+                            },
+                            Field {
+                                key: "peak_bid_ticks",
+                                value: &exit.peak_bid.ticks(),
+                            },
+                            Field {
+                                key: "bid_ticks",
+                                value: &exit.bid.ticks(),
+                            },
+                            Field {
+                                key: "hold_us",
+                                value: &exit.hold_us,
+                            },
+                        ],
+                    );
+                    let token = exit.plan.token.clone();
+                    let prepared = match exit.plan.sign(
                         &sign,
                         SignInputs {
                             salt: sid.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -1035,7 +1066,7 @@ async fn main() {
                         rotation_deadline = tokio::time::Instant::now()
                             + std::time::Duration::from_secs(secs_until_prefetch as u64);
 
-                        c.inventory_mut().release_market_scope([&yes, &no]);
+                        c.release_market_scope([&yes, &no]);
                         c.signal_mut().set_strike(0.0, true);
                         c.state_mut().set_market(discovered);
                         true

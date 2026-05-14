@@ -38,6 +38,9 @@ pub struct Config {
     pub decision_min_edge_cents: i32,
     pub entry_slippage_cents: i32,
     pub sell_slippage_cents: i32,
+    pub exit_drop_ticks: i32,
+    pub exit_arm_ticks: i32,
+    pub exit_hold_us: i64,
     pub prob_sigma_scale: f64,
     pub prob_sigma_floor_usd: f64,
     pub prob_floor: f64,
@@ -178,6 +181,39 @@ impl Config {
                 name: "MINIMAL_SELL_SLIPPAGE",
                 reason: "out_of_range".into(),
             })?;
+        let exit_drop_ticks = env_i64_lookup(&mut lookup, "EXIT_DROP_TICKS")
+            .unwrap_or(2)
+            .try_into()
+            .map_err(|_| ConfigError::Invalid {
+                name: "EXIT_DROP_TICKS",
+                reason: "out_of_range".into(),
+            })?;
+        if exit_drop_ticks <= 0 {
+            return Err(ConfigError::Invalid {
+                name: "EXIT_DROP_TICKS",
+                reason: format!("non_positive value={exit_drop_ticks}"),
+            });
+        }
+        let exit_arm_ticks = env_i64_lookup(&mut lookup, "EXIT_ARM_TICKS")
+            .unwrap_or(2)
+            .try_into()
+            .map_err(|_| ConfigError::Invalid {
+                name: "EXIT_ARM_TICKS",
+                reason: "out_of_range".into(),
+            })?;
+        if exit_arm_ticks < 0 {
+            return Err(ConfigError::Invalid {
+                name: "EXIT_ARM_TICKS",
+                reason: format!("negative value={exit_arm_ticks}"),
+            });
+        }
+        let exit_hold_us = env_i64_lookup(&mut lookup, "EXIT_HOLD_US").unwrap_or(15_000_000);
+        if exit_hold_us <= 0 {
+            return Err(ConfigError::Invalid {
+                name: "EXIT_HOLD_US",
+                reason: format!("non_positive value={exit_hold_us}"),
+            });
+        }
         Ok(Self {
             allow_live_orders,
             usdc_per_trade_cents,
@@ -205,6 +241,9 @@ impl Config {
             decision_min_edge_cents,
             entry_slippage_cents,
             sell_slippage_cents,
+            exit_drop_ticks,
+            exit_arm_ticks,
+            exit_hold_us,
             prob_sigma_scale: env_f64_lookup(&mut lookup, "MINIMAL_PROB_SIGMA_SCALE")
                 .unwrap_or(1.5),
             prob_sigma_floor_usd: env_f64_lookup(&mut lookup, "MINIMAL_PROB_SIGMA_FLOOR_USD")
@@ -521,6 +560,9 @@ mod tests {
             ("MINIMAL_DECISION_MIN_EDGE", "0.05"),
             ("MINIMAL_ENTRY_SLIPPAGE", "0.03"),
             ("MINIMAL_SELL_SLIPPAGE", "0.03"),
+            ("EXIT_DROP_TICKS", "3"),
+            ("EXIT_ARM_TICKS", "2"),
+            ("EXIT_HOLD_US", "12000000"),
             ("MINIMAL_PROB_SIGMA_SCALE", "1.5"),
             ("MINIMAL_PROB_SIGMA_FLOOR_USD", "2.0"),
             ("MINIMAL_PROB_FLOOR", "0.02"),
@@ -537,6 +579,9 @@ mod tests {
         assert_eq!(signal.min_buy_limit.ticks(), 35);
         assert_eq!(signal.max_buy_limit.ticks(), 65);
         assert_eq!(signal.min_tte_us, 45_000_000);
+        assert_eq!(cfg.exit_drop_ticks, 3);
+        assert_eq!(cfg.exit_arm_ticks, 2);
+        assert_eq!(cfg.exit_hold_us, 12_000_000);
 
         let buy = cfg.buy_submit_policy();
         assert_eq!(buy.target_maker_cents, 101);

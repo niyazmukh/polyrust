@@ -53,11 +53,16 @@ Old inventory is forgotten; old markets resolve on-chain at expiry.
 same `core.lock()` as the signal decision. Pending stays alive until CONFIRMED
 (blocks same-token re-entry). Rejected → claim deleted.
 
+**Exit rides executable bid.** BUY MATCHED starts a per-token bid tracker from
+the WSS fill price. The exit task wakes every 50ms, updates peak bid, and sells
+only after the bid arms (`EXIT_ARM_TICKS`) then drops (`EXIT_DROP_TICKS`), or
+after `EXIT_HOLD_US`. SELL remains FAK at current bid.
+
 **SELL submit is single-flight per token.** Inventory remains WSS-owned, and
-HTTP SELL responses never own balance. The exit task wakes every 50ms, but a
-token cannot submit another FAK SELL until the prior HTTP outcome returns. This
-prevents repeated full-size SELLs from colliding with venue-side reservations
-under transport uncertainty.
+HTTP SELL responses never own balance. Once exit decides to sell, a token cannot
+submit another FAK SELL until the prior HTTP outcome returns. This prevents
+repeated full-size SELLs from colliding with venue-side reservations under
+transport uncertainty.
 
 **User WSS scoped to the active market.** `user_wss_trusted` starts false,
 set true after the auth frame with the active condition ID is successfully
@@ -91,13 +96,16 @@ src_ts_us → recv_us → decide_us → submit_us → outcome (rtt_us)
  [network]  [signal]   [spawn+sign]  [HTTP RTT]
 ```
 
-**Post-signal price tracker** (INFO level): logs the token ask price at
+**Post-signal price tracker** (INFO level): logs token bid and ask prices at
 1s intervals for 15s after each signal fires. Zero hot-path overhead —
 runs in a spawned task off the critical path.
 
 **User trade application** (WARNING level): logs `user_trade_applied` after a
 parsed user-channel trade updates inventory, including trade id, token, side,
 status, size atoms, matched submit id, and sellable balance after the update.
+
+**Exit decision** (WARNING level): logs `exit_triggered` with reason (`drop` or
+`hold`), entry ticks, peak bid ticks, current bid ticks, and hold time.
 
 ## Build / Test
 
@@ -155,7 +163,7 @@ Runtime mapping from docs:
 * No flat-start check — WSS authority handles restart-with-position.
 * No early next-window promotion — rotation is scheduled at `end_ts - 5s`.
 * No rotation blocker — old markets resolve automatically at expiry.
-* No force-exit task — exit task (50ms) already sells all sellable inventory.
+* No force-exit task - the 50ms exit task owns bid-trailing SELL decisions.
 * No SELL inventory state/locks/cooldowns — submit concurrency is single-flight
   per token to avoid duplicate full-size FAKs while an HTTP outcome is pending.
 * No full SDK order builder — signing is local, synchronous, on-demand.

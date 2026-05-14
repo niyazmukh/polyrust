@@ -46,6 +46,10 @@ Rust-first low-latency FAK trading bot for Polymarket 5-minute binary options.
 
 ### SELL Lifecycle
 
+- BUY MATCHED starts a bid tracker from WSS fill price.
+- Exit wakes every 50ms: update peak bid, sell on armed drop (`EXIT_ARM_TICKS` then `EXIT_DROP_TICKS`) or hold timeout (`EXIT_HOLD_US`).
+- When exit fires: read sellable inventory, read bid, sign FAK SELL, submit, log.
+
 - Read sellable inventory → read bid → sign FAK SELL → submit → log.
 - Inventory remains WSS-owned; HTTP SELL responses do not mutate balance.
 - At most one SELL submit may be in flight per token. The next retry is allowed only after the prior HTTP outcome returns.
@@ -82,7 +86,7 @@ Rust-first low-latency FAK trading bot for Polymarket 5-minute binary options.
 
 - flat-start position checks (WSS authority handles restart-with-position)
 - rotation blockers (old markets resolve automatically)
-- force-exit tasks (exit task already sells everything)
+- force-exit tasks (50ms exit task owns bid-trailing SELL)
 - max-position caps (same-token duplicate protection is sufficient in 2-token markets)
 - max-TTE gates (the 5-min market window IS the product boundary)
 - SELL inventory state of any kind
@@ -145,6 +149,7 @@ All must be true:
 - user WSS subscription includes active condition ID and updates on rotation
 - BUY claim atomic with intent, deleted on rejection, removed on CONFIRMED
 - UNKNOWN stays matchable, Accepted doesn't expire blindly
+- BUY MATCHED arms bid-trailing exit; exit fires on `drop` or `hold`
 - SELL submit concurrency is single-flight per token; SELL does not own inventory
 - inventory applies on MATCHED; CONFIRMED is idempotent; FAILED reverses
 - decimal validation is fixed-point
