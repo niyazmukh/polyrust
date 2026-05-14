@@ -75,11 +75,30 @@ fn buy_trade(price_ticks: i32, size_atoms: i64) -> UserTrade {
 }
 
 fn apply_buy_raw(core: &mut RuntimeCore, price_ticks: i32, size: &str, ts_us: i64) {
+    apply_buy_raw_with_status(core, price_ticks, size, ts_us, "CONFIRMED");
+}
+
+fn apply_buy_matched_raw(core: &mut RuntimeCore, price_ticks: i32, size: &str, ts_us: i64) {
+    apply_buy_raw_with_status(core, price_ticks, size, ts_us, "MATCHED");
+}
+
+fn apply_buy_confirmed_raw(core: &mut RuntimeCore, price_ticks: i32, size: &str, ts_us: i64) {
+    apply_buy_raw_with_status(core, price_ticks, size, ts_us, "CONFIRMED");
+}
+
+fn apply_buy_raw_with_status(
+    core: &mut RuntimeCore,
+    price_ticks: i32,
+    size: &str,
+    ts_us: i64,
+    status: &str,
+) {
     let raw = format!(
-        r#"{{"event_type":"trade","trade_id":"buy-raw-{ts_us}","asset_id":"{}","side":"BUY","size":"{}","price":"{}","status":"MATCHED","order_id":"0xbuy"}}"#,
+        r#"{{"event_type":"trade","trade_id":"buy-raw-{ts_us}","asset_id":"{}","side":"BUY","size":"{}","price":"{}","status":"{}","order_id":"0xbuy"}}"#,
         token().as_str(),
         size,
-        PriceTick::checked(price_ticks).unwrap()
+        PriceTick::checked(price_ticks).unwrap(),
+        status
     );
     core.apply_user_raw_with_states(raw.as_bytes(), ts_us)
         .unwrap();
@@ -243,6 +262,25 @@ fn plan_sell_at_bid_returns_none_without_executable_bid() {
     inventory.apply_user_trade(buy_trade(50, 2_000_000));
 
     assert_eq!(plan_sell_at_bid(&token(), &state, &inventory, 0), None);
+}
+
+#[test]
+fn exit_tracker_arms_on_buy_confirmed_not_matched() {
+    let mut core = core_with_bid_and_config(55, cfg_with_fixed_prob(55));
+    seed_signal_window(&mut core, 999_000, 1, 102.0);
+    apply_buy_matched_raw(&mut core, 50, "2.000000", 0);
+
+    assert_eq!(
+        core.inventory_mut().sellable(&token()),
+        Shares2::new_unchecked(0)
+    );
+    assert_eq!(core.plan_exits(&Default::default(), 1_000_000), Vec::new());
+
+    apply_buy_confirmed_raw(&mut core, 50, "2.000000", 100);
+
+    let exits = core.plan_exits(&Default::default(), 1_000_000);
+    assert_eq!(exits.len(), 1);
+    assert_eq!(exits[0].reason, ExitReason::Value);
 }
 
 #[test]

@@ -97,14 +97,6 @@ impl TradeStatus {
         }
     }
 
-    fn inventory_applying(self) -> bool {
-        // Apply on MATCHED for fast SELL (Python bot does the same).
-        // If FAILED arrives later, the delta is reversed. SELL against
-        // a MATCHED-but-not-yet-CONFIRMED balance may get rejected by
-        // the venue — that's cheap (FAK rejection).
-        matches!(self, TradeStatus::Matched | TradeStatus::Confirmed)
-    }
-
     fn terminal(self) -> bool {
         matches!(self, TradeStatus::Confirmed | TradeStatus::Failed)
     }
@@ -270,7 +262,13 @@ impl Inventory {
             });
 
         let mut inventory_changed = false;
-        if trade.status.inventory_applying() && !record.applied {
+        let inventory_applying = match record.side {
+            OrderSide::Buy => trade.status == TradeStatus::Confirmed,
+            OrderSide::Sell => {
+                matches!(trade.status, TradeStatus::Matched | TradeStatus::Confirmed)
+            }
+        };
+        if inventory_applying && !record.applied {
             apply_inventory_delta(
                 &mut self.owned_by_token,
                 &record.token,
@@ -280,7 +278,7 @@ impl Inventory {
             record.applied = true;
             inventory_changed = true;
         }
-        // Reverse the delta if FAILED arrives after MATCHED already applied.
+        // Reverse the delta if FAILED arrives after the side-specific apply point.
         if trade.status == TradeStatus::Failed && record.applied && !record.finalized {
             let reverse_side = match record.side {
                 OrderSide::Buy => OrderSide::Sell,
@@ -427,7 +425,7 @@ mod tests {
     }
 
     #[test]
-    fn matched_applies_inventory_confirmed_is_idempotent() {
+    fn matched_waits_confirmed_applies_inventory_once() {
         let mut inv = Inventory::new();
         let t = token("asset");
         let first = inv.apply_user_trade(trade(
@@ -436,11 +434,9 @@ mod tests {
             OrderSide::Buy,
             TradeStatus::Matched,
         ));
-        // MATCHED now applies inventory immediately for fast SELL.
-        assert!(first.applied);
-        assert_eq!(inv.owned_atoms(&t), SharesAtoms(1_416_664));
+        assert!(!first.applied);
+        assert_eq!(inv.owned_atoms(&t), SharesAtoms(0));
 
-        // CONFIRMED is idempotent — already applied.
         let confirmed = inv.apply_user_trade(trade(
             "tr1",
             t.clone(),
@@ -505,7 +501,7 @@ mod tests {
         assert!(!inv.has_entry_exposure_or_pending(&t));
 
         // MATCHED: pending is matched but NOT removed (not terminal yet).
-        // Inventory IS applied on MATCHED for fast SELL.
+        // Inventory is not locally sellable until CONFIRMED.
         let state = inv.apply_user_trade(UserTrade {
             trade_id: TradeId::new("late"),
             token: t.clone(),
@@ -518,9 +514,9 @@ mod tests {
         });
         assert_eq!(state.matched_submit, Some(id.clone()));
         assert!(inv.pending(&id).is_some()); // still alive until terminal
-        assert_eq!(inv.owned_atoms(&t), SharesAtoms(1_000_000));
+        assert_eq!(inv.owned_atoms(&t), SharesAtoms(0));
 
-        // CONFIRMED: idempotent (already applied), pending removed.
+        // CONFIRMED: inventory applies, pending removed.
         let confirmed = inv.apply_user_trade(UserTrade {
             trade_id: TradeId::new("late"),
             token: t.clone(),

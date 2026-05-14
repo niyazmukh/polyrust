@@ -154,9 +154,10 @@ fn unknown_buy_submit_blocks_then_late_wss_trade_binds_and_applies_inventory() {
     });
 
     assert_eq!(state.matched_submit, Some(prepared.submit_id.clone()));
-    // MATCHED: pending stays alive (blocks duplicate BUY), inventory applied for fast SELL.
+    // MATCHED: pending stays alive (blocks duplicate BUY), but inventory waits
+    // for CONFIRMED so local sellable balance matches CLOB resale readiness.
     assert!(inventory.pending(&prepared.submit_id).is_some());
-    assert_eq!(inventory.owned_atoms(&intent().token), EXPECTED_SIZE_ATOMS);
+    assert_eq!(inventory.owned_atoms(&intent().token), SharesAtoms(0));
 
     // CONFIRMED: inventory applied, pending removed.
     let confirmed = inventory.apply_user_trade(UserTrade {
@@ -259,5 +260,18 @@ fn stale_unknown_buy_submit_stops_blocking_but_remains_matchable() {
     });
 
     assert_eq!(state.matched_submit, Some(prepared.submit_id.clone()));
+    assert_eq!(inventory.owned_atoms(&intent().token), SharesAtoms(0));
+
+    let confirmed = inventory.apply_user_trade(UserTrade {
+        trade_id: TradeId::new("late-expired-wss"),
+        token: intent().token,
+        taker_order_id: None,
+        side: OrderSide::Buy,
+        size_atoms: EXPECTED_SIZE_ATOMS,
+        price: PriceTick::checked(50).unwrap(),
+        status: TradeStatus::Confirmed,
+        ts_us: 15_200_000,
+    });
+    assert!(confirmed.applied);
     assert_eq!(inventory.owned_atoms(&intent().token), EXPECTED_SIZE_ATOMS);
 }

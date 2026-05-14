@@ -20,7 +20,7 @@ Rust-first low-latency FAK trading bot for Polymarket 5-minute binary options.
 
 7. **Fixed-point precision.** No f64 crosses the signed body boundary. Venue-facing values are integer ticks/cents/atoms. Silent rounding is forbidden.
 
-8. **WSS is inventory truth.** User WSS trade events own inventory. MATCHED applies inventory immediately for SELL; CONFIRMED is idempotent finality; FAILED after MATCHED reverses. HTTP responses classify outcomes but don't own inventory. User WSS must subscribe to the active condition ID and receive rotation subscription updates. Trust starts false, granted on successful auth frame send (venue has no explicit auth ACK per official SDK — invalid creds cause server disconnect), revoked on disconnect/error.
+8. **WSS is inventory truth.** User WSS trade events own inventory. BUY MATCHED binds pending submit and blocks duplicate BUY, but BUY inventory becomes locally sellable only on CONFIRMED because live CLOB rejected early resale before confirmation. SELL MATCHED applies immediately to clear local sellable inventory and prevent duplicate resale. HTTP responses classify outcomes but don't own inventory. User WSS must subscribe to the active condition ID and receive rotation subscription updates. Trust starts false, granted on successful auth frame send (venue has no explicit auth ACK per official SDK — invalid creds cause server disconnect), revoked on disconnect/error.
 
 9. **FAK rejection is cheap, submit storms are not.** Don't over-protect BUY no-match, SELL no-match, or definitive SELL balance rejection. Rejected BUY deletes the claim. SELL does not own inventory, but SELL submission is single-flight per token until the HTTP outcome returns; this prevents repeated full-size FAKs from colliding with venue-side matched/open reservations during transport uncertainty.
 
@@ -32,7 +32,8 @@ Rust-first low-latency FAK trading bot for Polymarket 5-minute binary options.
 
 ### Inventory
 
-- Inventory applies on **MATCHED** (not CONFIRMED — MATCHED is the first on-chain signal; SELL fires immediately). CONFIRMED is idempotent. FAILED after MATCHED reverses the delta.
+- BUY inventory applies on **CONFIRMED**. MATCHED binds pending submit and keeps duplicate BUY blocked, but does not create local sellable inventory.
+- SELL inventory applies on **MATCHED** so local sellable inventory clears as soon as our SELL is matched.
 - Pending claim stays alive until terminal status (CONFIRMED/FAILED) to block duplicate BUY.
 - WSS-confirmed trade removes pending claim. Inventory is then the sole authority.
 
@@ -47,7 +48,7 @@ Rust-first low-latency FAK trading bot for Polymarket 5-minute binary options.
 
 ### SELL Lifecycle
 
-- BUY MATCHED starts a bid tracker from WSS fill price and executable entry bid.
+- BUY CONFIRMED starts a bid tracker from WSS fill price and executable entry bid.
 - Exit wakes every 50ms: update peak bid, sell on hold timeout (`EXIT_HOLD_US`), hard local stop (`EXIT_STOP_TICKS` below executable entry bid), or when the same Binance probability model used for entry no longer values the held side above current bid plus `EXIT_EDGE_TICKS`. A profitable pullback is `drop` only when this fair-value gate is also weak.
 - When exit fires: read sellable inventory, read bid, sign FAK SELL, submit, log.
 
@@ -150,10 +151,10 @@ All must be true:
 - user WSS subscription includes active condition ID and updates on rotation
 - BUY claim atomic with intent, deleted on rejection, removed on CONFIRMED
 - UNKNOWN stays matchable, Accepted doesn't expire blindly
-- BUY MATCHED arms fair-value-gated exit; exit fires on `stop`, `value`, `drop`, or `hold`
+- BUY CONFIRMED arms fair-value-gated exit; exit fires on `stop`, `value`, `drop`, or `hold`
 - SELL submit concurrency is single-flight per token; SELL does not own inventory
 - UNKNOWN BUY submit stale expiry keeps late WSS matchability but unblocks same-token BUY after the live timeout window.
-- inventory applies on MATCHED; CONFIRMED is idempotent; FAILED reverses
+- BUY inventory applies on CONFIRMED; SELL inventory applies on MATCHED
 - decimal validation is fixed-point
 - signature kind/funder fails closed
 - rotation occurs only at `end_ts - 5s`, forgets old state, clears signal ring

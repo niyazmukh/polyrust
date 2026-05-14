@@ -641,8 +641,9 @@ async fn main() {
     };
 
     // --- User WS task ---
-    // Trade events own inventory (WSS authority). Inventory is applied
-    // on MATCHED for fast SELL; CONFIRMED is idempotent.
+    // Trade events own inventory (WSS authority). BUY inventory becomes
+    // locally sellable on CONFIRMED; SELL clears local sellable balance
+    // on MATCHED.
     let user_task = {
         let core = core.clone();
         let user_url = launch.poly_user_ws_url.clone();
@@ -742,7 +743,7 @@ async fn main() {
                         }
                     }
                     // No immediate sell trigger here. The exit_task (50ms loop)
-                    // handles selling once MATCHED inventory is visible.
+                    // handles selling once CONFIRMED BUY inventory is visible.
                 },
                 {
                     let ca = core_disconnect.clone();

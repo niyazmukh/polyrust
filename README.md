@@ -36,10 +36,11 @@ src/
 **WSS is inventory truth.** User-channel trade events own inventory. HTTP
 submit responses classify outcomes but don't own inventory.
 
-**Inventory applies on MATCHED.** MATCHED is the first on-chain signal; inventory
-is applied immediately so SELL can fire without waiting for CONFIRMED. If FAILED
-arrives after MATCHED the delta is reversed. CONFIRMED is idempotent (already applied).
-SELL only fires once MATCHED balance exists.
+**BUY inventory applies on CONFIRMED.** MATCHED binds the pending submit and
+keeps duplicate BUY blocked, but local sellable inventory waits for CONFIRMED
+because live CLOB rejected early resale attempts before confirmation. SELL
+inventory still applies on MATCHED so a matched SELL clears local sellable
+balance immediately and prevents duplicate resale attempts.
 
 **No flat-start check.** Old positions on expired markets resolve automatically.
 The bot only trades the current 5-minute window discovered via Gamma.
@@ -59,14 +60,13 @@ after the live timeout window.
 math charges half that cap rounded up as the expected fill debit, because a
 marketable FAK BUY starts at the best ask and only walks the book if needed.
 
-**Exit is fair-value gated.** BUY MATCHED starts a per-token bid tracker from
-the WSS fill price and the executable entry bid. The exit task wakes every
-50ms, updates peak bid, and sells on hard hold timeout (`EXIT_HOLD_US`), hard
-local stop (`EXIT_STOP_TICKS` below entry bid), or when the same Binance
-probability model used for entry no longer values the held side above current
-bid plus `EXIT_EDGE_TICKS`. A profitable pullback logs as `drop` only when the
-fair-value gate also says holding no longer pays. SELL remains FAK at current
-bid.
+**Exit is fair-value gated.** BUY CONFIRMED starts a per-token bid tracker from
+the WSS fill price and executable entry bid. The exit task wakes every 50ms,
+updates peak bid, and sells on hard hold timeout (`EXIT_HOLD_US`), hard local
+stop (`EXIT_STOP_TICKS` below entry bid), or when the same Binance probability
+model used for entry no longer values the held side above current bid plus
+`EXIT_EDGE_TICKS`. A profitable pullback logs as `drop` only when the fair-value
+gate also says holding no longer pays. SELL remains FAK at current bid.
 
 **SELL submit is single-flight per token.** Inventory remains WSS-owned, and
 HTTP SELL responses never own balance. Once exit decides to sell, a token cannot
