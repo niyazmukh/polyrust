@@ -39,15 +39,16 @@ Rust-first low-latency FAK trading bot for Polymarket 5-minute binary options.
 ### BUY Lifecycle
 
 - Claim created atomically with intent (same `core.lock()` scope).
+- BUY limit uses full `MINIMAL_ENTRY_SLIPPAGE` as a FAK execution cap; edge math charges half that slippage rounded up as the expected fill debit.
 - Dry-run does not create claims.
 - Rejected → claim deleted (no tombstone).
-- UNKNOWN → stays WSS-matchable, blocks same-token BUY.
+- UNKNOWN → stays WSS-matchable, blocks same-token BUY until stale expiry.
 - Accepted → does not blindly expire.
 
 ### SELL Lifecycle
 
-- BUY MATCHED starts a bid tracker from WSS fill price.
-- Exit wakes every 50ms: update peak bid, sell when bid drops `EXIT_DROP_TICKS` from peak after profit arm (`EXIT_ARM_TICKS`) or from the executable entry bid before profit, or on hold timeout (`EXIT_HOLD_US`).
+- BUY MATCHED starts a bid tracker from WSS fill price and executable entry bid.
+- Exit wakes every 50ms: update peak bid, sell on hold timeout (`EXIT_HOLD_US`), hard local stop (`EXIT_STOP_TICKS` below executable entry bid), or when the same Binance probability model used for entry no longer values the held side above current bid plus `EXIT_EDGE_TICKS`. A profitable pullback is `drop` only when this fair-value gate is also weak.
 - When exit fires: read sellable inventory, read bid, sign FAK SELL, submit, log.
 
 - Read sellable inventory → read bid → sign FAK SELL → submit → log.
@@ -86,7 +87,7 @@ Rust-first low-latency FAK trading bot for Polymarket 5-minute binary options.
 
 - flat-start position checks (WSS authority handles restart-with-position)
 - rotation blockers (old markets resolve automatically)
-- force-exit tasks (50ms exit task owns bid-trailing SELL)
+- force-exit tasks (50ms exit task owns fair-value-gated SELL)
 - max-position caps (same-token duplicate protection is sufficient in 2-token markets)
 - max-TTE gates (the 5-min market window IS the product boundary)
 - SELL inventory state of any kind
@@ -149,8 +150,9 @@ All must be true:
 - user WSS subscription includes active condition ID and updates on rotation
 - BUY claim atomic with intent, deleted on rejection, removed on CONFIRMED
 - UNKNOWN stays matchable, Accepted doesn't expire blindly
-- BUY MATCHED arms bid-trailing exit; exit fires on `drop` or `hold`
+- BUY MATCHED arms fair-value-gated exit; exit fires on `stop`, `value`, `drop`, or `hold`
 - SELL submit concurrency is single-flight per token; SELL does not own inventory
+- UNKNOWN BUY submit stale expiry keeps late WSS matchability but unblocks same-token BUY after the live timeout window.
 - inventory applies on MATCHED; CONFIRMED is idempotent; FAILED reverses
 - decimal validation is fixed-point
 - signature kind/funder fails closed

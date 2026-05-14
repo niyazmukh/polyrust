@@ -51,13 +51,22 @@ Old inventory is forgotten; old markets resolve on-chain at expiry.
 
 **BUY duplicate protection via atomic claim.** `claim_entry()` runs inside the
 same `core.lock()` as the signal decision. Pending stays alive until CONFIRMED
-(blocks same-token re-entry). Rejected → claim deleted.
+(blocks same-token re-entry). Rejected → claim deleted. Transport-timeout
+UNKNOWN stays WSS-matchable, but stale UNKNOWN stops blocking same-token BUY
+after the live timeout window.
 
-**Exit rides executable bid.** BUY MATCHED starts a per-token bid tracker from
+**BUY slippage split.** `MINIMAL_ENTRY_SLIPPAGE` is the FAK execution cap. Edge
+math charges half that cap rounded up as the expected fill debit, because a
+marketable FAK BUY starts at the best ask and only walks the book if needed.
+
+**Exit is fair-value gated.** BUY MATCHED starts a per-token bid tracker from
 the WSS fill price and the executable entry bid. The exit task wakes every
-50ms, updates peak bid, and sells when bid drops `EXIT_DROP_TICKS` from peak
-after profit arm (`EXIT_ARM_TICKS`) or from the entry bid before profit, or
-after `EXIT_HOLD_US`. SELL remains FAK at current bid.
+50ms, updates peak bid, and sells on hard hold timeout (`EXIT_HOLD_US`), hard
+local stop (`EXIT_STOP_TICKS` below entry bid), or when the same Binance
+probability model used for entry no longer values the held side above current
+bid plus `EXIT_EDGE_TICKS`. A profitable pullback logs as `drop` only when the
+fair-value gate also says holding no longer pays. SELL remains FAK at current
+bid.
 
 **SELL submit is single-flight per token.** Inventory remains WSS-owned, and
 HTTP SELL responses never own balance. Once exit decides to sell, a token cannot
@@ -97,6 +106,10 @@ src_ts_us → recv_us → decide_us → submit_us → outcome (rtt_us)
  [network]  [signal]   [spawn+sign]  [HTTP RTT]
 ```
 
+BUY submit outcomes also log `limit_ticks`, `edge_price_ticks`, and
+`edge_ticks`, so FAK no-match events can be separated into stale/slow execution
+versus intentional price-band rejections.
+
 **Post-signal price tracker** (INFO level): logs token bid and ask prices at
 1s intervals for 15s after each signal fires. Zero hot-path overhead —
 runs in a spawned task off the critical path.
@@ -105,9 +118,9 @@ runs in a spawned task off the critical path.
 parsed user-channel trade updates inventory, including trade id, token, side,
 status, size atoms, matched submit id, and sellable balance after the update.
 
-**Exit decision** (WARNING level): logs `exit_triggered` with reason (`drop` or
-`hold`), entry ticks, entry bid ticks, peak bid ticks, current bid ticks, and
-hold time.
+**Exit decision** (WARNING level): logs `exit_triggered` with reason (`stop`,
+`value`, `drop`, or `hold`), entry ticks, entry bid ticks, peak bid ticks,
+current bid ticks, fair ticks, fair-minus-bid ticks, and hold time.
 
 ## Build / Test
 
@@ -165,7 +178,7 @@ Runtime mapping from docs:
 * No flat-start check — WSS authority handles restart-with-position.
 * No early next-window promotion — rotation is scheduled at `end_ts - 5s`.
 * No rotation blocker — old markets resolve automatically at expiry.
-* No force-exit task - the 50ms exit task owns bid-trailing SELL decisions.
+* No force-exit task - the 50ms exit task owns fair-value-gated SELL decisions.
 * No SELL inventory state/locks/cooldowns — submit concurrency is single-flight
   per token to avoid duplicate full-size FAKs while an HTTP outcome is pending.
 * No full SDK order builder — signing is local, synchronous, on-demand.

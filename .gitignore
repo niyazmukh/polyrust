@@ -6,9 +6,11 @@
 .kiro/
 graphify-out/
 .venv/
+.ssh/
 .ssh_tmp/
+run_logs/
+*.log
 docs/
-tests/
 scripts/
 NUL
 

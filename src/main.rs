@@ -494,6 +494,18 @@ async fn main() {
                                             value: &intent2.token.as_str(),
                                         },
                                         Field {
+                                            key: "limit_ticks",
+                                            value: &intent2.limit.ticks(),
+                                        },
+                                        Field {
+                                            key: "edge_price_ticks",
+                                            value: &intent2.edge_price.ticks(),
+                                        },
+                                        Field {
+                                            key: "edge_ticks",
+                                            value: &intent2.edge_ticks,
+                                        },
+                                        Field {
                                             key: "accepted",
                                             value: &accepted,
                                         },
@@ -550,6 +562,10 @@ async fn main() {
                                 Field {
                                     key: "limit_ticks",
                                     value: &intent.limit.ticks(),
+                                },
+                                Field {
+                                    key: "edge_price_ticks",
+                                    value: &intent.edge_price.ticks(),
                                 },
                                 Field {
                                     key: "edge_ticks",
@@ -818,6 +834,12 @@ async fn main() {
 
                 // Sign and fire sells outside the lock.
                 for exit in exits {
+                    let fair_ticks = exit
+                        .fair_ticks
+                        .map_or_else(|| "-".to_string(), |ticks| ticks.to_string());
+                    let fair_minus_bid_ticks = exit
+                        .fair_minus_bid_ticks
+                        .map_or_else(|| "-".to_string(), |ticks| ticks.to_string());
                     logline::log_event(
                         Level::Warn,
                         "exit_triggered",
@@ -845,6 +867,14 @@ async fn main() {
                             Field {
                                 key: "bid_ticks",
                                 value: &exit.bid.ticks(),
+                            },
+                            Field {
+                                key: "fair_ticks",
+                                value: &fair_ticks,
+                            },
+                            Field {
+                                key: "fair_minus_bid_ticks",
+                                value: &fair_minus_bid_ticks,
                             },
                             Field {
                                 key: "hold_us",
@@ -986,7 +1016,7 @@ async fn main() {
                     );
                 }
 
-                // 1. Expire unknown submits older than 30 s, and pending
+                // 1. Expire stale unknown submits, and pending
                 //    claims older than 60 s (defensive — the spawned submit
                 //    task normally resolves the outcome in ≤ 2 s via HTTP
                 //    timeout, but a task panic or cancellation would
@@ -995,11 +1025,7 @@ async fn main() {
                 //    Traces to: _unknown_submit_expiry_loop in minimal_live_bot.py.
                 {
                     let mut c = core.lock().unwrap();
-                    let now = now_us();
-                    let unknown_cutoff = now.saturating_sub(30_000_000);
-                    let pending_cutoff = now.saturating_sub(60_000_000);
-                    c.inventory_mut().expire_unknowns(unknown_cutoff);
-                    c.inventory_mut().expire_pending(pending_cutoff);
+                    runtime::expire_stale_entry_claims(c.inventory_mut(), now_us());
                 }
 
                 // 2. Discover initial market or scheduled next market.

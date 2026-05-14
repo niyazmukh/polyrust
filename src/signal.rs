@@ -25,6 +25,7 @@ pub struct BuyIntent {
     pub side: OutcomeSide,
     pub token: TokenId,
     pub limit: PriceTick,
+    pub edge_price: PriceTick,
     pub edge_ticks: i32,
 }
 
@@ -171,12 +172,7 @@ impl SignalEngine {
         if self.strike <= 0.0 || tte_us < self.cfg.min_tte_us {
             return None;
         }
-        let latest = *self.samples.back()?;
-        let window_base = self.oldest_since(latest.ts_us.micros() - self.cfg.max_window_us)?;
-        let window_us = latest.ts_us.micros() - window_base.ts_us.micros();
-        if window_base.ts_us == latest.ts_us || window_us < self.cfg.min_window_us {
-            return None;
-        }
+        let (latest, window_base) = self.latest_window()?;
 
         let move_usd = latest.microprice - window_base.microprice;
         if move_usd.abs() < self.cfg.min_move_usd {
@@ -242,17 +238,19 @@ impl SignalEngine {
             );
             return None;
         }
+        let edge_slippage_ticks = (self.cfg.entry_slippage_ticks + 1) / 2;
+        let edge_price = PriceTick::checked(ask.ticks().checked_add(edge_slippage_ticks)?).ok()?;
 
         let p_yes = self.prob_yes(latest.microprice, latest.ts_us, tte_us)?;
         let side_prob_ticks = match side {
             OutcomeSide::Yes => p_yes * 100.0,
             OutcomeSide::No => (1.0 - p_yes) * 100.0,
         };
-        let edge_ticks_f = side_prob_ticks - f64::from(limit.ticks());
+        let edge_ticks_f = side_prob_ticks - f64::from(edge_price.ticks());
         let edge_ticks = edge_ticks_f.floor() as i32;
         let live_spread_ticks = quote
             .bid
-            .map(|bid| limit.ticks().saturating_sub(bid.ticks()))
+            .map(|bid| edge_price.ticks().saturating_sub(bid.ticks()))
             .unwrap_or(0)
             .max(0);
         let min_edge_ticks = self.cfg.min_edge_ticks.max(live_spread_ticks);
@@ -272,8 +270,23 @@ impl SignalEngine {
             side,
             token,
             limit,
+            edge_price,
             edge_ticks,
         })
+    }
+
+    pub fn fair_ticks_for_side(&self, side: OutcomeSide, now: TsUs, tte_us: i64) -> Option<i32> {
+        let (latest, _) = self.latest_window()?;
+        let lag_us = now.micros() - latest.ts_us.micros();
+        if self.cfg.max_lag_us > 0 && lag_us > self.cfg.max_lag_us {
+            return None;
+        }
+        let p_yes = self.prob_yes(latest.microprice, latest.ts_us, tte_us)?;
+        let side_prob_ticks = match side {
+            OutcomeSide::Yes => p_yes * 100.0,
+            OutcomeSide::No => (1.0 - p_yes) * 100.0,
+        };
+        Some(side_prob_ticks.floor() as i32)
     }
 
     fn debug_reject(gate: &str, move_usd: f64, ofi: f64, imbalance: f64, a: i64, b: i32) {
@@ -339,6 +352,16 @@ impl SignalEngine {
             .iter()
             .copied()
             .find(|sample| sample.ts_us.micros() >= cutoff_us)
+    }
+
+    fn latest_window(&self) -> Option<(SignalPoint, SignalPoint)> {
+        let latest = *self.samples.back()?;
+        let window_base = self.oldest_since(latest.ts_us.micros() - self.cfg.max_window_us)?;
+        let window_us = latest.ts_us.micros() - window_base.ts_us.micros();
+        if window_base.ts_us == latest.ts_us || window_us < self.cfg.min_window_us {
+            return None;
+        }
+        Some((latest, window_base))
     }
 
     fn ofi_sum_since(&self, cutoff_us: i64) -> f64 {

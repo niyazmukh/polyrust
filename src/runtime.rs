@@ -83,9 +83,14 @@ pub struct PreparedSellSubmit {
     pub body: SignedFakOrderBody,
 }
 
+pub const UNKNOWN_SUBMIT_EXPIRE_US: i64 = 5_000_000;
+pub const PENDING_SUBMIT_EXPIRE_US: i64 = 60_000_000;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExitReason {
     Drop,
+    Stop,
+    Value,
     Hold,
 }
 
@@ -93,6 +98,8 @@ impl ExitReason {
     pub fn as_str(self) -> &'static str {
         match self {
             ExitReason::Drop => "drop",
+            ExitReason::Stop => "stop",
+            ExitReason::Value => "value",
             ExitReason::Hold => "hold",
         }
     }
@@ -107,6 +114,8 @@ pub struct ExitDecision {
     pub peak_bid: PriceTick,
     pub bid: PriceTick,
     pub hold_us: i64,
+    pub fair_ticks: Option<i32>,
+    pub fair_minus_bid_ticks: Option<i32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -115,7 +124,8 @@ struct ExitTracker {
     entry_bid: PriceTick,
     peak_bid: PriceTick,
     fill_ts_us: i64,
-    fired: Option<ExitReason>,
+    stop_fired: bool,
+    hold_fired: bool,
 }
 
 /// Snapshot of the inputs needed to sign a FAK SELL, computable purely
@@ -154,6 +164,8 @@ pub struct RuntimeCore {
     sell_slippage_ticks: i32,
     exit_drop_ticks: i32,
     exit_arm_ticks: i32,
+    exit_stop_ticks: i32,
+    exit_edge_ticks: i32,
     exit_hold_us: i64,
     exit_trackers: HashMap<TokenId, ExitTracker>,
 }
@@ -168,6 +180,8 @@ impl RuntimeCore {
             sell_slippage_ticks: config.sell_slippage_cents,
             exit_drop_ticks: config.exit_drop_ticks,
             exit_arm_ticks: config.exit_arm_ticks,
+            exit_stop_ticks: config.exit_stop_ticks,
+            exit_edge_ticks: config.exit_edge_ticks,
             exit_hold_us: config.exit_hold_us,
             exit_trackers: HashMap::new(),
         })
@@ -252,7 +266,8 @@ impl RuntimeCore {
                             entry_bid: current_bid,
                             peak_bid: current_bid.max(trade.price),
                             fill_ts_us: trade.ts_us,
-                            fired: None,
+                            stop_fired: false,
+                            hold_fired: false,
                         },
                     );
                 }
@@ -265,20 +280,26 @@ impl RuntimeCore {
         }
     }
 
-    /// Build FAK SELL plans for active-market inventory only when the
-    /// bid-trailing exit has fired and no SELL is already in flight.
+    /// Build FAK SELL plans for active-market inventory when time, local
+    /// stop, or fair-value exit logic fires and no SELL is already in flight.
     pub fn plan_exits(
         &mut self,
         in_flight: &HashSet<TokenId>,
         now_ts_us: i64,
     ) -> Vec<ExitDecision> {
         let mut out = Vec::new();
-        let tokens: Vec<_> = self
-            .state
-            .market()
-            .map(|m| vec![m.yes_token.clone(), m.no_token.clone()])
-            .unwrap_or_default();
-        for token in tokens {
+        let Some(market) = self.state.market().cloned() else {
+            return out;
+        };
+        let tte_us = market
+            .end_ts
+            .saturating_mul(1_000_000)
+            .saturating_sub(now_ts_us);
+        let tokens = [
+            (market.yes_token.clone(), OutcomeSide::Yes),
+            (market.no_token.clone(), OutcomeSide::No),
+        ];
+        for (token, side) in tokens {
             if in_flight.contains(&token) {
                 continue;
             }
@@ -293,44 +314,59 @@ impl RuntimeCore {
             let Some(bid) = self.state.quote_for_token(&token).and_then(|q| q.bid) else {
                 continue;
             };
+            let fair_ticks = self
+                .signal
+                .fair_ticks_for_side(side, TsUs(now_ts_us), tte_us);
             let Some(tracker) = self.exit_trackers.get_mut(&token) else {
                 continue;
             };
             tracker.peak_bid = tracker.peak_bid.max(bid);
             let hold_us = now_ts_us.saturating_sub(tracker.fill_ts_us);
-            let reason = tracker.fired.or_else(|| {
-                let profit_ticks = tracker.peak_bid.ticks() - tracker.entry_price.ticks();
-                let peak_drop_ticks = tracker.peak_bid.ticks() - bid.ticks();
-                let adverse_drop_ticks = tracker.entry_bid.ticks() - bid.ticks();
-                let profit_drop =
-                    profit_ticks >= self.exit_arm_ticks && peak_drop_ticks >= self.exit_drop_ticks;
-                let adverse_drop = adverse_drop_ticks >= self.exit_drop_ticks;
-                if profit_drop || adverse_drop {
-                    Some(ExitReason::Drop)
-                } else if hold_us >= self.exit_hold_us {
-                    Some(ExitReason::Hold)
+            let reason = if tracker.hold_fired || hold_us >= self.exit_hold_us {
+                tracker.hold_fired = true;
+                Some(ExitReason::Hold)
+            } else if tracker.stop_fired
+                || bid.ticks() <= tracker.entry_bid.ticks() - self.exit_stop_ticks
+            {
+                tracker.stop_fired = true;
+                Some(ExitReason::Stop)
+            } else if let Some(fair_ticks) = fair_ticks {
+                let value_exit = fair_ticks <= bid.ticks().saturating_add(self.exit_edge_ticks);
+                if value_exit {
+                    let profit_ticks = tracker.peak_bid.ticks() - tracker.entry_price.ticks();
+                    let peak_drop_ticks = tracker.peak_bid.ticks() - bid.ticks();
+                    let profit_drop = profit_ticks >= self.exit_arm_ticks
+                        && peak_drop_ticks >= self.exit_drop_ticks;
+                    Some(if profit_drop {
+                        ExitReason::Drop
+                    } else {
+                        ExitReason::Value
+                    })
                 } else {
                     None
                 }
-            });
-            if let Some(reason) = reason {
-                tracker.fired = Some(reason);
-                if let Some(plan) = plan_sell_at_bid(
+            } else {
+                None
+            };
+            if let Some(reason) = reason
+                && let Some(plan) = plan_sell_at_bid(
                     &token,
                     &self.state,
                     &self.inventory,
                     self.sell_slippage_ticks,
-                ) {
-                    out.push(ExitDecision {
-                        plan,
-                        reason,
-                        entry_price: tracker.entry_price,
-                        entry_bid: tracker.entry_bid,
-                        peak_bid: tracker.peak_bid,
-                        bid,
-                        hold_us,
-                    });
-                }
+                )
+            {
+                out.push(ExitDecision {
+                    plan,
+                    reason,
+                    entry_price: tracker.entry_price,
+                    entry_bid: tracker.entry_bid,
+                    peak_bid: tracker.peak_bid,
+                    bid,
+                    hold_us,
+                    fair_ticks,
+                    fair_minus_bid_ticks: fair_ticks.map(|fair| fair - bid.ticks()),
+                });
             }
         }
         out
@@ -428,6 +464,11 @@ pub fn record_buy_submit_outcome(
             inventory.release_claim(submit_id);
         }
     }
+}
+
+pub fn expire_stale_entry_claims(inventory: &mut Inventory, now_ts_us: i64) {
+    inventory.expire_unknowns(now_ts_us.saturating_sub(UNKNOWN_SUBMIT_EXPIRE_US));
+    inventory.expire_pending(now_ts_us.saturating_sub(PENDING_SUBMIT_EXPIRE_US));
 }
 
 /// Compute a `SellPlan` for a FAK SELL at the current executable bid,
