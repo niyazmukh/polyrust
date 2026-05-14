@@ -55,8 +55,9 @@ same `core.lock()` as the signal decision. Pending stays alive until CONFIRMED
 
 **Exit rides executable bid.** BUY MATCHED starts a per-token bid tracker from
 the WSS fill price. The exit task wakes every 50ms, updates peak bid, and sells
-only after the bid arms (`EXIT_ARM_TICKS`) then drops (`EXIT_DROP_TICKS`), or
-after `EXIT_HOLD_US`. SELL remains FAK at current bid.
+when bid drops `EXIT_DROP_TICKS` from the protected bid after profit arm
+(`EXIT_ARM_TICKS`) or below entry, or after `EXIT_HOLD_US`. SELL remains FAK at
+current bid.
 
 **SELL submit is single-flight per token.** Inventory remains WSS-owned, and
 HTTP SELL responses never own balance. Once exit decides to sell, a token cannot

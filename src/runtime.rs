@@ -297,8 +297,12 @@ impl RuntimeCore {
             let hold_us = now_ts_us.saturating_sub(tracker.fill_ts_us);
             let reason = tracker.fired.or_else(|| {
                 let profit_ticks = tracker.peak_bid.ticks() - tracker.entry_price.ticks();
-                let drawdown_ticks = tracker.peak_bid.ticks() - bid.ticks();
-                if profit_ticks >= self.exit_arm_ticks && drawdown_ticks >= self.exit_drop_ticks {
+                let protected_bid = tracker.peak_bid.max(tracker.entry_price);
+                let drop_ticks = protected_bid.ticks() - bid.ticks();
+                let adverse_entry = bid.ticks() < tracker.entry_price.ticks();
+                if drop_ticks >= self.exit_drop_ticks
+                    && (profit_ticks >= self.exit_arm_ticks || adverse_entry)
+                {
                     Some(ExitReason::Drop)
                 } else if hold_us >= self.exit_hold_us {
                     Some(ExitReason::Hold)
