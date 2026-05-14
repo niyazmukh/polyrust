@@ -54,10 +54,10 @@ same `core.lock()` as the signal decision. Pending stays alive until CONFIRMED
 (blocks same-token re-entry). Rejected → claim deleted.
 
 **Exit rides executable bid.** BUY MATCHED starts a per-token bid tracker from
-the WSS fill price. The exit task wakes every 50ms, updates peak bid, and sells
-when bid drops `EXIT_DROP_TICKS` from the protected bid after profit arm
-(`EXIT_ARM_TICKS`) or below entry, or after `EXIT_HOLD_US`. SELL remains FAK at
-current bid.
+the WSS fill price and the executable entry bid. The exit task wakes every
+50ms, updates peak bid, and sells when bid drops `EXIT_DROP_TICKS` from peak
+after profit arm (`EXIT_ARM_TICKS`) or from the entry bid before profit, or
+after `EXIT_HOLD_US`. SELL remains FAK at current bid.
 
 **SELL submit is single-flight per token.** Inventory remains WSS-owned, and
 HTTP SELL responses never own balance. Once exit decides to sell, a token cannot
@@ -106,7 +106,8 @@ parsed user-channel trade updates inventory, including trade id, token, side,
 status, size atoms, matched submit id, and sellable balance after the update.
 
 **Exit decision** (WARNING level): logs `exit_triggered` with reason (`drop` or
-`hold`), entry ticks, peak bid ticks, current bid ticks, and hold time.
+`hold`), entry ticks, entry bid ticks, peak bid ticks, current bid ticks, and
+hold time.
 
 ## Build / Test
 

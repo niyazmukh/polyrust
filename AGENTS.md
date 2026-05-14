@@ -47,7 +47,7 @@ Rust-first low-latency FAK trading bot for Polymarket 5-minute binary options.
 ### SELL Lifecycle
 
 - BUY MATCHED starts a bid tracker from WSS fill price.
-- Exit wakes every 50ms: update peak bid, sell when bid drops `EXIT_DROP_TICKS` from protected bid after profit arm (`EXIT_ARM_TICKS`) or below entry, or on hold timeout (`EXIT_HOLD_US`).
+- Exit wakes every 50ms: update peak bid, sell when bid drops `EXIT_DROP_TICKS` from peak after profit arm (`EXIT_ARM_TICKS`) or from the executable entry bid before profit, or on hold timeout (`EXIT_HOLD_US`).
 - When exit fires: read sellable inventory, read bid, sign FAK SELL, submit, log.
 
 - Read sellable inventory → read bid → sign FAK SELL → submit → log.

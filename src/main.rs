@@ -835,6 +835,10 @@ async fn main() {
                                 value: &exit.entry_price.ticks(),
                             },
                             Field {
+                                key: "entry_bid_ticks",
+                                value: &exit.entry_bid.ticks(),
+                            },
+                            Field {
                                 key: "peak_bid_ticks",
                                 value: &exit.peak_bid.ticks(),
                             },

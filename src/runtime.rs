@@ -103,6 +103,7 @@ pub struct ExitDecision {
     pub plan: SellPlan,
     pub reason: ExitReason,
     pub entry_price: PriceTick,
+    pub entry_bid: PriceTick,
     pub peak_bid: PriceTick,
     pub bid: PriceTick,
     pub hold_us: i64,
@@ -111,6 +112,7 @@ pub struct ExitDecision {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ExitTracker {
     entry_price: PriceTick,
+    entry_bid: PriceTick,
     peak_bid: PriceTick,
     fill_ts_us: i64,
     fired: Option<ExitReason>,
@@ -247,6 +249,7 @@ impl RuntimeCore {
                         state.token.clone(),
                         ExitTracker {
                             entry_price: trade.price,
+                            entry_bid: current_bid,
                             peak_bid: current_bid.max(trade.price),
                             fill_ts_us: trade.ts_us,
                             fired: None,
@@ -297,12 +300,12 @@ impl RuntimeCore {
             let hold_us = now_ts_us.saturating_sub(tracker.fill_ts_us);
             let reason = tracker.fired.or_else(|| {
                 let profit_ticks = tracker.peak_bid.ticks() - tracker.entry_price.ticks();
-                let protected_bid = tracker.peak_bid.max(tracker.entry_price);
-                let drop_ticks = protected_bid.ticks() - bid.ticks();
-                let adverse_entry = bid.ticks() < tracker.entry_price.ticks();
-                if drop_ticks >= self.exit_drop_ticks
-                    && (profit_ticks >= self.exit_arm_ticks || adverse_entry)
-                {
+                let peak_drop_ticks = tracker.peak_bid.ticks() - bid.ticks();
+                let adverse_drop_ticks = tracker.entry_bid.ticks() - bid.ticks();
+                let profit_drop =
+                    profit_ticks >= self.exit_arm_ticks && peak_drop_ticks >= self.exit_drop_ticks;
+                let adverse_drop = adverse_drop_ticks >= self.exit_drop_ticks;
+                if profit_drop || adverse_drop {
                     Some(ExitReason::Drop)
                 } else if hold_us >= self.exit_hold_us {
                     Some(ExitReason::Hold)
@@ -322,6 +325,7 @@ impl RuntimeCore {
                         plan,
                         reason,
                         entry_price: tracker.entry_price,
+                        entry_bid: tracker.entry_bid,
                         peak_bid: tracker.peak_bid,
                         bid,
                         hold_us,
