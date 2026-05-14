@@ -207,7 +207,7 @@ impl Config {
                 reason: format!("negative value={exit_arm_ticks}"),
             });
         }
-        let exit_hold_us = env_i64_lookup(&mut lookup, "EXIT_HOLD_US").unwrap_or(15_000_000);
+        let exit_hold_us = env_i64_lookup(&mut lookup, "EXIT_HOLD_US").unwrap_or(30_000_000);
         if exit_hold_us <= 0 {
             return Err(ConfigError::Invalid {
                 name: "EXIT_HOLD_US",
