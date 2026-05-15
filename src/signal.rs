@@ -29,6 +29,23 @@ pub struct BuyIntent {
     pub edge_ticks: i32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Thesis {
+    Supports,
+    Weakens,
+    Opposes,
+}
+
+impl Thesis {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Thesis::Supports => "supports",
+            Thesis::Weakens => "weakens",
+            Thesis::Opposes => "opposes",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct SignalConfig {
     pub max_lag_us: i64,
@@ -139,6 +156,51 @@ impl SignalEngine {
         self.last_ask = sample.ask;
         self.last_bid_qty = sample.bid_qty;
         self.last_ask_qty = sample.ask_qty;
+        if logline::enabled(Level::Debug) {
+            let src_ts_us = sample.ts_us.micros();
+            logline::log_event(
+                Level::Debug,
+                "binance_sample",
+                &[
+                    Field {
+                        key: "src_ts_us",
+                        value: &src_ts_us,
+                    },
+                    Field {
+                        key: "update_id",
+                        value: &sample.update_id,
+                    },
+                    Field {
+                        key: "bid",
+                        value: &sample.bid,
+                    },
+                    Field {
+                        key: "ask",
+                        value: &sample.ask,
+                    },
+                    Field {
+                        key: "bid_qty",
+                        value: &sample.bid_qty,
+                    },
+                    Field {
+                        key: "ask_qty",
+                        value: &sample.ask_qty,
+                    },
+                    Field {
+                        key: "microprice",
+                        value: &sample.microprice,
+                    },
+                    Field {
+                        key: "ofi",
+                        value: &ofi,
+                    },
+                    Field {
+                        key: "imbalance",
+                        value: &imbalance,
+                    },
+                ],
+            );
+        }
         true
     }
 
@@ -275,18 +337,29 @@ impl SignalEngine {
         })
     }
 
-    pub fn fair_ticks_for_side(&self, side: OutcomeSide, now: TsUs, tte_us: i64) -> Option<i32> {
-        let (latest, _) = self.latest_window()?;
+    pub fn thesis_for_side(&self, side: OutcomeSide, now: TsUs) -> Option<Thesis> {
+        let (latest, window_base) = self.latest_window()?;
         let lag_us = now.micros() - latest.ts_us.micros();
-        if self.cfg.max_lag_us > 0 && lag_us > self.cfg.max_lag_us {
+        if lag_us < 0 || (self.cfg.max_lag_us > 0 && lag_us > self.cfg.max_lag_us) {
             return None;
         }
-        let p_yes = self.prob_yes(latest.microprice, latest.ts_us, tte_us)?;
-        let side_prob_ticks = match side {
-            OutcomeSide::Yes => p_yes * 100.0,
-            OutcomeSide::No => (1.0 - p_yes) * 100.0,
+        let sign = match side {
+            OutcomeSide::Yes => 1.0,
+            OutcomeSide::No => -1.0,
         };
-        Some(side_prob_ticks.floor() as i32)
+        let signed_move = sign * (latest.microprice - window_base.microprice);
+        let signed_ofi = sign * self.ofi_sum_since(latest.ts_us.micros() - self.cfg.max_window_us);
+        let signed_imbalance = sign * latest.imbalance;
+        if signed_move >= 0.0 && signed_ofi >= 0.0 && signed_imbalance >= 0.0 {
+            Some(Thesis::Supports)
+        } else if signed_move <= -self.cfg.min_move_usd
+            && signed_ofi <= -self.cfg.min_abs_ofi
+            && signed_imbalance <= -self.cfg.min_imbalance
+        {
+            Some(Thesis::Opposes)
+        } else {
+            Some(Thesis::Weakens)
+        }
     }
 
     fn debug_reject(gate: &str, move_usd: f64, ofi: f64, imbalance: f64, a: i64, b: i32) {

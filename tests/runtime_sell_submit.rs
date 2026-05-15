@@ -69,21 +69,17 @@ fn buy_trade(price_ticks: i32, size_atoms: i64) -> UserTrade {
         side: OrderSide::Buy,
         size_atoms: SharesAtoms(size_atoms),
         price: PriceTick::checked(price_ticks).unwrap(),
-        status: TradeStatus::Confirmed,
+        status: TradeStatus::Matched,
         ts_us: 100,
     }
 }
 
 fn apply_buy_raw(core: &mut RuntimeCore, price_ticks: i32, size: &str, ts_us: i64) {
-    apply_buy_raw_with_status(core, price_ticks, size, ts_us, "CONFIRMED");
+    apply_buy_raw_with_status(core, price_ticks, size, ts_us, "MATCHED");
 }
 
 fn apply_buy_matched_raw(core: &mut RuntimeCore, price_ticks: i32, size: &str, ts_us: i64) {
     apply_buy_raw_with_status(core, price_ticks, size, ts_us, "MATCHED");
-}
-
-fn apply_buy_confirmed_raw(core: &mut RuntimeCore, price_ticks: i32, size: &str, ts_us: i64) {
-    apply_buy_raw_with_status(core, price_ticks, size, ts_us, "CONFIRMED");
 }
 
 fn apply_buy_raw_with_status(
@@ -138,7 +134,6 @@ fn cfg() -> minirust::config::Config {
         exit_drop_ticks: 2,
         exit_arm_ticks: 2,
         exit_stop_ticks: 3,
-        exit_edge_ticks: 0,
         exit_hold_us: 15_000_000,
         prob_sigma_scale: 1.0,
         prob_sigma_floor_usd: 2.0,
@@ -193,12 +188,71 @@ fn sample(ts_us: i64, update_id: i64, microprice: f64) -> BinanceSample {
     }
 }
 
+fn book_sample(
+    ts_us: i64,
+    update_id: i64,
+    bid: f64,
+    ask: f64,
+    bid_qty: f64,
+    ask_qty: f64,
+) -> BinanceSample {
+    BinanceSample {
+        ts_us: TsUs(ts_us),
+        update_id,
+        bid,
+        ask,
+        bid_qty,
+        ask_qty,
+        microprice: ((bid * ask_qty) + (ask * bid_qty)) / (bid_qty + ask_qty),
+    }
+}
+
 fn seed_signal_window(core: &mut RuntimeCore, latest_ts_us: i64, update_id: i64, microprice: f64) {
     core.signal_mut().set_strike(100.0, true);
     core.signal_mut()
         .push(sample(latest_ts_us - 300_000, update_id, microprice));
     core.signal_mut()
         .push(sample(latest_ts_us, update_id + 1, microprice));
+}
+
+fn seed_yes_weakens(core: &mut RuntimeCore, latest_ts_us: i64, update_id: i64) {
+    core.signal_mut().set_strike(100.0, true);
+    core.signal_mut().push(book_sample(
+        latest_ts_us - 300_000,
+        update_id,
+        99.0,
+        101.0,
+        4.0,
+        1.0,
+    ));
+    core.signal_mut().push(book_sample(
+        latest_ts_us,
+        update_id + 1,
+        101.0,
+        103.0,
+        1.0,
+        4.0,
+    ));
+}
+
+fn seed_yes_opposes(core: &mut RuntimeCore, latest_ts_us: i64, update_id: i64) {
+    core.signal_mut().set_strike(100.0, true);
+    core.signal_mut().push(book_sample(
+        latest_ts_us - 300_000,
+        update_id,
+        104.0,
+        106.0,
+        4.0,
+        1.0,
+    ));
+    core.signal_mut().push(book_sample(
+        latest_ts_us,
+        update_id + 1,
+        103.0,
+        105.0,
+        1.0,
+        4.0,
+    ));
 }
 
 fn update_bid(core: &mut RuntimeCore, bid: i32, ask: i32, ts_us: i64) {
@@ -265,22 +319,16 @@ fn plan_sell_at_bid_returns_none_without_executable_bid() {
 }
 
 #[test]
-fn exit_tracker_arms_on_buy_confirmed_not_matched() {
+fn exit_tracker_arms_on_buy_matched() {
     let mut core = core_with_bid_and_config(55, cfg_with_fixed_prob(55));
     seed_signal_window(&mut core, 999_000, 1, 102.0);
     apply_buy_matched_raw(&mut core, 50, "2.000000", 0);
 
     assert_eq!(
         core.inventory_mut().sellable(&token()),
-        Shares2::new_unchecked(0)
+        Shares2::new_unchecked(200)
     );
-    assert_eq!(core.plan_exits(&Default::default(), 1_000_000), Vec::new());
-
-    apply_buy_confirmed_raw(&mut core, 50, "2.000000", 100);
-
-    let exits = core.plan_exits(&Default::default(), 1_000_000);
-    assert_eq!(exits.len(), 1);
-    assert_eq!(exits[0].reason, ExitReason::Value);
+    assert_eq!(core.plan_exits(1_000_000), Vec::new());
 }
 
 #[test]
@@ -289,14 +337,14 @@ fn exit_tracker_holds_until_arm_and_drop() {
     seed_signal_window(&mut core, 899_000, 1, 300.0);
     apply_buy_raw(&mut core, 50, "2.000000", 0);
 
-    assert_eq!(core.plan_exits(&Default::default(), 800_000), Vec::new());
+    assert_eq!(core.plan_exits(800_000), Vec::new());
 
     update_bid(&mut core, 53, 55, 900_000);
-    assert_eq!(core.plan_exits(&Default::default(), 900_000), Vec::new());
+    assert_eq!(core.plan_exits(900_000), Vec::new());
 
-    seed_signal_window(&mut core, 999_000, 10, 100.0);
+    seed_yes_weakens(&mut core, 999_000, 10);
     update_bid(&mut core, 51, 54, 1_000_000);
-    let exits = core.plan_exits(&Default::default(), 1_000_000);
+    let exits = core.plan_exits(1_000_000);
     assert_eq!(exits.len(), 1);
     assert_eq!(exits[0].reason, ExitReason::Drop);
     assert_eq!(exits[0].plan.price, PriceTick::checked(51).unwrap());
@@ -309,7 +357,7 @@ fn exit_tracker_sells_after_hold_without_profit() {
     let mut core = core_with_bid(49);
     apply_buy_raw(&mut core, 50, "2.000000", 0);
 
-    let exits = core.plan_exits(&Default::default(), 15_000_100);
+    let exits = core.plan_exits(15_000_100);
     assert_eq!(exits.len(), 1);
     assert_eq!(exits[0].reason, ExitReason::Hold);
     assert_eq!(exits[0].plan.price, PriceTick::checked(49).unwrap());
@@ -318,12 +366,12 @@ fn exit_tracker_sells_after_hold_without_profit() {
 #[test]
 fn exit_tracker_stops_when_bid_drops_below_entry_bid() {
     let mut core = core_with_bid(50);
-    seed_signal_window(&mut core, 999_000, 1, 200.0);
+    seed_yes_opposes(&mut core, 999_000, 1);
     apply_buy_raw(&mut core, 50, "2.000000", 0);
 
     update_bid(&mut core, 47, 50, 1_000_000);
 
-    let exits = core.plan_exits(&Default::default(), 1_000_000);
+    let exits = core.plan_exits(1_000_000);
     assert_eq!(exits.len(), 1);
     assert_eq!(exits[0].reason, ExitReason::Stop);
     assert_eq!(exits[0].plan.price, PriceTick::checked(47).unwrap());
@@ -334,69 +382,95 @@ fn exit_tracker_stops_when_bid_drops_below_entry_bid() {
 #[test]
 fn exit_tracker_uses_entry_bid_for_adverse_drop() {
     let mut core = core_with_bid(32);
-    seed_signal_window(&mut core, 4_599_000, 1, 200.0);
+    seed_yes_opposes(&mut core, 4_599_000, 1);
     apply_buy_raw(&mut core, 33, "2.000000", 0);
 
     update_bid(&mut core, 30, 33, 4_500_000);
-    assert_eq!(core.plan_exits(&Default::default(), 4_500_000), Vec::new());
+    assert_eq!(core.plan_exits(4_500_000), Vec::new());
 
     update_bid(&mut core, 29, 32, 4_600_000);
-    let exits = core.plan_exits(&Default::default(), 4_600_000);
+    let exits = core.plan_exits(4_600_000);
     assert_eq!(exits.len(), 1);
     assert_eq!(exits[0].reason, ExitReason::Stop);
     assert_eq!(exits[0].plan.price, PriceTick::checked(29).unwrap());
 }
 
 #[test]
-fn exit_tracker_sells_when_fair_value_no_longer_exceeds_bid() {
-    let mut core = core_with_bid_and_config(55, cfg_with_fixed_prob(55));
-    seed_signal_window(&mut core, 999_000, 1, 102.0);
+fn exit_tracker_sells_when_binance_thesis_opposes_side() {
+    let mut core = core_with_bid(55);
+    seed_yes_opposes(&mut core, 999_000, 1);
     apply_buy_raw(&mut core, 50, "2.000000", 0);
 
-    let exits = core.plan_exits(&Default::default(), 1_000_000);
+    let exits = core.plan_exits(1_000_000);
     assert_eq!(exits.len(), 1);
-    assert_eq!(exits[0].reason, ExitReason::Value);
+    assert_eq!(exits[0].reason, ExitReason::Opposite);
     assert_eq!(exits[0].plan.price, PriceTick::checked(55).unwrap());
-    assert_eq!(exits[0].fair_ticks, Some(55));
-    assert_eq!(exits[0].fair_minus_bid_ticks, Some(0));
 }
 
 #[test]
-fn value_exit_is_not_sticky_after_model_recovers() {
+fn exit_repeats_until_sell_matched_clears_inventory() {
     let mut core = core_with_bid(55);
-    seed_signal_window(&mut core, 999_000, 1, 100.0);
+    seed_yes_opposes(&mut core, 999_000, 1);
     apply_buy_raw(&mut core, 50, "2.000000", 0);
 
-    let exits = core.plan_exits(&Default::default(), 1_000_000);
+    let first = core.plan_exits(1_000_000);
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].reason, ExitReason::Opposite);
+
+    let second = core.plan_exits(1_050_000);
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].reason, ExitReason::Opposite);
+
+    apply_sell_raw(&mut core, 55, "2.000000", 1_100_000);
+    assert_eq!(core.plan_exits(1_150_000), Vec::new());
+}
+
+#[test]
+fn opposite_exit_is_not_sticky_after_thesis_recovers() {
+    let mut core = core_with_bid(55);
+    seed_yes_opposes(&mut core, 999_000, 1);
+    apply_buy_raw(&mut core, 50, "2.000000", 0);
+
+    let exits = core.plan_exits(1_000_000);
     assert_eq!(exits.len(), 1);
-    assert_eq!(exits[0].reason, ExitReason::Value);
+    assert_eq!(exits[0].reason, ExitReason::Opposite);
 
     seed_signal_window(&mut core, 1_999_000, 10, 300.0);
     update_bid(&mut core, 56, 57, 2_000_000);
-    assert_eq!(core.plan_exits(&Default::default(), 2_000_000), Vec::new());
+    assert_eq!(core.plan_exits(2_000_000), Vec::new());
 }
 
 #[test]
-fn profitable_pullback_holds_while_fair_value_still_supports_side() {
+fn profitable_pullback_holds_while_binance_thesis_supports_side() {
     let mut core = core_with_bid(68);
     seed_signal_window(&mut core, 7_999_000, 1, 300.0);
     apply_buy_raw(&mut core, 69, "2.000000", 0);
 
     update_bid(&mut core, 78, 79, 7_500_000);
-    assert_eq!(core.plan_exits(&Default::default(), 7_500_000), Vec::new());
+    assert_eq!(core.plan_exits(7_500_000), Vec::new());
 
     update_bid(&mut core, 76, 79, 8_000_000);
-    assert_eq!(core.plan_exits(&Default::default(), 8_000_000), Vec::new());
+    assert_eq!(core.plan_exits(8_000_000), Vec::new());
 }
 
 #[test]
-fn adverse_collapse_stops_even_when_fair_value_supports_side() {
+fn adverse_collapse_holds_while_binance_thesis_supports_side() {
     let mut core = core_with_bid(55);
     seed_signal_window(&mut core, 999_000, 1, 300.0);
     apply_buy_raw(&mut core, 56, "2.000000", 0);
 
     update_bid(&mut core, 52, 54, 1_000_000);
-    let exits = core.plan_exits(&Default::default(), 1_000_000);
+    assert_eq!(core.plan_exits(1_000_000), Vec::new());
+}
+
+#[test]
+fn adverse_collapse_stops_when_binance_no_longer_supports_side() {
+    let mut core = core_with_bid(55);
+    seed_yes_weakens(&mut core, 999_000, 1);
+    apply_buy_raw(&mut core, 56, "2.000000", 0);
+
+    update_bid(&mut core, 52, 54, 1_000_000);
+    let exits = core.plan_exits(1_000_000);
     assert_eq!(exits.len(), 1);
     assert_eq!(exits[0].reason, ExitReason::Stop);
     assert_eq!(exits[0].plan.price, PriceTick::checked(52).unwrap());
@@ -408,9 +482,9 @@ fn exit_tracker_clears_after_sell_trade_and_market_rotation() {
     apply_buy_raw(&mut core, 50, "2.000000", 0);
     apply_sell_raw(&mut core, 53, "2.000000", 200);
 
-    assert_eq!(core.plan_exits(&Default::default(), 15_000_100), Vec::new());
+    assert_eq!(core.plan_exits(15_000_100), Vec::new());
 
     apply_buy_raw(&mut core, 50, "2.000000", 300);
     core.release_market_scope([&no_token()]);
-    assert_eq!(core.plan_exits(&Default::default(), 15_000_100), Vec::new());
+    assert_eq!(core.plan_exits(15_000_100), Vec::new());
 }

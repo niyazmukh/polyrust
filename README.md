@@ -36,11 +36,10 @@ src/
 **WSS is inventory truth.** User-channel trade events own inventory. HTTP
 submit responses classify outcomes but don't own inventory.
 
-**BUY inventory applies on CONFIRMED.** MATCHED binds the pending submit and
-keeps duplicate BUY blocked, but local sellable inventory waits for CONFIRMED
-because live CLOB rejected early resale attempts before confirmation. SELL
-inventory still applies on MATCHED so a matched SELL clears local sellable
-balance immediately and prevents duplicate resale attempts.
+**BUY inventory applies on MATCHED.** MATCHED binds the pending submit, keeps
+duplicate BUY blocked, and makes the position locally sellable for the 50ms
+exit loop. CONFIRMED is idempotent finality. SELL inventory also applies on
+MATCHED so a matched SELL clears local sellable balance immediately.
 
 **No flat-start check.** Old positions on expired markets resolve automatically.
 The bot only trades the current 5-minute window discovered via Gamma.
@@ -60,19 +59,18 @@ after the live timeout window.
 math charges half that cap rounded up as the expected fill debit, because a
 marketable FAK BUY starts at the best ask and only walks the book if needed.
 
-**Exit is fair-value gated.** BUY CONFIRMED starts a per-token bid tracker from
-the WSS fill price and executable entry bid. The exit task wakes every 50ms,
-updates peak bid, and sells on hard hold timeout (`EXIT_HOLD_US`), hard local
-stop (`EXIT_STOP_TICKS` below entry bid), or when the same Binance probability
-model used for entry no longer values the held side above current bid plus
-`EXIT_EDGE_TICKS`. A profitable pullback logs as `drop` only when the fair-value
-gate also says holding no longer pays. SELL remains FAK at current bid.
+**Exit is thesis-gated.** BUY MATCHED starts a per-token bid tracker from the
+WSS fill price and executable entry bid. The exit task wakes every 50ms, updates
+peak bid, and sells on hard hold timeout (`EXIT_HOLD_US`), local stop when
+Polymarket bid falls below entry bid and Binance no longer supports the held
+side, a strong opposite Binance thesis, or a profitable Polymarket pullback
+after Binance weakening. SELL remains FAK at current bid.
 
-**SELL submit is single-flight per token.** Inventory remains WSS-owned, and
-HTTP SELL responses never own balance. Once exit decides to sell, a token cannot
-submit another FAK SELL until the prior HTTP outcome returns. This prevents
-repeated full-size SELLs from colliding with venue-side reservations under
-transport uncertainty.
+**SELL retries until WSS clears inventory.** Inventory remains WSS-owned, and
+HTTP SELL responses never own balance. While exit logic fires and local
+inventory remains sellable, the 50ms exit loop may submit another FAK SELL even
+if an earlier SELL HTTP outcome is still unknown. SELL MATCHED clears inventory
+and stops further attempts.
 
 **User WSS scoped to the active market.** `user_wss_trusted` starts false,
 set true after the auth frame with the active condition ID is successfully
@@ -114,13 +112,17 @@ versus intentional price-band rejections.
 1s intervals for 15s after each signal fires. Zero hot-path overhead —
 runs in a spawned task off the critical path.
 
+**Stream trace** (DEBUG level): logs normalized `binance_sample` and
+`poly_quote` rows through the existing non-blocking logger. When DEBUG is off,
+the hot path pays only the logger's level check.
+
 **User trade application** (WARNING level): logs `user_trade_applied` after a
 parsed user-channel trade updates inventory, including trade id, token, side,
 status, size atoms, matched submit id, and sellable balance after the update.
 
 **Exit decision** (WARNING level): logs `exit_triggered` with reason (`stop`,
-`value`, `drop`, or `hold`), entry ticks, entry bid ticks, peak bid ticks,
-current bid ticks, fair ticks, fair-minus-bid ticks, and hold time.
+`opposite`, `drop`, or `hold`), entry ticks, entry bid ticks, peak bid ticks,
+current bid ticks, Binance thesis, and hold time.
 
 ## Build / Test
 
@@ -178,9 +180,9 @@ Runtime mapping from docs:
 * No flat-start check — WSS authority handles restart-with-position.
 * No early next-window promotion — rotation is scheduled at `end_ts - 5s`.
 * No rotation blocker — old markets resolve automatically at expiry.
-* No force-exit task - the 50ms exit task owns fair-value-gated SELL decisions.
-* No SELL inventory state/locks/cooldowns — submit concurrency is single-flight
-  per token to avoid duplicate full-size FAKs while an HTTP outcome is pending.
+* No force-exit task - the 50ms exit task owns thesis-gated SELL decisions.
+* No SELL inventory state/locks/cooldowns — the 50ms exit loop retries while
+  WSS-owned inventory remains sellable.
 * No full SDK order builder — signing is local, synchronous, on-demand.
 * No analyzer — off-runtime by doctrine.
 * No GTC/GTD — FAK only.

@@ -5,6 +5,7 @@
 
 use serde_json::Value;
 
+use crate::logline::{self, Field, Level};
 use crate::state::RuntimeState;
 use crate::types::{ConditionId, PriceTick, SharesAtoms, TokenId, TsUs};
 
@@ -57,6 +58,40 @@ pub fn apply_market_events(events: &[MarketEvent], state: &mut RuntimeState, ts_
             MarketEvent::Quote(q) => {
                 if state.update_quote(q.token.clone(), q.bid, q.ask, q.tick, ts_us) {
                     applied += 1;
+                    if logline::enabled(Level::Debug) {
+                        let recv_us = ts_us.micros();
+                        let side = state
+                            .side_for_token(&q.token)
+                            .map_or("-", |side| side.as_str());
+                        let bid_ticks = q.bid.map_or(-1, |bid| bid.ticks());
+                        let ask_ticks = q.ask.map_or(-1, |ask| ask.ticks());
+                        logline::log_event(
+                            Level::Debug,
+                            "poly_quote",
+                            &[
+                                Field {
+                                    key: "recv_us",
+                                    value: &recv_us,
+                                },
+                                Field {
+                                    key: "token_id",
+                                    value: &q.token.as_str(),
+                                },
+                                Field {
+                                    key: "side",
+                                    value: &side,
+                                },
+                                Field {
+                                    key: "bid_ticks",
+                                    value: &bid_ticks,
+                                },
+                                Field {
+                                    key: "ask_ticks",
+                                    value: &ask_ticks,
+                                },
+                            ],
+                        );
+                    }
                 }
             }
             MarketEvent::Resolved { condition_id } => {

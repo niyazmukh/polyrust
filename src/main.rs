@@ -642,8 +642,8 @@ async fn main() {
 
     // --- User WS task ---
     // Trade events own inventory (WSS authority). BUY inventory becomes
-    // locally sellable on CONFIRMED; SELL clears local sellable balance
-    // on MATCHED.
+    // locally sellable on MATCHED; SELL clears local sellable balance on
+    // MATCHED.
     let user_task = {
         let core = core.clone();
         let user_url = launch.poly_user_ws_url.clone();
@@ -743,7 +743,7 @@ async fn main() {
                         }
                     }
                     // No immediate sell trigger here. The exit_task (50ms loop)
-                    // handles selling once CONFIRMED BUY inventory is visible.
+                    // handles selling once MATCHED BUY inventory is visible.
                 },
                 {
                     let ca = core_disconnect.clone();
@@ -768,12 +768,12 @@ async fn main() {
         })
     };
 
-    // --- Exit task: periodic SELL at executable bid, one in-flight per token ---
+    // --- Exit task: periodic SELL at executable bid ---
     // Traces to: minimal_live_bot.py:309-312 (_exit_loop),
     //   bot_orchestrator.py:464-538 (evaluate_exit).
-    // Principle: SELL does not own inventory, but submit concurrency is
-    // single-flight per token. Live evidence showed full-size FAK storms
-    // during transport uncertainty can consume venue-side reservations.
+    // Principle: SELL does not own inventory. While WSS inventory remains
+    // sellable, the 50ms exit loop keeps submitting FAK SELLs. WSS SELL
+    // MATCHED clears local inventory and stops the retry storm.
     let exit_task = {
         let core = core.clone();
         let sub = submitter.clone();
@@ -781,13 +781,11 @@ async fn main() {
         let sid = sell_id.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_micros(50_000));
-            let (done_tx, mut done_rx) = mpsc::channel::<(TokenId, SubmitOutcome)>(4);
-            let mut sell_in_flight = std::collections::HashSet::<TokenId>::new();
+            let (done_tx, mut done_rx) = mpsc::unbounded_channel::<(TokenId, SubmitOutcome)>();
             tick.tick().await;
             loop {
                 tick.tick().await;
                 while let Ok((token, outcome)) = done_rx.try_recv() {
-                    sell_in_flight.remove(&token);
                     let err = outcome.error_text().unwrap_or("-");
                     logline::log_event(
                         Level::Warn,
@@ -830,17 +828,12 @@ async fn main() {
                         Ok(c) => c,
                         Err(_) => continue,
                     };
-                    c.plan_exits(&sell_in_flight, now_us())
+                    c.plan_exits(now_us())
                 };
 
                 // Sign and fire sells outside the lock.
                 for exit in exits {
-                    let fair_ticks = exit
-                        .fair_ticks
-                        .map_or_else(|| "-".to_string(), |ticks| ticks.to_string());
-                    let fair_minus_bid_ticks = exit
-                        .fair_minus_bid_ticks
-                        .map_or_else(|| "-".to_string(), |ticks| ticks.to_string());
+                    let thesis = exit.thesis.map_or("-", |t| t.as_str());
                     logline::log_event(
                         Level::Warn,
                         "exit_triggered",
@@ -870,12 +863,8 @@ async fn main() {
                                 value: &exit.bid.ticks(),
                             },
                             Field {
-                                key: "fair_ticks",
-                                value: &fair_ticks,
-                            },
-                            Field {
-                                key: "fair_minus_bid_ticks",
-                                value: &fair_minus_bid_ticks,
+                                key: "thesis",
+                                value: &thesis,
                             },
                             Field {
                                 key: "hold_us",
@@ -904,12 +893,11 @@ async fn main() {
                             continue;
                         }
                     };
-                    sell_in_flight.insert(token.clone());
                     let sub2 = sub.clone();
                     let done_tx = done_tx.clone();
                     tokio::spawn(async move {
                         let outcome = sub2.submit_order(&prepared.body).await;
-                        let _ = done_tx.send((token, outcome)).await;
+                        let _ = done_tx.send((token, outcome));
                     });
                 }
             }

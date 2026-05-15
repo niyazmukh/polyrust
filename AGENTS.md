@@ -20,9 +20,9 @@ Rust-first low-latency FAK trading bot for Polymarket 5-minute binary options.
 
 7. **Fixed-point precision.** No f64 crosses the signed body boundary. Venue-facing values are integer ticks/cents/atoms. Silent rounding is forbidden.
 
-8. **WSS is inventory truth.** User WSS trade events own inventory. BUY MATCHED binds pending submit and blocks duplicate BUY, but BUY inventory becomes locally sellable only on CONFIRMED because live CLOB rejected early resale before confirmation. SELL MATCHED applies immediately to clear local sellable inventory and prevent duplicate resale. HTTP responses classify outcomes but don't own inventory. User WSS must subscribe to the active condition ID and receive rotation subscription updates. Trust starts false, granted on successful auth frame send (venue has no explicit auth ACK per official SDK — invalid creds cause server disconnect), revoked on disconnect/error.
+8. **WSS is inventory truth.** User WSS trade events own inventory. BUY MATCHED binds pending submit, blocks duplicate BUY, and makes inventory locally sellable for exit. CONFIRMED is idempotent finality. SELL MATCHED applies immediately to clear local sellable inventory and stop SELL retries. HTTP responses classify outcomes but don't own inventory. User WSS must subscribe to the active condition ID and receive rotation subscription updates. Trust starts false, granted on successful auth frame send (venue has no explicit auth ACK per official SDK — invalid creds cause server disconnect), revoked on disconnect/error.
 
-9. **FAK rejection is cheap, submit storms are not.** Don't over-protect BUY no-match, SELL no-match, or definitive SELL balance rejection. Rejected BUY deletes the claim. SELL does not own inventory, but SELL submission is single-flight per token until the HTTP outcome returns; this prevents repeated full-size FAKs from colliding with venue-side matched/open reservations during transport uncertainty.
+9. **FAK rejection is cheap, missed exits are not.** Don't over-protect BUY no-match, SELL no-match, or definitive SELL balance rejection. Rejected BUY deletes the claim. SELL does not own inventory; while WSS-owned inventory remains sellable and exit logic fires, the 50ms exit loop may submit another FAK SELL even if prior SELL HTTP outcomes are still unknown.
 
 10. **Official docs rule.** When in doubt, consult Polymarket/Binance official docs. Priority: live evidence > official docs > source code > tests > Graphify > comments > AI summaries.
 
@@ -32,7 +32,7 @@ Rust-first low-latency FAK trading bot for Polymarket 5-minute binary options.
 
 ### Inventory
 
-- BUY inventory applies on **CONFIRMED**. MATCHED binds pending submit and keeps duplicate BUY blocked, but does not create local sellable inventory.
+- BUY inventory applies on **MATCHED**. MATCHED binds pending submit, keeps duplicate BUY blocked, and creates local sellable inventory.
 - SELL inventory applies on **MATCHED** so local sellable inventory clears as soon as our SELL is matched.
 - Pending claim stays alive until terminal status (CONFIRMED/FAILED) to block duplicate BUY.
 - WSS-confirmed trade removes pending claim. Inventory is then the sole authority.
@@ -48,15 +48,15 @@ Rust-first low-latency FAK trading bot for Polymarket 5-minute binary options.
 
 ### SELL Lifecycle
 
-- BUY CONFIRMED starts a bid tracker from WSS fill price and executable entry bid.
-- Exit wakes every 50ms: update peak bid, sell on hold timeout (`EXIT_HOLD_US`), hard local stop (`EXIT_STOP_TICKS` below executable entry bid), or when the same Binance probability model used for entry no longer values the held side above current bid plus `EXIT_EDGE_TICKS`. A profitable pullback is `drop` only when this fair-value gate is also weak.
+- BUY MATCHED starts a bid tracker from WSS fill price and executable entry bid.
+- Exit wakes every 50ms: update peak bid, sell on hold timeout (`EXIT_HOLD_US`), local stop (`EXIT_STOP_TICKS` below executable entry bid) only when Binance no longer supports the held side, strong opposite Binance thesis, or profitable pullback after Binance weakening. A profitable pullback is `drop`; strong flow reversal is `opposite`.
 - When exit fires: read sellable inventory, read bid, sign FAK SELL, submit, log.
 
 - Read sellable inventory → read bid → sign FAK SELL → submit → log.
 - Inventory remains WSS-owned; HTTP SELL responses do not mutate balance.
-- At most one SELL submit may be in flight per token. The next retry is allowed only after the prior HTTP outcome returns.
+- SELL retries every exit loop while WSS-owned inventory remains sellable; SELL MATCHED clears inventory and stops retries.
 - No cooldown knobs, balance locks, REST reconciliation, force-exit tasks, or pending-inventory state.
-- Exit task wakes every 50ms, but token-level single-flight bounds submit concurrency.
+- Exit task wakes every 50ms and may overlap SELL submits for the same token when the exit condition persists.
 
 ### Market Rotation
 
@@ -88,11 +88,10 @@ Rust-first low-latency FAK trading bot for Polymarket 5-minute binary options.
 
 - flat-start position checks (WSS authority handles restart-with-position)
 - rotation blockers (old markets resolve automatically)
-- force-exit tasks (50ms exit task owns fair-value-gated SELL)
+- force-exit tasks (50ms exit task owns thesis-gated SELL)
 - max-position caps (same-token duplicate protection is sufficient in 2-token markets)
 - max-TTE gates (the 5-min market window IS the product boundary)
 - SELL inventory state of any kind
-- overlapping SELL submits for the same token
 - periodic rediscovery that can promote a future market before `end_ts - 5s`
 - old-market pending/inventory reconciliation
 - SDK network calls on the signal path
@@ -151,10 +150,10 @@ All must be true:
 - user WSS subscription includes active condition ID and updates on rotation
 - BUY claim atomic with intent, deleted on rejection, removed on CONFIRMED
 - UNKNOWN stays matchable, Accepted doesn't expire blindly
-- BUY CONFIRMED arms fair-value-gated exit; exit fires on `stop`, `value`, `drop`, or `hold`
-- SELL submit concurrency is single-flight per token; SELL does not own inventory
+- BUY MATCHED arms thesis-gated exit; exit fires on `stop`, `opposite`, `drop`, or `hold`
+- SELL retries while WSS-owned inventory remains sellable; SELL does not own inventory
 - UNKNOWN BUY submit stale expiry keeps late WSS matchability but unblocks same-token BUY after the live timeout window.
-- BUY inventory applies on CONFIRMED; SELL inventory applies on MATCHED
+- BUY inventory applies on MATCHED; SELL inventory applies on MATCHED
 - decimal validation is fixed-point
 - signature kind/funder fails closed
 - rotation occurs only at `end_ts - 5s`, forgets old state, clears signal ring

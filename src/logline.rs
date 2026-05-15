@@ -61,6 +61,10 @@ pub fn set_level(level: Level) {
     LEVEL_THRESHOLD.store(level as u8, Ordering::Relaxed);
 }
 
+pub fn enabled(level: Level) -> bool {
+    (level as u8) >= LEVEL_THRESHOLD.load(Ordering::Relaxed)
+}
+
 /// Single key/value entry for a log line.
 pub struct Field<'a> {
     pub key: &'a str,
@@ -144,7 +148,7 @@ fn now_us() -> i64 {
 
 /// Emit a structured log line if its level is at or above the threshold.
 pub fn log_event(level: Level, event: &str, fields: &[Field<'_>]) {
-    if (level as u8) < LEVEL_THRESHOLD.load(Ordering::Relaxed) {
+    if !enabled(level) {
         return;
     }
     let mut buf: Vec<u8> = Vec::with_capacity(256);

@@ -240,9 +240,9 @@ impl Inventory {
         let matched_submit = self.match_pending_submit(&trade);
 
         // Only remove matched Entry pending submits on terminal status.
-        // Between MATCHED and CONFIRMED the pending must stay alive to
-        // block duplicate same-token BUYs (owned_atoms is still 0 until
-        // CONFIRMED applies the inventory delta).
+        // Between MATCHED and CONFIRMED the pending stays alive to block
+        // duplicate same-token BUYs while WSS-owned inventory is already
+        // locally sellable for exit.
         if trade.status.terminal()
             && let Some(ref id) = matched_submit
             && self.pending.contains_key(id)
@@ -263,7 +263,7 @@ impl Inventory {
 
         let mut inventory_changed = false;
         let inventory_applying = match record.side {
-            OrderSide::Buy => trade.status == TradeStatus::Confirmed,
+            OrderSide::Buy => matches!(trade.status, TradeStatus::Matched | TradeStatus::Confirmed),
             OrderSide::Sell => {
                 matches!(trade.status, TradeStatus::Matched | TradeStatus::Confirmed)
             }
@@ -425,7 +425,7 @@ mod tests {
     }
 
     #[test]
-    fn matched_waits_confirmed_applies_inventory_once() {
+    fn matched_applies_inventory_once() {
         let mut inv = Inventory::new();
         let t = token("asset");
         let first = inv.apply_user_trade(trade(
@@ -434,8 +434,9 @@ mod tests {
             OrderSide::Buy,
             TradeStatus::Matched,
         ));
-        assert!(!first.applied);
-        assert_eq!(inv.owned_atoms(&t), SharesAtoms(0));
+        assert!(first.applied);
+        assert_eq!(inv.owned_atoms(&t), SharesAtoms(1_416_664));
+        assert_eq!(inv.sellable(&t), Shares2::new_unchecked(141));
 
         let confirmed = inv.apply_user_trade(trade(
             "tr1",
@@ -501,7 +502,7 @@ mod tests {
         assert!(!inv.has_entry_exposure_or_pending(&t));
 
         // MATCHED: pending is matched but NOT removed (not terminal yet).
-        // Inventory is not locally sellable until CONFIRMED.
+        // Inventory is locally sellable immediately for exit.
         let state = inv.apply_user_trade(UserTrade {
             trade_id: TradeId::new("late"),
             token: t.clone(),
@@ -514,9 +515,9 @@ mod tests {
         });
         assert_eq!(state.matched_submit, Some(id.clone()));
         assert!(inv.pending(&id).is_some()); // still alive until terminal
-        assert_eq!(inv.owned_atoms(&t), SharesAtoms(0));
+        assert_eq!(inv.owned_atoms(&t), SharesAtoms(1_000_000));
 
-        // CONFIRMED: inventory applies, pending removed.
+        // CONFIRMED: inventory stays idempotent, pending removed.
         let confirmed = inv.apply_user_trade(UserTrade {
             trade_id: TradeId::new("late"),
             token: t.clone(),
