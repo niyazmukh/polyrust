@@ -33,6 +33,7 @@ fn cfg() -> Config {
         exit_drop_ticks: 2,
         exit_arm_ticks: 2,
         exit_stop_ticks: 3,
+        exit_edge_ticks: 0,
         exit_hold_us: 15_000_000,
         prob_sigma_scale: 1.0,
         prob_sigma_floor_usd: 2.0,

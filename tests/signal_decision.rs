@@ -1,4 +1,4 @@
-use minirust::signal::{BinanceSample, SignalConfig, SignalEngine, Thesis};
+use minirust::signal::{BinanceSample, SignalConfig, SignalEngine};
 use minirust::state::{MarketContext, Quote};
 use minirust::types::{ConditionId, OutcomeSide, PriceTick, TokenId, TsUs};
 
@@ -81,31 +81,13 @@ fn sample(
 }
 
 #[test]
-fn thesis_for_side_uses_flow_not_absolute_strike_location() {
-    let mut engine = SignalEngine::new(cfg());
-    engine.set_strike(100.0, true);
-    engine.push(sample(28_000_000, 1, 104.0, 106.0, 4.0, 1.0));
-    engine.push(sample(29_000_000, 2, 103.0, 105.0, 1.0, 4.0));
-
+fn fair_ticks_for_side_requires_fresh_valid_window_strike_and_tte() {
+    let mut short_window = SignalEngine::new(cfg());
+    short_window.set_strike(100.0, true);
+    short_window.push(sample(28_900_000, 1, 99.0, 101.0, 1.0, 1.0));
+    short_window.push(sample(29_000_000, 2, 101.0, 103.0, 3.0, 1.0));
     assert_eq!(
-        engine.thesis_for_side(OutcomeSide::Yes, TsUs(29_010_000)),
-        Some(Thesis::Opposes)
-    );
-    assert_eq!(
-        engine.thesis_for_side(OutcomeSide::No, TsUs(29_010_000)),
-        Some(Thesis::Supports)
-    );
-}
-
-#[test]
-fn thesis_for_side_requires_fresh_valid_signal_window() {
-    let mut engine = SignalEngine::new(cfg());
-    engine.set_strike(100.0, true);
-    engine.push(sample(28_900_000, 1, 99.0, 101.0, 1.0, 1.0));
-    engine.push(sample(29_000_000, 2, 101.0, 103.0, 3.0, 1.0));
-
-    assert_eq!(
-        engine.thesis_for_side(OutcomeSide::Yes, TsUs(29_010_000)),
+        short_window.fair_ticks_for_side(OutcomeSide::Yes, TsUs(29_010_000), 60_000_000),
         None
     );
 
@@ -113,21 +95,69 @@ fn thesis_for_side_requires_fresh_valid_signal_window() {
     stale.set_strike(100.0, true);
     seed_window(&mut stale);
     assert_eq!(
-        stale.thesis_for_side(OutcomeSide::Yes, TsUs(29_300_001)),
+        stale.fair_ticks_for_side(OutcomeSide::Yes, TsUs(29_300_001), 60_000_000),
+        None
+    );
+
+    let mut missing_strike = SignalEngine::new(cfg());
+    seed_window(&mut missing_strike);
+    assert_eq!(
+        missing_strike.fair_ticks_for_side(OutcomeSide::Yes, TsUs(29_010_000), 60_000_000),
+        None
+    );
+
+    let mut invalid_tte = SignalEngine::new(cfg());
+    invalid_tte.set_strike(100.0, true);
+    seed_window(&mut invalid_tte);
+    assert_eq!(
+        invalid_tte.fair_ticks_for_side(OutcomeSide::Yes, TsUs(29_010_000), 0),
         None
     );
 }
 
 #[test]
-fn thesis_for_side_classifies_mixed_flow_as_weakens() {
+fn fair_ticks_for_side_matches_entry_probability_model() {
+    let mut engine = SignalEngine::new(cfg_with_fixed_prob(1, 63));
+    engine.set_strike(100.0, true);
+    seed_window(&mut engine);
+
+    assert_eq!(
+        engine.fair_ticks_for_side(OutcomeSide::Yes, TsUs(29_010_000), 60_000_000),
+        Some(63)
+    );
+    assert_eq!(
+        engine.fair_ticks_for_side(OutcomeSide::No, TsUs(29_010_000), 60_000_000),
+        Some(37)
+    );
+}
+
+#[test]
+fn opposes_side_uses_same_pressure_terms_as_entry() {
+    let mut engine = SignalEngine::new(cfg());
+    engine.set_strike(100.0, true);
+    engine.push(sample(28_000_000, 1, 104.0, 106.0, 4.0, 1.0));
+    engine.push(sample(29_000_000, 2, 103.0, 105.0, 1.0, 4.0));
+
+    assert_eq!(
+        engine.opposes_side(OutcomeSide::Yes, TsUs(29_010_000)),
+        Some(true)
+    );
+    assert_eq!(
+        engine.opposes_side(OutcomeSide::No, TsUs(29_010_000)),
+        Some(false)
+    );
+}
+
+#[test]
+fn opposes_side_does_not_treat_mixed_flow_as_opposite_pressure() {
     let mut engine = SignalEngine::new(cfg());
     engine.set_strike(100.0, true);
     engine.push(sample(28_000_000, 1, 99.0, 101.0, 4.0, 1.0));
     engine.push(sample(29_000_000, 2, 101.0, 103.0, 1.0, 4.0));
 
     assert_eq!(
-        engine.thesis_for_side(OutcomeSide::Yes, TsUs(29_010_000)),
-        Some(Thesis::Weakens)
+        engine.opposes_side(OutcomeSide::Yes, TsUs(29_010_000)),
+        Some(false)
     );
 }
 

@@ -26,6 +26,8 @@ use minirust::submit::{HttpSubmitter, SubmitOutcome};
 use minirust::types::{TokenId, TsUs};
 use tokio::sync::mpsc;
 
+const BUY_BURST: u64 = 2;
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -370,11 +372,11 @@ async fn main() {
                     }
                 }
 
-                // Signal decision + claim in one lock scope.
+                // Signal decision + burst claims in one lock scope.
                 // claim_entry() MUST be atomic with on_binance_sample():
-                // has_entry_exposure_or_pending checks the claim so a second
-                // Binance tick cannot slip in between intent production and
-                // claim registration.
+                // has_entry_exposure_or_pending checks these claims so a
+                // second Binance tick cannot slip in between intent
+                // production and claim registration.
                 // NOTE: dry-run does NOT claim — shadow mode must not create
                 // fake pending exposure that blocks future same-token BUYs.
                 let claimed = {
@@ -401,13 +403,17 @@ async fn main() {
                                 None
                             } else {
                                 let policy = c.buy_submit_policy();
-                                let claim_id = c.inventory_mut().claim_entry(
-                                    intent.token.clone(),
-                                    minirust::types::OrderSide::Buy,
-                                    minirust::types::SharesAtoms(1),
-                                    ts.micros(),
-                                );
-                                Some((policy, claim_id))
+                                let claim_ids = (0..BUY_BURST)
+                                    .map(|_| {
+                                        c.inventory_mut().claim_entry(
+                                            intent.token.clone(),
+                                            minirust::types::OrderSide::Buy,
+                                            minirust::types::SharesAtoms(1),
+                                            ts.micros(),
+                                        )
+                                    })
+                                    .collect::<Vec<_>>();
+                                Some((policy, claim_ids))
                             };
                             Some((intent, claim))
                         }
@@ -419,127 +425,135 @@ async fn main() {
                     let id = sig_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let decide_us = now_us();
                     hb_signals.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if let Some((policy, claim_id)) = claim {
+                    if let Some((policy, claim_ids)) = claim {
                         if let (Some(sub), Some(sign)) = (sub.as_ref(), sign.as_ref()) {
-                            let sub = sub.clone();
-                            let sign = sign.clone();
-                            let core2 = core.clone();
-                            let intent2 = intent.clone();
-                            let claim_id2 = claim_id.clone();
-                            let src_ts = sample.ts_us.micros();
-                            let recv_ts = ts.micros();
-                            tokio::spawn(async move {
-                                let prepared = match runtime::prepare_buy_submit(
-                                    &intent2,
-                                    policy,
-                                    &sign,
-                                    SignInputs {
-                                        salt: id,
-                                        timestamp_ms: now_ms(),
-                                    },
-                                    claim_id2,
-                                ) {
-                                    Ok(p) => p,
-                                    Err(e) => {
-                                        logline::log_event(
-                                            Level::Error,
-                                            "buy_prepare_failed",
-                                            &[Field {
-                                                key: "error",
-                                                value: &e.to_string().as_str(),
-                                            }],
-                                        );
-                                        // Release the claim so this token is
-                                        // unblocked for future BUYs.
-                                        if let Ok(mut c) = core2.lock() {
-                                            c.inventory_mut().release_claim(&claim_id);
+                            for (burst_ix, claim_id) in claim_ids.into_iter().enumerate() {
+                                let sub = sub.clone();
+                                let sign = sign.clone();
+                                let core2 = core.clone();
+                                let intent2 = intent.clone();
+                                let claim_id2 = claim_id.clone();
+                                let src_ts = sample.ts_us.micros();
+                                let recv_ts = ts.micros();
+                                tokio::spawn(async move {
+                                    let prepared = match runtime::prepare_buy_submit(
+                                        &intent2,
+                                        policy,
+                                        &sign,
+                                        SignInputs {
+                                            salt: id
+                                                .saturating_mul(BUY_BURST)
+                                                .saturating_add(burst_ix as u64),
+                                            timestamp_ms: now_ms(),
+                                        },
+                                        claim_id2,
+                                    ) {
+                                        Ok(p) => p,
+                                        Err(e) => {
+                                            logline::log_event(
+                                                Level::Error,
+                                                "buy_prepare_failed",
+                                                &[Field {
+                                                    key: "error",
+                                                    value: &e.to_string().as_str(),
+                                                }],
+                                            );
+                                            // Release the claim so this token is
+                                            // unblocked for future BUYs.
+                                            if let Ok(mut c) = core2.lock() {
+                                                c.inventory_mut().release_claim(&claim_id);
+                                            }
+                                            return;
                                         }
-                                        return;
-                                    }
-                                };
-
-                                let submit_us = now_us();
-                                let outcome = sub.submit_order(&prepared.body).await;
-                                let rtt_us = now_us() - submit_us;
-
-                                {
-                                    let mut c = match core2.lock() {
-                                        Ok(c) => c,
-                                        Err(_) => return,
                                     };
-                                    runtime::record_buy_submit_outcome(
-                                        c.inventory_mut(),
-                                        &prepared.submit_id,
-                                        &outcome,
-                                        now_us(),
-                                    );
-                                }
 
-                                let accepted = outcome.is_accepted();
-                                let err_text = outcome.error_text().unwrap_or("-");
-                                logline::log_event(
-                                    Level::Warn,
-                                    "buy_submit_outcome",
-                                    &[
-                                        Field {
-                                            key: "signal_id",
-                                            value: &(id as i64),
-                                        },
-                                        Field {
-                                            key: "side",
-                                            value: &intent2.side.as_str(),
-                                        },
-                                        Field {
-                                            key: "token_id",
-                                            value: &intent2.token.as_str(),
-                                        },
-                                        Field {
-                                            key: "limit_ticks",
-                                            value: &intent2.limit.ticks(),
-                                        },
-                                        Field {
-                                            key: "edge_price_ticks",
-                                            value: &intent2.edge_price.ticks(),
-                                        },
-                                        Field {
-                                            key: "edge_ticks",
-                                            value: &intent2.edge_ticks,
-                                        },
-                                        Field {
-                                            key: "accepted",
-                                            value: &accepted,
-                                        },
-                                        Field {
-                                            key: "http_status",
-                                            value: &(outcome.http_status() as i64),
-                                        },
-                                        Field {
-                                            key: "error",
-                                            value: &err_text,
-                                        },
-                                        Field {
-                                            key: "src_ts_us",
-                                            value: &src_ts,
-                                        },
-                                        Field {
-                                            key: "recv_us",
-                                            value: &recv_ts,
-                                        },
-                                        Field {
-                                            key: "decide_us",
-                                            value: &decide_us,
-                                        },
-                                        Field {
-                                            key: "submit_us",
-                                            value: &submit_us,
-                                        },
-                                        Field {
-                                            key: "rtt_us",
-                                            value: &rtt_us,
-                                        },
-                                    ],
-                                );
-                            });
+                                    let submit_us = now_us();
+                                    let outcome = sub.submit_order(&prepared.body).await;
+                                    let rtt_us = now_us() - submit_us;
+
+                                    {
+                                        let mut c = match core2.lock() {
+                                            Ok(c) => c,
+                                            Err(_) => return,
+                                        };
+                                        runtime::record_buy_submit_outcome(
+                                            c.inventory_mut(),
+                                            &prepared.submit_id,
+                                            &outcome,
+                                            now_us(),
+                                        );
+                                    }
+
+                                    let accepted = outcome.is_accepted();
+                                    let err_text = outcome.error_text().unwrap_or("-");
+                                    logline::log_event(
+                                        Level::Warn,
+                                        "buy_submit_outcome",
+                                        &[
+                                            Field {
+                                                key: "signal_id",
+                                                value: &(id as i64),
+                                            },
+                                            Field {
+                                                key: "burst_ix",
+                                                value: &(burst_ix as i64),
+                                            },
+                                            Field {
+                                                key: "side",
+                                                value: &intent2.side.as_str(),
+                                            },
+                                            Field {
+                                                key: "token_id",
+                                                value: &intent2.token.as_str(),
+                                            },
+                                            Field {
+                                                key: "limit_ticks",
+                                                value: &intent2.limit.ticks(),
+                                            },
+                                            Field {
+                                                key: "edge_price_ticks",
+                                                value: &intent2.edge_price.ticks(),
+                                            },
+                                            Field {
+                                                key: "edge_ticks",
+                                                value: &intent2.edge_ticks,
+                                            },
+                                            Field {
+                                                key: "accepted",
+                                                value: &accepted,
+                                            },
+                                            Field {
+                                                key: "http_status",
+                                                value: &(outcome.http_status() as i64),
+                                            },
+                                            Field {
+                                                key: "error",
+                                                value: &err_text,
+                                            },
+                                            Field {
+                                                key: "src_ts_us",
+                                                value: &src_ts,
+                                            },
+                                            Field {
+                                                key: "recv_us",
+                                                value: &recv_ts,
+                                            },
+                                            Field {
+                                                key: "decide_us",
+                                                value: &decide_us,
+                                            },
+                                            Field {
+                                                key: "submit_us",
+                                                value: &submit_us,
+                                            },
+                                            Field {
+                                                key: "rtt_us",
+                                                value: &rtt_us,
+                                            },
+                                        ],
+                                    );
+                                });
+                            }
                         }
                     } else {
                         // Dry-run: log the signal, no claim, no submit.
@@ -833,7 +847,11 @@ async fn main() {
 
                 // Sign and fire sells outside the lock.
                 for exit in exits {
-                    let thesis = exit.thesis.map_or("-", |t| t.as_str());
+                    let opposes = match exit.opposes {
+                        Some(true) => "true",
+                        Some(false) => "false",
+                        None => "-",
+                    };
                     logline::log_event(
                         Level::Warn,
                         "exit_triggered",
@@ -863,8 +881,20 @@ async fn main() {
                                 value: &exit.bid.ticks(),
                             },
                             Field {
-                                key: "thesis",
-                                value: &thesis,
+                                key: "sell_limit_ticks",
+                                value: &exit.plan.price.ticks(),
+                            },
+                            Field {
+                                key: "fair_ticks",
+                                value: &exit.fair_ticks.unwrap_or(-1),
+                            },
+                            Field {
+                                key: "fair_minus_bid_ticks",
+                                value: &exit.fair_minus_bid_ticks.unwrap_or(-999),
+                            },
+                            Field {
+                                key: "opposes",
+                                value: &opposes,
                             },
                             Field {
                                 key: "hold_us",

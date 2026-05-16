@@ -10,7 +10,7 @@ use crate::market::{MarketParseError, apply_market_events, parse_market_events};
 use crate::orders::{
     BuyCanonicalError, BuyCanonicalInput, canonical_buy_target_for_notional, canonical_sell_params,
 };
-use crate::signal::{BuyIntent, SignalEngine, Thesis};
+use crate::signal::{BuyIntent, SignalEngine};
 use crate::signing::{OrderSigner, SignInputs, SignedFakOrderBody, SigningError};
 use crate::state::RuntimeState;
 use crate::submit::SubmitOutcome;
@@ -88,18 +88,18 @@ pub const PENDING_SUBMIT_EXPIRE_US: i64 = 60_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExitReason {
+    Value,
     Drop,
     Stop,
-    Opposite,
     Hold,
 }
 
 impl ExitReason {
     pub fn as_str(self) -> &'static str {
         match self {
+            ExitReason::Value => "value",
             ExitReason::Drop => "drop",
             ExitReason::Stop => "stop",
-            ExitReason::Opposite => "opposite",
             ExitReason::Hold => "hold",
         }
     }
@@ -113,8 +113,10 @@ pub struct ExitDecision {
     pub entry_bid: PriceTick,
     pub peak_bid: PriceTick,
     pub bid: PriceTick,
+    pub fair_ticks: Option<i32>,
+    pub fair_minus_bid_ticks: Option<i32>,
+    pub opposes: Option<bool>,
     pub hold_us: i64,
-    pub thesis: Option<Thesis>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -123,7 +125,6 @@ struct ExitTracker {
     entry_bid: PriceTick,
     peak_bid: PriceTick,
     fill_ts_us: i64,
-    stop_fired: bool,
     hold_fired: bool,
 }
 
@@ -164,6 +165,7 @@ pub struct RuntimeCore {
     exit_drop_ticks: i32,
     exit_arm_ticks: i32,
     exit_stop_ticks: i32,
+    exit_edge_ticks: i32,
     exit_hold_us: i64,
     exit_trackers: HashMap<TokenId, ExitTracker>,
 }
@@ -179,6 +181,7 @@ impl RuntimeCore {
             exit_drop_ticks: config.exit_drop_ticks,
             exit_arm_ticks: config.exit_arm_ticks,
             exit_stop_ticks: config.exit_stop_ticks,
+            exit_edge_ticks: config.exit_edge_ticks,
             exit_hold_us: config.exit_hold_us,
             exit_trackers: HashMap::new(),
         })
@@ -263,7 +266,6 @@ impl RuntimeCore {
                             entry_bid: current_bid,
                             peak_bid: current_bid.max(trade.price),
                             fill_ts_us: trade.ts_us,
-                            stop_fired: false,
                             hold_fired: false,
                         },
                     );
@@ -277,9 +279,10 @@ impl RuntimeCore {
         }
     }
 
-    /// Build FAK SELL plans for active-market inventory when time, local
-    /// stop, opposite thesis, or weakening pullback logic fires. WSS SELL MATCHED clears
-    /// inventory; until then, each exit loop may submit another FAK SELL.
+    /// Build FAK SELL plans for active-market inventory when fair-value,
+    /// adverse-stop, or stale-model time-boundary logic fires. WSS SELL
+    /// MATCHED clears inventory; until then, each exit loop may submit
+    /// another FAK SELL.
     pub fn plan_exits(&mut self, now_ts_us: i64) -> Vec<ExitDecision> {
         let mut out = Vec::new();
         let Some(market) = self.state.market().cloned() else {
@@ -301,7 +304,14 @@ impl RuntimeCore {
             let Some(bid) = self.state.quote_for_token(&token).and_then(|q| q.bid) else {
                 continue;
             };
-            let thesis = self.signal.thesis_for_side(side, TsUs(now_ts_us));
+            let tte_us = market
+                .end_ts
+                .saturating_mul(1_000_000)
+                .saturating_sub(now_ts_us);
+            let fair_ticks = self
+                .signal
+                .fair_ticks_for_side(side, TsUs(now_ts_us), tte_us);
+            let opposes = self.signal.opposes_side(side, TsUs(now_ts_us));
             let Some(tracker) = self.exit_trackers.get_mut(&token) else {
                 continue;
             };
@@ -310,21 +320,29 @@ impl RuntimeCore {
             let bid_drop_ticks = tracker.entry_bid.ticks() - bid.ticks();
             let profit_ticks = tracker.peak_bid.ticks() - tracker.entry_price.ticks();
             let peak_drop_ticks = tracker.peak_bid.ticks() - bid.ticks();
-            let reason = if tracker.hold_fired || hold_us >= self.exit_hold_us {
+            let fair_minus_bid_ticks = fair_ticks.map(|fair| fair - bid.ticks());
+            let fair_supports_hold = fair_ticks
+                .map(|fair| fair > bid.ticks() + self.exit_edge_ticks && opposes != Some(true))
+                .unwrap_or(false);
+            let fair_value_exit = fair_ticks
+                .map(|fair| fair <= bid.ticks() + self.exit_edge_ticks && opposes == Some(true))
+                .unwrap_or(false);
+            let fair_boundary_exit = fair_ticks
+                .map(|fair| fair <= bid.ticks() + self.exit_edge_ticks)
+                .unwrap_or(true);
+            let reason = if tracker.hold_fired {
+                Some(ExitReason::Hold)
+            } else if bid_drop_ticks >= self.exit_stop_ticks && !fair_supports_hold {
+                Some(ExitReason::Stop)
+            } else if fair_value_exit {
+                if profit_ticks >= self.exit_arm_ticks && peak_drop_ticks >= self.exit_drop_ticks {
+                    Some(ExitReason::Drop)
+                } else {
+                    Some(ExitReason::Value)
+                }
+            } else if hold_us >= self.exit_hold_us && fair_boundary_exit {
                 tracker.hold_fired = true;
                 Some(ExitReason::Hold)
-            } else if tracker.stop_fired
-                || (bid_drop_ticks >= self.exit_stop_ticks && thesis != Some(Thesis::Supports))
-            {
-                tracker.stop_fired = true;
-                Some(ExitReason::Stop)
-            } else if thesis == Some(Thesis::Opposes) {
-                Some(ExitReason::Opposite)
-            } else if profit_ticks >= self.exit_arm_ticks
-                && peak_drop_ticks >= self.exit_drop_ticks
-                && matches!(thesis, Some(Thesis::Weakens | Thesis::Opposes))
-            {
-                Some(ExitReason::Drop)
             } else {
                 None
             };
@@ -343,8 +361,10 @@ impl RuntimeCore {
                     entry_bid: tracker.entry_bid,
                     peak_bid: tracker.peak_bid,
                     bid,
+                    fair_ticks,
+                    fair_minus_bid_ticks,
+                    opposes,
                     hold_us,
-                    thesis,
                 });
             }
         }

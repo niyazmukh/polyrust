@@ -55,16 +55,26 @@ same `core.lock()` as the signal decision. Pending stays alive until CONFIRMED
 UNKNOWN stays WSS-matchable, but stale UNKNOWN stops blocking same-token BUY
 after the live timeout window.
 
+**BUY burst.** Live mode sends two independent FAK BUY requests per signal at
+the same signed limit. Each has its own pending claim and salt. If both fill,
+user WSS applies the combined inventory; exit sells the full WSS sellable size.
+
 **BUY slippage split.** `MINIMAL_ENTRY_SLIPPAGE` is the FAK execution cap. Edge
 math charges half that cap rounded up as the expected fill debit, because a
 marketable FAK BUY starts at the best ask and only walks the book if needed.
 
-**Exit is thesis-gated.** BUY MATCHED starts a per-token bid tracker from the
-WSS fill price and executable entry bid. The exit task wakes every 50ms, updates
-peak bid, and sells on hard hold timeout (`EXIT_HOLD_US`), local stop when
-Polymarket bid falls below entry bid and Binance no longer supports the held
-side, a strong opposite Binance thesis, or a profitable Polymarket pullback
-after Binance weakening. SELL remains FAK at current bid.
+**Exit is pressure-confirmed fair-value.** BUY MATCHED starts a per-token bid
+tracker from the WSS fill price and executable entry bid. The exit task wakes
+every 50ms, updates peak bid, and sells when the same Binance probability model
+used for entry no longer values the held side above current bid plus
+`EXIT_EDGE_TICKS` and Binance move/OFI/imbalance all oppose the held side.
+An adverse stop below executable entry bid does not override a still-supported
+position; it fires when fair value is no longer supportive, pressure opposes,
+or the model is unavailable. The hold-time boundary sells only when fair value
+is weak/unavailable, so it no longer forces out supported winners. A profitable
+pullback is logged as `drop` only when the same fair-value and opposite-pressure
+gate fires. SELL remains FAK at current bid minus the configured execution
+concession.
 
 **SELL retries until WSS clears inventory.** Inventory remains WSS-owned, and
 HTTP SELL responses never own balance. While exit logic fires and local
@@ -104,9 +114,9 @@ src_ts_us → recv_us → decide_us → submit_us → outcome (rtt_us)
  [network]  [signal]   [spawn+sign]  [HTTP RTT]
 ```
 
-BUY submit outcomes also log `limit_ticks`, `edge_price_ticks`, and
-`edge_ticks`, so FAK no-match events can be separated into stale/slow execution
-versus intentional price-band rejections.
+BUY submit outcomes also log `limit_ticks`, `edge_price_ticks`, `edge_ticks`,
+and live `burst_ix`, so FAK no-match events can be separated into stale/slow
+execution versus intentional price-band rejections.
 
 **Post-signal price tracker** (INFO level): logs token bid and ask prices at
 1s intervals for 15s after each signal fires. Zero hot-path overhead —
@@ -121,8 +131,9 @@ parsed user-channel trade updates inventory, including trade id, token, side,
 status, size atoms, matched submit id, and sellable balance after the update.
 
 **Exit decision** (WARNING level): logs `exit_triggered` with reason (`stop`,
-`opposite`, `drop`, or `hold`), entry ticks, entry bid ticks, peak bid ticks,
-current bid ticks, Binance thesis, and hold time.
+`value`, `drop`, or `hold`), entry ticks, entry bid ticks, peak bid ticks,
+current bid ticks, signed SELL limit ticks, held-side fair ticks,
+fair-minus-bid ticks, opposite-pressure state, and hold time.
 
 ## Build / Test
 
@@ -180,7 +191,7 @@ Runtime mapping from docs:
 * No flat-start check — WSS authority handles restart-with-position.
 * No early next-window promotion — rotation is scheduled at `end_ts - 5s`.
 * No rotation blocker — old markets resolve automatically at expiry.
-* No force-exit task - the 50ms exit task owns thesis-gated SELL decisions.
+* No force-exit task - the 50ms exit task owns pressure-confirmed fair-value SELL decisions.
 * No SELL inventory state/locks/cooldowns — the 50ms exit loop retries while
   WSS-owned inventory remains sellable.
 * No full SDK order builder — signing is local, synchronous, on-demand.

@@ -29,23 +29,6 @@ pub struct BuyIntent {
     pub edge_ticks: i32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Thesis {
-    Supports,
-    Weakens,
-    Opposes,
-}
-
-impl Thesis {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Thesis::Supports => "supports",
-            Thesis::Weakens => "weakens",
-            Thesis::Opposes => "opposes",
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 pub struct SignalConfig {
     pub max_lag_us: i64,
@@ -337,7 +320,21 @@ impl SignalEngine {
         })
     }
 
-    pub fn thesis_for_side(&self, side: OutcomeSide, now: TsUs) -> Option<Thesis> {
+    pub fn fair_ticks_for_side(&self, side: OutcomeSide, now: TsUs, tte_us: i64) -> Option<i32> {
+        let (latest, _) = self.latest_window()?;
+        let lag_us = now.micros() - latest.ts_us.micros();
+        if lag_us < 0 || (self.cfg.max_lag_us > 0 && lag_us > self.cfg.max_lag_us) {
+            return None;
+        }
+        let p_yes = self.prob_yes(latest.microprice, latest.ts_us, tte_us)?;
+        let side_prob = match side {
+            OutcomeSide::Yes => p_yes,
+            OutcomeSide::No => 1.0 - p_yes,
+        };
+        Some((side_prob * 100.0).floor() as i32)
+    }
+
+    pub fn opposes_side(&self, side: OutcomeSide, now: TsUs) -> Option<bool> {
         let (latest, window_base) = self.latest_window()?;
         let lag_us = now.micros() - latest.ts_us.micros();
         if lag_us < 0 || (self.cfg.max_lag_us > 0 && lag_us > self.cfg.max_lag_us) {
@@ -350,16 +347,11 @@ impl SignalEngine {
         let signed_move = sign * (latest.microprice - window_base.microprice);
         let signed_ofi = sign * self.ofi_sum_since(latest.ts_us.micros() - self.cfg.max_window_us);
         let signed_imbalance = sign * latest.imbalance;
-        if signed_move >= 0.0 && signed_ofi >= 0.0 && signed_imbalance >= 0.0 {
-            Some(Thesis::Supports)
-        } else if signed_move <= -self.cfg.min_move_usd
-            && signed_ofi <= -self.cfg.min_abs_ofi
-            && signed_imbalance <= -self.cfg.min_imbalance
-        {
-            Some(Thesis::Opposes)
-        } else {
-            Some(Thesis::Weakens)
-        }
+        Some(
+            signed_move <= -self.cfg.min_move_usd
+                && signed_ofi <= -self.cfg.min_abs_ofi
+                && signed_imbalance <= -self.cfg.min_imbalance,
+        )
     }
 
     fn debug_reject(gate: &str, move_usd: f64, ofi: f64, imbalance: f64, a: i64, b: i32) {

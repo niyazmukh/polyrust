@@ -40,6 +40,7 @@ Rust-first low-latency FAK trading bot for Polymarket 5-minute binary options.
 ### BUY Lifecycle
 
 - Claim created atomically with intent (same `core.lock()` scope).
+- Live BUY uses a bounded same-limit burst of two independent FAK submits per signal. Each request has its own pending claim and unique salt; all share the same signal limit.
 - BUY limit uses full `MINIMAL_ENTRY_SLIPPAGE` as a FAK execution cap; edge math charges half that slippage rounded up as the expected fill debit.
 - Dry-run does not create claims.
 - Rejected → claim deleted (no tombstone).
@@ -49,8 +50,8 @@ Rust-first low-latency FAK trading bot for Polymarket 5-minute binary options.
 ### SELL Lifecycle
 
 - BUY MATCHED starts a bid tracker from WSS fill price and executable entry bid.
-- Exit wakes every 50ms: update peak bid, sell on hold timeout (`EXIT_HOLD_US`), local stop (`EXIT_STOP_TICKS` below executable entry bid) only when Binance no longer supports the held side, strong opposite Binance thesis, or profitable pullback after Binance weakening. A profitable pullback is `drop`; strong flow reversal is `opposite`.
-- When exit fires: read sellable inventory, read bid, sign FAK SELL, submit, log.
+- Exit wakes every 50ms: update peak bid, sell on fair-value failure confirmed by opposite Binance book pressure, an adverse stop below executable entry bid when the same model no longer supports holding, or a hold-time boundary only when fair value is weak/unavailable. A position is supported when `fair_ticks > bid + EXIT_EDGE_TICKS` and Binance pressure does not oppose the held side. Normal `value` / `drop` exits require both `fair_ticks <= bid + EXIT_EDGE_TICKS` and opposite pressure from the same move/OFI/imbalance terms used by entry. Mixed/weak pressure alone is not an exit before the hold boundary.
+- When exit fires: read sellable inventory, read bid, sign FAK SELL with configured SELL execution concession, submit, log.
 
 - Read sellable inventory → read bid → sign FAK SELL → submit → log.
 - Inventory remains WSS-owned; HTTP SELL responses do not mutate balance.
@@ -88,7 +89,7 @@ Rust-first low-latency FAK trading bot for Polymarket 5-minute binary options.
 
 - flat-start position checks (WSS authority handles restart-with-position)
 - rotation blockers (old markets resolve automatically)
-- force-exit tasks (50ms exit task owns thesis-gated SELL)
+- force-exit tasks (50ms exit task owns pressure-confirmed fair-value SELL)
 - max-position caps (same-token duplicate protection is sufficient in 2-token markets)
 - max-TTE gates (the 5-min market window IS the product boundary)
 - SELL inventory state of any kind
@@ -150,7 +151,7 @@ All must be true:
 - user WSS subscription includes active condition ID and updates on rotation
 - BUY claim atomic with intent, deleted on rejection, removed on CONFIRMED
 - UNKNOWN stays matchable, Accepted doesn't expire blindly
-- BUY MATCHED arms thesis-gated exit; exit fires on `stop`, `opposite`, `drop`, or `hold`
+- BUY MATCHED arms pressure-confirmed fair-value exit; exit fires on `value`/`drop`, model-aware `stop`, or stale/weak-model `hold`
 - SELL retries while WSS-owned inventory remains sellable; SELL does not own inventory
 - UNKNOWN BUY submit stale expiry keeps late WSS matchability but unblocks same-token BUY after the live timeout window.
 - BUY inventory applies on MATCHED; SELL inventory applies on MATCHED
