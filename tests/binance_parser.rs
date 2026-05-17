@@ -1,6 +1,6 @@
 use minirust::binance::{BinanceParseError, parse_book_ticker};
 use minirust::signal::{SignalConfig, SignalEngine};
-use minirust::state::{MarketContext, Quote};
+use minirust::state::{BookDepth, MarketContext, Quote};
 use minirust::types::{ConditionId, OutcomeSide, PriceTick, TokenId, TsUs};
 
 fn market() -> MarketContext {
@@ -18,6 +18,7 @@ fn quote(bid: i32, ask: i32, ts_us: i64) -> Quote {
     Quote {
         bid: Some(PriceTick::checked(bid).unwrap()),
         ask: Some(PriceTick::checked(ask).unwrap()),
+        ask_depth: BookDepth::empty(),
         tick: PriceTick::checked(1).unwrap(),
         ts_us: TsUs(ts_us),
     }
@@ -35,6 +36,7 @@ fn cfg() -> SignalConfig {
         min_total_qty: 0.000001,
         min_edge_ticks: 5,
         entry_slippage_ticks: 1,
+        entry_notional_cents: 101,
         max_quote_age_us: 250_000,
         min_tte_us: 2_000_000,
         min_buy_limit: PriceTick::checked(35).unwrap(),

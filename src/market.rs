@@ -6,7 +6,7 @@
 use serde_json::Value;
 
 use crate::logline::{self, Field, Level};
-use crate::state::RuntimeState;
+use crate::state::{BookDepth, BookLevel, RuntimeState};
 use crate::types::{ConditionId, PriceTick, SharesAtoms, TokenId, TsUs};
 
 const DEFAULT_TICK: PriceTick = PriceTick::new_unchecked(1);
@@ -16,6 +16,7 @@ pub struct QuoteUpdate {
     pub token: TokenId,
     pub bid: Option<PriceTick>,
     pub ask: Option<PriceTick>,
+    pub ask_depth: BookDepth,
     pub tick: PriceTick,
 }
 
@@ -56,7 +57,14 @@ pub fn apply_market_events(events: &[MarketEvent], state: &mut RuntimeState, ts_
     for event in events {
         match event {
             MarketEvent::Quote(q) => {
-                if state.update_quote(q.token.clone(), q.bid, q.ask, q.tick, ts_us) {
+                if state.update_quote_with_depth(
+                    q.token.clone(),
+                    q.bid,
+                    q.ask,
+                    q.ask_depth,
+                    q.tick,
+                    ts_us,
+                ) {
                     applied += 1;
                     if logline::enabled(Level::Debug) {
                         let recv_us = ts_us.micros();
@@ -144,8 +152,9 @@ fn parse_one(value: &Value, out: &mut Vec<MarketEvent>) {
 
 fn quote_from_book(value: &Value) -> Option<QuoteUpdate> {
     let token = parse_token(value)?;
+    let ask_depth = book_depth(value.get("asks"), false);
     let bid = best_book_price(value.get("bids"), true);
-    let ask = best_book_price(value.get("asks"), false);
+    let ask = ask_depth.best_price();
     if bid.is_none() && ask.is_none() {
         return None;
     }
@@ -153,6 +162,7 @@ fn quote_from_book(value: &Value) -> Option<QuoteUpdate> {
         token,
         bid,
         ask,
+        ask_depth,
         tick: parse_tick(value),
     })
 }
@@ -168,6 +178,7 @@ fn quote_from_dict(value: &Value) -> Option<QuoteUpdate> {
         token,
         bid,
         ask,
+        ask_depth: BookDepth::empty(),
         tick: parse_tick(value),
     })
 }
@@ -205,9 +216,25 @@ fn optional_price(value: &Value, keys: &[&str]) -> Option<PriceTick> {
     None
 }
 
+fn book_depth(value: Option<&Value>, want_bid: bool) -> BookDepth {
+    let Some(levels) = value.and_then(Value::as_array) else {
+        return BookDepth::empty();
+    };
+    BookDepth::from_levels(
+        levels.iter().filter_map(|level| {
+            let (price, size) = parse_level(level)?;
+            Some(BookLevel {
+                price,
+                size_atoms: size.atoms(),
+            })
+        }),
+        want_bid,
+    )
+}
+
 fn best_book_price(value: Option<&Value>, want_bid: bool) -> Option<PriceTick> {
     let levels = value?.as_array()?;
-    let mut best: Option<PriceTick> = None;
+    let mut best = None;
     for level in levels {
         let Some((price, size)) = parse_level(level) else {
             continue;

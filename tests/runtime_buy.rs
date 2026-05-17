@@ -30,6 +30,7 @@ fn cfg() -> SignalConfig {
         min_total_qty: 0.000001,
         min_edge_ticks: 5,
         entry_slippage_ticks: 1,
+        entry_notional_cents: 101,
         max_quote_age_us: 250_000,
         min_tte_us: 2_000_000,
         min_buy_limit: PriceTick::checked(35).unwrap(),

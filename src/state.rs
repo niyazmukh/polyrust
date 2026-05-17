@@ -6,6 +6,88 @@ use std::collections::HashMap;
 
 use crate::types::{ConditionId, OutcomeSide, PriceTick, TokenId, TsUs};
 
+const BOOK_DEPTH_LEVELS: usize = 4;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BookLevel {
+    pub price: PriceTick,
+    pub size_atoms: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BookDepth {
+    levels: [Option<BookLevel>; BOOK_DEPTH_LEVELS],
+}
+
+impl BookDepth {
+    pub const fn empty() -> Self {
+        Self {
+            levels: [None; BOOK_DEPTH_LEVELS],
+        }
+    }
+
+    pub fn from_levels(levels: impl IntoIterator<Item = BookLevel>, want_bid: bool) -> Self {
+        let mut depth = Self::empty();
+        for level in levels {
+            if level.size_atoms > 0 {
+                depth.insert(level, want_bid);
+            }
+        }
+        depth
+    }
+
+    pub(crate) fn best_price(self) -> Option<PriceTick> {
+        self.levels[0].map(|level| level.price)
+    }
+
+    fn cutoff_for_buy_cents(self, target_cents: i64) -> Option<PriceTick> {
+        if target_cents <= 0 {
+            return None;
+        }
+        let target_microcents = i128::from(target_cents) * 1_000_000;
+        let mut total = 0i128;
+        for level in self.levels.into_iter().flatten() {
+            total += i128::from(level.price.ticks()) * i128::from(level.size_atoms);
+            if total >= target_microcents {
+                return Some(level.price);
+            }
+        }
+        None
+    }
+
+    fn insert(&mut self, level: BookLevel, want_bid: bool) {
+        if let Some(existing) = self
+            .levels
+            .iter_mut()
+            .flatten()
+            .find(|existing| existing.price == level.price)
+        {
+            existing.size_atoms = existing.size_atoms.saturating_add(level.size_atoms);
+            return;
+        }
+        for idx in 0..BOOK_DEPTH_LEVELS {
+            let should_insert = match self.levels[idx] {
+                None => true,
+                Some(existing) if want_bid => level.price > existing.price,
+                Some(existing) => level.price < existing.price,
+            };
+            if should_insert {
+                for shift in ((idx + 1)..BOOK_DEPTH_LEVELS).rev() {
+                    self.levels[shift] = self.levels[shift - 1];
+                }
+                self.levels[idx] = Some(level);
+                return;
+            }
+        }
+    }
+}
+
+impl Default for BookDepth {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarketContext {
     pub slug: String,
@@ -20,8 +102,17 @@ pub struct MarketContext {
 pub struct Quote {
     pub bid: Option<PriceTick>,
     pub ask: Option<PriceTick>,
+    pub ask_depth: BookDepth,
     pub tick: PriceTick,
     pub ts_us: TsUs,
+}
+
+impl Quote {
+    pub fn buy_cutoff_for_cents(self, target_cents: i64) -> Option<PriceTick> {
+        self.ask_depth
+            .cutoff_for_buy_cents(target_cents)
+            .or(self.ask)
+    }
 }
 
 pub struct RuntimeState {
@@ -85,6 +176,18 @@ impl RuntimeState {
         tick: PriceTick,
         ts_us: TsUs,
     ) -> bool {
+        self.update_quote_with_depth(token, bid, ask, BookDepth::empty(), tick, ts_us)
+    }
+
+    pub fn update_quote_with_depth(
+        &mut self,
+        token: TokenId,
+        bid: Option<PriceTick>,
+        ask: Option<PriceTick>,
+        ask_depth: BookDepth,
+        tick: PriceTick,
+        ts_us: TsUs,
+    ) -> bool {
         if !self.trading_active || self.side_for_token(&token).is_none() {
             return false;
         }
@@ -93,6 +196,7 @@ impl RuntimeState {
             Quote {
                 bid,
                 ask,
+                ask_depth,
                 tick,
                 ts_us,
             },

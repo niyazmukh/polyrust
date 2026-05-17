@@ -41,6 +41,7 @@ pub struct SignalConfig {
     pub min_total_qty: f64,
     pub min_edge_ticks: i32,
     pub entry_slippage_ticks: i32,
+    pub entry_notional_cents: i64,
     pub max_quote_age_us: i64,
     pub min_tte_us: i64,
     pub min_buy_limit: PriceTick,
@@ -55,6 +56,7 @@ pub struct SignalConfig {
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct SignalPoint {
     ts_us: TsUs,
+    recv_ts_us: TsUs,
     microprice: f64,
     ofi: f64,
     imbalance: f64,
@@ -99,6 +101,10 @@ impl SignalEngine {
     }
 
     pub fn push(&mut self, sample: BinanceSample) -> bool {
+        self.push_received(sample, sample.ts_us)
+    }
+
+    fn push_received(&mut self, sample: BinanceSample, recv_ts_us: TsUs) -> bool {
         if !sample.microprice.is_finite()
             || sample.microprice <= 0.0
             || sample.update_id <= self.last_update_id
@@ -130,6 +136,7 @@ impl SignalEngine {
         }
         self.samples.push_back(SignalPoint {
             ts_us: sample.ts_us,
+            recv_ts_us,
             microprice: sample.microprice,
             ofi,
             imbalance,
@@ -197,10 +204,10 @@ impl SignalEngine {
         tte_us: i64,
     ) -> Option<BuyIntent> {
         let lag_us = now.micros() - sample.ts_us.micros();
-        if self.cfg.max_lag_us > 0 && lag_us > self.cfg.max_lag_us {
+        if !self.push_received(sample, now) {
             return None;
         }
-        if !self.push(sample) {
+        if self.cfg.max_lag_us > 0 && lag_us > self.cfg.max_lag_us {
             return None;
         }
         self.decide_latest(market, yes_quote, no_quote, now, tte_us)
@@ -250,7 +257,7 @@ impl SignalEngine {
             OutcomeSide::No => market.no_token.clone(),
         };
 
-        let ask = match quote.ask {
+        let entry_ask = match quote.buy_cutoff_for_cents(self.cfg.entry_notional_cents) {
             Some(a) => a,
             None => {
                 Self::debug_reject("no_ask", move_usd, ofi_sum, latest.imbalance, 0, 0);
@@ -270,8 +277,12 @@ impl SignalEngine {
             return None;
         }
 
-        let limit =
-            PriceTick::checked(ask.ticks().checked_add(self.cfg.entry_slippage_ticks)?).ok()?;
+        let limit = PriceTick::checked(
+            entry_ask
+                .ticks()
+                .checked_add(self.cfg.entry_slippage_ticks)?,
+        )
+        .ok()?;
         if limit < self.cfg.min_buy_limit || limit > self.cfg.max_buy_limit {
             Self::debug_reject(
                 "limit_band",
@@ -284,7 +295,8 @@ impl SignalEngine {
             return None;
         }
         let edge_slippage_ticks = (self.cfg.entry_slippage_ticks + 1) / 2;
-        let edge_price = PriceTick::checked(ask.ticks().checked_add(edge_slippage_ticks)?).ok()?;
+        let edge_price =
+            PriceTick::checked(entry_ask.ticks().checked_add(edge_slippage_ticks)?).ok()?;
 
         let p_yes = self.prob_yes(latest.microprice, latest.ts_us, tte_us)?;
         let side_prob_ticks = match side {
@@ -322,7 +334,7 @@ impl SignalEngine {
 
     pub fn fair_ticks_for_side(&self, side: OutcomeSide, now: TsUs, tte_us: i64) -> Option<i32> {
         let (latest, _) = self.latest_window()?;
-        let lag_us = now.micros() - latest.ts_us.micros();
+        let lag_us = now.micros() - latest.recv_ts_us.micros();
         if lag_us < 0 || (self.cfg.max_lag_us > 0 && lag_us > self.cfg.max_lag_us) {
             return None;
         }
@@ -336,7 +348,7 @@ impl SignalEngine {
 
     pub fn opposes_side(&self, side: OutcomeSide, now: TsUs) -> Option<bool> {
         let (latest, window_base) = self.latest_window()?;
-        let lag_us = now.micros() - latest.ts_us.micros();
+        let lag_us = now.micros() - latest.recv_ts_us.micros();
         if lag_us < 0 || (self.cfg.max_lag_us > 0 && lag_us > self.cfg.max_lag_us) {
             return None;
         }

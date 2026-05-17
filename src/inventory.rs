@@ -218,7 +218,7 @@ impl Inventory {
     /// `claim_entry` (synchronous, under the core lock) and the spawned
     /// submit task's call to `mark_submit_accepted` /
     /// `mark_submit_unknown` / `release_claim`. In normal operation this
-    /// window is ≤ HTTP timeout (3 s). If a submit task panics or is
+    /// window is ≤ HTTP timeout (10 s). If a submit task panics or is
     /// cancelled before resolving the outcome, the Pending claim lingers
     /// forever and blocks same-token BUYs (because `blocks_entry()` is
     /// true for Pending).

@@ -55,13 +55,14 @@ same `core.lock()` as the signal decision. Pending stays alive until CONFIRMED
 UNKNOWN stays WSS-matchable, but stale UNKNOWN stops blocking same-token BUY
 after the live timeout window.
 
-**BUY burst.** Live mode sends two independent FAK BUY requests per signal at
-the same signed limit. Each has its own pending claim and salt. If both fill,
-user WSS applies the combined inventory; exit sells the full WSS sellable size.
+**BUY submit.** Live mode sends one FAK BUY request per signal. User WSS owns
+inventory truth; exit sells the full WSS sellable size when a BUY fill appears.
 
-**BUY slippage split.** `MINIMAL_ENTRY_SLIPPAGE` is the FAK execution cap. Edge
-math charges half that cap rounded up as the expected fill debit, because a
-marketable FAK BUY starts at the best ask and only walks the book if needed.
+**BUY slippage split.** Market WSS book snapshots carry a fixed-size depth
+summary. BUY uses the ask cutoff needed to cover `MINIMAL_USDC_PER_TRADE` when
+that depth is available, otherwise it falls back to best ask. `MINIMAL_ENTRY_SLIPPAGE`
+is added to that cutoff as the FAK execution cap; edge math charges half that
+cap rounded up as the expected fill debit.
 
 **Exit is pressure-confirmed fair-value.** BUY MATCHED starts a per-token bid
 tracker from the WSS fill price and executable entry bid. The exit task wakes
@@ -114,9 +115,9 @@ src_ts_us → recv_us → decide_us → submit_us → outcome (rtt_us)
  [network]  [signal]   [spawn+sign]  [HTTP RTT]
 ```
 
-BUY submit outcomes also log `limit_ticks`, `edge_price_ticks`, `edge_ticks`,
-and live `burst_ix`, so FAK no-match events can be separated into stale/slow
-execution versus intentional price-band rejections.
+BUY submit outcomes also log `limit_ticks`, `edge_price_ticks`, and
+`edge_ticks`, so FAK no-match events can be separated into stale/slow execution
+versus intentional price-band rejections.
 
 **Post-signal price tracker** (INFO level): logs token bid and ask prices at
 1s intervals for 15s after each signal fires. Zero hot-path overhead —

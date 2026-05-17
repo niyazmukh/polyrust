@@ -125,7 +125,6 @@ struct ExitTracker {
     entry_bid: PriceTick,
     peak_bid: PriceTick,
     fill_ts_us: i64,
-    hold_fired: bool,
 }
 
 /// Snapshot of the inputs needed to sign a FAK SELL, computable purely
@@ -266,7 +265,6 @@ impl RuntimeCore {
                             entry_bid: current_bid,
                             peak_bid: current_bid.max(trade.price),
                             fill_ts_us: trade.ts_us,
-                            hold_fired: false,
                         },
                     );
                 }
@@ -330,9 +328,7 @@ impl RuntimeCore {
             let fair_boundary_exit = fair_ticks
                 .map(|fair| fair <= bid.ticks() + self.exit_edge_ticks)
                 .unwrap_or(true);
-            let reason = if tracker.hold_fired {
-                Some(ExitReason::Hold)
-            } else if bid_drop_ticks >= self.exit_stop_ticks && !fair_supports_hold {
+            let reason = if bid_drop_ticks >= self.exit_stop_ticks && !fair_supports_hold {
                 Some(ExitReason::Stop)
             } else if fair_value_exit {
                 if profit_ticks >= self.exit_arm_ticks && peak_drop_ticks >= self.exit_drop_ticks {
@@ -341,7 +337,6 @@ impl RuntimeCore {
                     Some(ExitReason::Value)
                 }
             } else if hold_us >= self.exit_hold_us && fair_boundary_exit {
-                tracker.hold_fired = true;
                 Some(ExitReason::Hold)
             } else {
                 None

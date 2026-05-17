@@ -40,8 +40,8 @@ Rust-first low-latency FAK trading bot for Polymarket 5-minute binary options.
 ### BUY Lifecycle
 
 - Claim created atomically with intent (same `core.lock()` scope).
-- Live BUY uses a bounded same-limit burst of two independent FAK submits per signal. Each request has its own pending claim and unique salt; all share the same signal limit.
-- BUY limit uses full `MINIMAL_ENTRY_SLIPPAGE` as a FAK execution cap; edge math charges half that slippage rounded up as the expected fill debit.
+- Live BUY uses one FAK submit per signal.
+- BUY limit starts from the WSS ask-depth cutoff for `MINIMAL_USDC_PER_TRADE` when book depth is available, otherwise best ask. Full `MINIMAL_ENTRY_SLIPPAGE` is added as the FAK execution cap; edge math charges half that slippage rounded up as the expected fill debit.
 - Dry-run does not create claims.
 - Rejected → claim deleted (no tombstone).
 - UNKNOWN → stays WSS-matchable, blocks same-token BUY until stale expiry.

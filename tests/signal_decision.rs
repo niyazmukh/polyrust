@@ -1,5 +1,5 @@
 use minirust::signal::{BinanceSample, SignalConfig, SignalEngine};
-use minirust::state::{MarketContext, Quote};
+use minirust::state::{BookDepth, BookLevel, MarketContext, Quote};
 use minirust::types::{ConditionId, OutcomeSide, PriceTick, TokenId, TsUs};
 
 fn market() -> MarketContext {
@@ -17,6 +17,7 @@ fn quote(bid: i32, ask: i32, ts_us: i64) -> Quote {
     Quote {
         bid: Some(PriceTick::checked(bid).unwrap()),
         ask: Some(PriceTick::checked(ask).unwrap()),
+        ask_depth: BookDepth::empty(),
         tick: PriceTick::checked(1).unwrap(),
         ts_us: TsUs(ts_us),
     }
@@ -34,6 +35,7 @@ fn cfg() -> SignalConfig {
         min_total_qty: 0.000001,
         min_edge_ticks: 5,
         entry_slippage_ticks: 1,
+        entry_notional_cents: 101,
         max_quote_age_us: 250_000,
         min_tte_us: 2_000_000,
         min_buy_limit: PriceTick::checked(35).unwrap(),
@@ -43,6 +45,21 @@ fn cfg() -> SignalConfig {
         prob_floor: 0.02,
         prob_ceil: 0.98,
         max_samples: 128,
+    }
+}
+
+fn quote_with_asks(bid: i32, ask: i32, ts_us: i64, asks: &[(i32, i64)]) -> Quote {
+    Quote {
+        ask_depth: BookDepth::from_levels(
+            asks.iter()
+                .copied()
+                .map(|(price_ticks, size_atoms)| BookLevel {
+                    price: PriceTick::checked(price_ticks).unwrap(),
+                    size_atoms,
+                }),
+            false,
+        ),
+        ..quote(bid, ask, ts_us)
     }
 }
 
@@ -128,6 +145,27 @@ fn fair_ticks_for_side_matches_entry_probability_model() {
     assert_eq!(
         engine.fair_ticks_for_side(OutcomeSide::No, TsUs(29_010_000), 60_000_000),
         Some(37)
+    );
+}
+
+#[test]
+fn stale_entry_sample_still_refreshes_exit_fair_value_by_receive_time() {
+    let mut engine = SignalEngine::new(cfg_with_fixed_prob(1, 63));
+    engine.set_strike(100.0, true);
+    engine.push(sample(28_000_000, 1, 99.0, 101.0, 1.0, 1.0));
+
+    let intent = engine.on_sample(
+        sample(29_000_000, 2, 101.0, 103.0, 3.0, 1.0),
+        &market(),
+        quote(40, 41, 29_900_000),
+        quote(58, 59, 29_900_000),
+        TsUs(30_000_000),
+        60_000_000,
+    );
+    assert_eq!(intent, None);
+    assert_eq!(
+        engine.fair_ticks_for_side(OutcomeSide::Yes, TsUs(30_010_000), 60_000_000),
+        Some(63)
     );
 }
 
@@ -242,6 +280,36 @@ fn entry_slippage_is_execution_cap_not_full_edge_debit() {
     assert_eq!(intent.limit, PriceTick::checked(57).unwrap());
     assert_eq!(intent.edge_price, PriceTick::checked(55).unwrap());
     assert_eq!(intent.edge_ticks, 5);
+}
+
+#[test]
+fn entry_limit_uses_wss_book_depth_cutoff_when_best_ask_is_thin() {
+    let mut engine = SignalEngine::new(cfg_with_fixed_prob(3, 61));
+    engine.set_strike(100.0, true);
+    engine.push(sample(28_000_000, 1, 99.0, 101.0, 1.0, 1.0));
+    engine.push(sample(29_000_000, 2, 101.0, 103.0, 3.0, 1.0));
+
+    let intent = engine.on_sample(
+        sample(30_000_000, 3, 104.0, 106.0, 3.0, 1.0),
+        &market(),
+        quote_with_asks(
+            50,
+            52,
+            30_000_000,
+            &[
+                (52, 1_000_000), // $0.52 notional, below $1.01 target.
+                (53, 2_000_000), // cumulative crosses target here.
+            ],
+        ),
+        quote(45, 50, 30_000_000),
+        TsUs(30_010_000),
+        60_000_000,
+    );
+
+    let intent = intent.unwrap();
+    assert_eq!(intent.limit, PriceTick::checked(56).unwrap());
+    assert_eq!(intent.edge_price, PriceTick::checked(55).unwrap());
+    assert_eq!(intent.edge_ticks, 6);
 }
 
 #[test]

@@ -292,6 +292,7 @@ impl Config {
             min_total_qty: self.signal_min_total_qty,
             min_edge_ticks: self.decision_min_edge_cents,
             entry_slippage_ticks: self.entry_slippage_cents,
+            entry_notional_cents: self.usdc_per_trade_cents,
             max_quote_age_us: 250_000,
             min_tte_us: self.min_decision_tte_us,
             min_buy_limit: PriceTick::checked(self.min_buy_limit_cents).map_err(|e| {
@@ -602,6 +603,7 @@ mod tests {
         assert_eq!(signal.max_window_us, 2_000_000);
         assert_eq!(signal.min_edge_ticks, 5);
         assert_eq!(signal.entry_slippage_ticks, 3);
+        assert_eq!(signal.entry_notional_cents, 101);
         assert_eq!(signal.min_buy_limit.ticks(), 35);
         assert_eq!(signal.max_buy_limit.ticks(), 65);
         assert_eq!(signal.min_tte_us, 45_000_000);

@@ -31,6 +31,10 @@ fn book_quote_updates_active_market_and_resolved_clears_it() {
     let quote = state.quote_for_side(OutcomeSide::Yes).unwrap();
     assert_eq!(quote.bid, Some(PriceTick::checked(58).unwrap()));
     assert_eq!(quote.ask, Some(PriceTick::checked(61).unwrap()));
+    assert_eq!(
+        quote.buy_cutoff_for_cents(101),
+        Some(PriceTick::checked(62).unwrap())
+    );
 
     let resolved =
         parse_market_events(br#"{"event_type":"market_resolved","condition_id":"cond-1"}"#)

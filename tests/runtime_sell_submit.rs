@@ -555,6 +555,20 @@ fn hold_timeout_sells_when_fair_value_no_longer_exceeds_bid_without_opposite_pre
 }
 
 #[test]
+fn hold_timeout_is_not_sticky_after_fair_value_support_recovers() {
+    let mut core = core_with_bid_and_config(52, cfg_with_fixed_prob(52));
+    seed_signal_window(&mut core, 14_999_000, 1, 300.0);
+    apply_buy_raw(&mut core, 50, "2.000000", 0);
+
+    let exits = core.plan_exits(15_000_100);
+    assert_eq!(exits.len(), 1);
+    assert_eq!(exits[0].reason, ExitReason::Hold);
+
+    update_bid(&mut core, 40, 41, 15_100_000);
+    assert_eq!(core.plan_exits(15_100_000), Vec::new());
+}
+
+#[test]
 fn value_exit_fires_on_adverse_collapse_before_stop_threshold() {
     let mut core = core_with_bid_and_config(55, cfg_with_fixed_prob(51));
     seed_yes_opposes(&mut core, 999_000, 1);

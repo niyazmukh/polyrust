@@ -1,4 +1,5 @@
 /target
+.rs-clob-client-v2-main/
 **/*.rs.bk
 *.pdb
 .claude/

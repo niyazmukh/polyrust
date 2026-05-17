@@ -25,6 +25,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use reqwest::Client;
+use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::Value;
 
 use crate::auth::L2AuthSigner;
@@ -34,18 +35,14 @@ use crate::signing::SignedFakOrderBody;
 /// base URL.
 pub const ORDER_PATH: &str = "/order";
 
-/// Per-request HTTP timeout. Live evidence (2026-05-13, 69 submits):
+/// Per-request HTTP timeout. The official Rust client leaves reqwest
+/// without a total request timeout; this bot still bounds async submit
+/// task lifetime so venue stalls cannot accumulate forever.
 ///
-/// - All 30 transport_errors hit exactly 3000-3002ms (server non-response)
-/// - All 14 accepted orders responded in 301-2693ms (never timed out)
-/// - 25 FAK no-match rejections responded in 460-2901ms
-/// - Timeouts cluster in time (venue congestion), NOT correlated with
-///   connection idle gap (42% timeout at gap≤40s vs 50% at gap>40s).
-///
-/// The venue simply doesn't respond within 3s during congestion.
-/// Increasing this timeout would recover some orders that matched on-chain
-/// despite the HTTP timeout (confirmed via WSS reconciliation in live logs).
-pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+/// Live logs showed many 3000ms UNKNOWNs and official source has no 3s
+/// cutoff, so 10s is a bounded classification window rather than an
+/// execution gate. WSS remains inventory truth either way.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 pub const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Outcome of a submit attempt, after the classifier has run on the
@@ -133,6 +130,7 @@ impl HttpSubmitter {
             return Err(SubmitError::InvalidBaseUrl);
         }
         let client = Client::builder()
+            .default_headers(official_default_headers())
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
             .pool_idle_timeout(Duration::from_secs(75))
@@ -163,11 +161,7 @@ impl HttpSubmitter {
         let bytes = body.as_bytes();
         let headers = self.auth.headers("POST", ORDER_PATH, bytes, ts);
 
-        let mut req = self
-            .client
-            .post(&url)
-            .body(bytes.to_vec())
-            .header("Content-Type", "application/json");
+        let mut req = self.client.post(&url).body(bytes.to_vec());
         for (name, value) in headers.as_pairs() {
             req = req.header(name, value);
         }
@@ -203,6 +197,15 @@ impl HttpSubmitter {
             }
         }
     }
+}
+
+fn official_default_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert("User-Agent", HeaderValue::from_static("rs_clob_client"));
+    headers.insert("Accept", HeaderValue::from_static("*/*"));
+    headers.insert("Connection", HeaderValue::from_static("keep-alive"));
+    headers.insert("Content-Type", HeaderValue::from_static("application/json"));
+    headers
 }
 
 /// Default unix-seconds source. Unwraps to 0 on the unreasonable
@@ -465,5 +468,66 @@ mod tests {
         assert!(HttpSubmitter::new("", signer.clone()).is_err());
         // Trailing slash: also rejected to keep path-joining unambiguous.
         assert!(HttpSubmitter::new("https://x.test/", signer).is_err());
+    }
+
+    #[test]
+    fn submit_timeout_is_bounded_but_not_three_second_classification_cutoff() {
+        assert_eq!(REQUEST_TIMEOUT, Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn submitter_sends_official_client_default_headers() {
+        use crate::orders::BuyCanonicalTarget;
+        use crate::signing::{
+            EXCHANGE_V2_NORMAL, OrderSigner, POLYGON_CHAIN_ID, SignInputs, SignatureKind,
+        };
+        use crate::types::{Shares4, TokenId, UsdcCents};
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/order"))
+            .and(header("User-Agent", "rs_clob_client"))
+            .and(header("Accept", "*/*"))
+            .and(header("Connection", "keep-alive"))
+            .and(header("Content-Type", "application/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"orderID":"0xabc"}"#))
+            .mount(&server)
+            .await;
+
+        let signer = L2AuthSigner::new(
+            "00000000-0000-0000-0000-000000000001",
+            "p",
+            "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVoxMjM0NTY3ODkw",
+            "0x0",
+        )
+        .unwrap();
+        let submitter = HttpSubmitter::new(&server.uri(), signer).unwrap();
+        let order_signer = OrderSigner::new(
+            "0x0000000000000000000000000000000000000000000000000000000000000001",
+            "00000000-0000-0000-0000-000000000001",
+            None,
+            SignatureKind::Eoa,
+            POLYGON_CHAIN_ID,
+            EXCHANGE_V2_NORMAL,
+        )
+        .unwrap();
+        let body = order_signer
+            .sign_fak_buy(
+                &TokenId::new("1"),
+                &BuyCanonicalTarget {
+                    size: Shares4::new_unchecked(20_200),
+                    maker_amount: UsdcCents(101),
+                },
+                SignInputs {
+                    salt: 1,
+                    timestamp_ms: 1_777_000_000_000,
+                },
+            )
+            .unwrap();
+        let outcome = submitter.submit_order(&body).await;
+
+        assert!(outcome.is_accepted(), "{outcome:?}");
     }
 }
