@@ -46,6 +46,7 @@ fn cfg() -> SignalConfig {
         prob_floor: 0.02,
         prob_ceil: 0.98,
         max_samples: 128,
+        use_implied_sigma: false,
     }
 }
 

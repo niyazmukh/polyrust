@@ -141,6 +141,14 @@ fn cfg() -> minirust::config::Config {
         prob_floor: 0.02,
         prob_ceil: 0.98,
         signal_ring_size: 128,
+        signal_quote_age_us: 250_000,
+        rtt_ceiling_us: 0,
+        poly_drift_window_us: 0,
+        poly_drift_block_up_ticks: 0,
+        poly_drift_block_down_ticks: 0,
+        poly_drift_safety_bps: 0,
+        poly_drift_min_clean_edge_ticks: 0,
+        use_implied_sigma: false,
     }
 }
 

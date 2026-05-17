@@ -51,6 +51,11 @@ pub struct SignalConfig {
     pub prob_floor: f64,
     pub prob_ceil: f64,
     pub max_samples: usize,
+    /// When `true`, fold the Polymarket-implied probability (book BBO mid,
+    /// normalised across YES/NO) into the `prob_yes` σ estimate by taking the
+    /// larger of realised-σ and Polymarket-implied-σ. Acts as a "trust the
+    /// book" guard against overconfident Binance-only fair-value calls.
+    pub use_implied_sigma: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -298,7 +303,12 @@ impl SignalEngine {
         let edge_price =
             PriceTick::checked(entry_ask.ticks().checked_add(edge_slippage_ticks)?).ok()?;
 
-        let p_yes = self.prob_yes(latest.microprice, latest.ts_us, tte_us)?;
+        let implied_p_yes_hint = if self.cfg.use_implied_sigma {
+            implied_p_yes_for(yes_quote, no_quote)
+        } else {
+            None
+        };
+        let p_yes = self.prob_yes(latest.microprice, latest.ts_us, tte_us, implied_p_yes_hint)?;
         let side_prob_ticks = match side {
             OutcomeSide::Yes => p_yes * 100.0,
             OutcomeSide::No => (1.0 - p_yes) * 100.0,
@@ -332,13 +342,24 @@ impl SignalEngine {
         })
     }
 
-    pub fn fair_ticks_for_side(&self, side: OutcomeSide, now: TsUs, tte_us: i64) -> Option<i32> {
+    pub fn fair_ticks_for_side(
+        &self,
+        side: OutcomeSide,
+        now: TsUs,
+        tte_us: i64,
+        implied_p_yes_hint: Option<f64>,
+    ) -> Option<i32> {
         let (latest, _) = self.latest_window()?;
         let lag_us = now.micros() - latest.recv_ts_us.micros();
         if lag_us < 0 || (self.cfg.max_lag_us > 0 && lag_us > self.cfg.max_lag_us) {
             return None;
         }
-        let p_yes = self.prob_yes(latest.microprice, latest.ts_us, tte_us)?;
+        let hint = if self.cfg.use_implied_sigma {
+            implied_p_yes_hint
+        } else {
+            None
+        };
+        let p_yes = self.prob_yes(latest.microprice, latest.ts_us, tte_us, hint)?;
         let side_prob = match side {
             OutcomeSide::Yes => p_yes,
             OutcomeSide::No => 1.0 - p_yes,
@@ -449,19 +470,47 @@ impl SignalEngine {
             .sum()
     }
 
-    fn prob_yes(&self, microprice: f64, latest_ts: TsUs, tte_us: i64) -> Option<f64> {
+    fn prob_yes(
+        &self,
+        microprice: f64,
+        latest_ts: TsUs,
+        tte_us: i64,
+        implied_p_yes_hint: Option<f64>,
+    ) -> Option<f64> {
         if !microprice.is_finite() || microprice <= 0.0 || self.strike <= 0.0 || tte_us <= 0 {
             return None;
         }
-        let sigma_px = self
+        let realized_px = self
             .realized_sigma_since(latest_ts.micros() - self.cfg.max_window_us)
             .max(self.cfg.prob_sigma_floor_usd);
-        let sigma_eff =
-            self.cfg.prob_sigma_scale * sigma_px * ((tte_us as f64) / 1_000_000.0).sqrt();
+        let scale_to_eff = self.cfg.prob_sigma_scale * ((tte_us as f64) / 1_000_000.0).sqrt();
+        let realized_eff = realized_px * scale_to_eff;
+        let drift = microprice - self.strike;
+        // Polymarket-implied σ: solve drift = z · σ for σ, where z = Φ⁻¹(p̂).
+        // Only accept positive σ aligned with the sign of `drift`; an implied
+        // probability on the other side of the strike would yield a non-sensical
+        // negative σ (drift and z disagree) — fall back to realised in that case.
+        let implied_eff = implied_p_yes_hint.and_then(|p| {
+            let p = p.clamp(1e-6, 1.0 - 1e-6);
+            let z = phi_inv(p);
+            if !z.is_finite() || z.abs() < 1e-6 {
+                return None;
+            }
+            let s = drift / z;
+            if s.is_finite() && s > 0.0 {
+                Some(s)
+            } else {
+                None
+            }
+        });
+        let sigma_eff = match implied_eff {
+            Some(implied) => realized_eff.max(implied),
+            None => realized_eff,
+        };
         if !sigma_eff.is_finite() || sigma_eff <= 1e-9 {
             return None;
         }
-        let z = (microprice - self.strike) / sigma_eff;
+        let z = drift / sigma_eff;
         if !z.is_finite() {
             return None;
         }
@@ -516,4 +565,87 @@ fn phi_tail(z: f64) -> f64 {
         * t;
     let pdf = (-0.5 * z * z).exp() * 0.398_942_280_401_432_7;
     pdf * poly
+}
+
+/// Inverse standard-normal CDF via Acklam's rational approximation
+/// (max relative error ~1.15 · 10⁻⁹). Used to derive Polymarket-implied σ.
+fn phi_inv(p: f64) -> f64 {
+    if !(0.0 < p && p < 1.0) {
+        return f64::NAN;
+    }
+    const A: [f64; 6] = [
+        -3.969_683_028_665_376e1,
+        2.209_460_984_245_205e2,
+        -2.759_285_104_469_687e2,
+        1.383_577_518_672_69e2,
+        -3.066_479_806_614_716e1,
+        2.506_628_277_459_239,
+    ];
+    const B: [f64; 5] = [
+        -5.447_609_879_822_406e1,
+        1.615_858_368_580_409e2,
+        -1.556_989_798_598_866e2,
+        6.680_131_188_771_972e1,
+        -1.328_068_155_288_572e1,
+    ];
+    const C: [f64; 6] = [
+        -7.784_894_002_430_293e-3,
+        -3.223_964_580_411_365e-1,
+        -2.400_758_277_161_838,
+        -2.549_732_539_343_734,
+        4.374_664_141_464_968,
+        2.938_163_982_698_783,
+    ];
+    const D: [f64; 4] = [
+        7.784_695_709_041_462e-3,
+        3.224_671_290_700_398e-1,
+        2.445_134_137_142_996,
+        3.754_408_661_907_416,
+    ];
+    let p_low = 0.024_25;
+    let p_high = 1.0 - p_low;
+    if p < p_low {
+        let q = (-2.0 * p.ln()).sqrt();
+        (((((C[0] * q + C[1]) * q + C[2]) * q + C[3]) * q + C[4]) * q + C[5])
+            / ((((D[0] * q + D[1]) * q + D[2]) * q + D[3]) * q + 1.0)
+    } else if p <= p_high {
+        let q = p - 0.5;
+        let r = q * q;
+        (((((A[0] * r + A[1]) * r + A[2]) * r + A[3]) * r + A[4]) * r + A[5]) * q
+            / (((((B[0] * r + B[1]) * r + B[2]) * r + B[3]) * r + B[4]) * r + 1.0)
+    } else {
+        let q = (-2.0 * (1.0 - p).ln()).sqrt();
+        -(((((C[0] * q + C[1]) * q + C[2]) * q + C[3]) * q + C[4]) * q + C[5])
+            / ((((D[0] * q + D[1]) * q + D[2]) * q + D[3]) * q + 1.0)
+    }
+}
+
+/// Polymarket-implied P(YES) from the two-legged BBO. Normalises the YES and
+/// NO mids so they sum to one (the spread carve-out the venue charges both
+/// sides). Returns `None` if neither leg has both a bid and an ask.
+///
+/// Public so the runtime exit path can feed the same hint into
+/// `fair_ticks_for_side` as the entry path passes to `prob_yes`.
+pub fn implied_p_yes_for(yes_quote: Quote, no_quote: Quote) -> Option<f64> {
+    fn mid(q: Quote) -> Option<f64> {
+        let bid = q.bid?.ticks();
+        let ask = q.ask?.ticks();
+        if bid <= 0 || ask <= 0 || ask < bid {
+            return None;
+        }
+        Some(f64::from(bid + ask) * 0.5 / 100.0)
+    }
+    match (mid(yes_quote), mid(no_quote)) {
+        (Some(y), Some(n)) => {
+            let total = y + n;
+            if total > 1e-9 && total.is_finite() {
+                Some((y / total).clamp(1e-6, 1.0 - 1e-6))
+            } else {
+                None
+            }
+        }
+        (Some(y), None) => Some(y.clamp(1e-6, 1.0 - 1e-6)),
+        (None, Some(n)) => Some((1.0 - n).clamp(1e-6, 1.0 - 1e-6)),
+        (None, None) => None,
+    }
 }

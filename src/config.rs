@@ -48,6 +48,33 @@ pub struct Config {
     pub prob_floor: f64,
     pub prob_ceil: f64,
     pub signal_ring_size: usize,
+    /// Maximum age (µs) of the Polymarket quote consumed at signal time.
+    /// Defaults to 50 ms — well below typical live submit→outcome RTT so the
+    /// fill price never references a stale book snapshot.
+    pub signal_quote_age_us: i64,
+    /// If the BUY-submit RTT EWMA exceeds this ceiling (µs), the entry gate
+    /// suppresses new signals. `0` disables the gate.
+    pub rtt_ceiling_us: i64,
+    /// Pre-trade Polymarket drift window (µs). The runtime compares the
+    /// current ask against the oldest ask at-or-after `now − window`.
+    pub poly_drift_window_us: i64,
+    /// Suppress entry when the side's ask has already lifted by this many
+    /// ticks inside the drift window — Polymarket-native HFTs have already
+    /// taken the spread, the residual is toxic. `0` disables.
+    pub poly_drift_block_up_ticks: i32,
+    /// Suppress entry when the side's ask has dropped by this many ticks
+    /// inside the drift window — sellers are fading our side. `0` disables.
+    pub poly_drift_block_down_ticks: i32,
+    /// Scale factor (basis points) on the Polymarket-observed drift speed,
+    /// applied to the RTT EWMA to compute the edge buffer required to absorb
+    /// expected ask drift between submit and venue arrival. `0` disables.
+    pub poly_drift_safety_bps: i32,
+    /// Minimum clean edge (ticks) demanded on top of the drift buffer.
+    /// Acts as the "non-adverse profit" floor.
+    pub poly_drift_min_clean_edge_ticks: i32,
+    /// Trust the Polymarket book's implied probability as a lower-bound on σ
+    /// when computing the Binance fair-value model.
+    pub use_implied_sigma: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -236,6 +263,87 @@ impl Config {
                 reason: format!("non_positive value={exit_hold_us}"),
             });
         }
+        let signal_quote_age_us =
+            env_i64_lookup(&mut lookup, "MINIMAL_SIGNAL_QUOTE_AGE_US").unwrap_or(50_000);
+        if signal_quote_age_us <= 0 {
+            return Err(ConfigError::Invalid {
+                name: "MINIMAL_SIGNAL_QUOTE_AGE_US",
+                reason: format!("non_positive value={signal_quote_age_us}"),
+            });
+        }
+        let rtt_ceiling_us =
+            env_i64_lookup(&mut lookup, "MINIMAL_RTT_CEILING_US").unwrap_or(1_500_000);
+        if rtt_ceiling_us < 0 {
+            return Err(ConfigError::Invalid {
+                name: "MINIMAL_RTT_CEILING_US",
+                reason: format!("negative value={rtt_ceiling_us}"),
+            });
+        }
+        let poly_drift_window_us =
+            env_i64_lookup(&mut lookup, "MINIMAL_POLY_DRIFT_WINDOW_US").unwrap_or(1_000_000);
+        if poly_drift_window_us < 0 {
+            return Err(ConfigError::Invalid {
+                name: "MINIMAL_POLY_DRIFT_WINDOW_US",
+                reason: format!("negative value={poly_drift_window_us}"),
+            });
+        }
+        let poly_drift_block_up_ticks =
+            env_i64_lookup(&mut lookup, "MINIMAL_POLY_DRIFT_BLOCK_UP_TICKS")
+                .unwrap_or(4)
+                .try_into()
+                .map_err(|_| ConfigError::Invalid {
+                    name: "MINIMAL_POLY_DRIFT_BLOCK_UP_TICKS",
+                    reason: "out_of_range".into(),
+                })?;
+        if poly_drift_block_up_ticks < 0 {
+            return Err(ConfigError::Invalid {
+                name: "MINIMAL_POLY_DRIFT_BLOCK_UP_TICKS",
+                reason: format!("negative value={poly_drift_block_up_ticks}"),
+            });
+        }
+        let poly_drift_block_down_ticks =
+            env_i64_lookup(&mut lookup, "MINIMAL_POLY_DRIFT_BLOCK_DOWN_TICKS")
+                .unwrap_or(4)
+                .try_into()
+                .map_err(|_| ConfigError::Invalid {
+                    name: "MINIMAL_POLY_DRIFT_BLOCK_DOWN_TICKS",
+                    reason: "out_of_range".into(),
+                })?;
+        if poly_drift_block_down_ticks < 0 {
+            return Err(ConfigError::Invalid {
+                name: "MINIMAL_POLY_DRIFT_BLOCK_DOWN_TICKS",
+                reason: format!("negative value={poly_drift_block_down_ticks}"),
+            });
+        }
+        let poly_drift_safety_bps = env_i64_lookup(&mut lookup, "MINIMAL_POLY_DRIFT_SAFETY_BPS")
+            .unwrap_or(12_000)
+            .try_into()
+            .map_err(|_| ConfigError::Invalid {
+                name: "MINIMAL_POLY_DRIFT_SAFETY_BPS",
+                reason: "out_of_range".into(),
+            })?;
+        if poly_drift_safety_bps < 0 {
+            return Err(ConfigError::Invalid {
+                name: "MINIMAL_POLY_DRIFT_SAFETY_BPS",
+                reason: format!("negative value={poly_drift_safety_bps}"),
+            });
+        }
+        let poly_drift_min_clean_edge_ticks =
+            env_i64_lookup(&mut lookup, "MINIMAL_POLY_DRIFT_MIN_CLEAN_EDGE_TICKS")
+                .unwrap_or(3)
+                .try_into()
+                .map_err(|_| ConfigError::Invalid {
+                    name: "MINIMAL_POLY_DRIFT_MIN_CLEAN_EDGE_TICKS",
+                    reason: "out_of_range".into(),
+                })?;
+        if poly_drift_min_clean_edge_ticks < 0 {
+            return Err(ConfigError::Invalid {
+                name: "MINIMAL_POLY_DRIFT_MIN_CLEAN_EDGE_TICKS",
+                reason: format!("negative value={poly_drift_min_clean_edge_ticks}"),
+            });
+        }
+        let use_implied_sigma =
+            env_bool_lookup(&mut lookup, "MINIMAL_USE_IMPLIED_SIGMA").unwrap_or(true);
         Ok(Self {
             allow_live_orders,
             usdc_per_trade_cents,
@@ -277,6 +385,14 @@ impl Config {
             signal_ring_size: env_i64_lookup(&mut lookup, "MINIMAL_SIGNAL_RING_SIZE")
                 .unwrap_or(128)
                 .max(8) as usize,
+            signal_quote_age_us,
+            rtt_ceiling_us,
+            poly_drift_window_us,
+            poly_drift_block_up_ticks,
+            poly_drift_block_down_ticks,
+            poly_drift_safety_bps,
+            poly_drift_min_clean_edge_ticks,
+            use_implied_sigma,
         })
     }
 
@@ -293,7 +409,7 @@ impl Config {
             min_edge_ticks: self.decision_min_edge_cents,
             entry_slippage_ticks: self.entry_slippage_cents,
             entry_notional_cents: self.usdc_per_trade_cents,
-            max_quote_age_us: 250_000,
+            max_quote_age_us: self.signal_quote_age_us,
             min_tte_us: self.min_decision_tte_us,
             min_buy_limit: PriceTick::checked(self.min_buy_limit_cents).map_err(|e| {
                 ConfigError::Invalid {
@@ -312,6 +428,7 @@ impl Config {
             prob_floor: self.prob_floor,
             prob_ceil: self.prob_ceil,
             max_samples: self.signal_ring_size,
+            use_implied_sigma: self.use_implied_sigma,
         })
     }
 

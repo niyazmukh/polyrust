@@ -2,11 +2,15 @@
 //!
 //! Inventory is intentionally absent. User-WSS trades belong to `inventory`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use crate::types::{ConditionId, OutcomeSide, PriceTick, TokenId, TsUs};
 
 const BOOK_DEPTH_LEVELS: usize = 4;
+
+/// Per-token rolling history of recent Polymarket BBO snapshots. Sized for the
+/// signal max window; we only ever read the oldest sample inside a cutoff.
+const QUOTE_HISTORY_CAP: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BookLevel {
@@ -115,9 +119,46 @@ impl Quote {
     }
 }
 
+/// One slot of `RuntimeState::quote_history` — a BBO snapshot tagged with the
+/// timestamp the runtime ingested it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QuoteHistorySample {
+    pub ts_us: TsUs,
+    pub bid_ticks: Option<i32>,
+    pub ask_ticks: Option<i32>,
+}
+
+struct QuoteRing {
+    samples: VecDeque<QuoteHistorySample>,
+}
+
+impl QuoteRing {
+    fn new() -> Self {
+        Self {
+            samples: VecDeque::with_capacity(QUOTE_HISTORY_CAP),
+        }
+    }
+
+    fn push(&mut self, sample: QuoteHistorySample) {
+        while self.samples.len() >= QUOTE_HISTORY_CAP {
+            self.samples.pop_front();
+        }
+        self.samples.push_back(sample);
+    }
+
+    /// Oldest sample at or after `cutoff_us`. `None` if no sample in window.
+    fn oldest_since(&self, cutoff_us: i64) -> Option<QuoteHistorySample> {
+        self.samples
+            .iter()
+            .copied()
+            .find(|sample| sample.ts_us.micros() >= cutoff_us)
+    }
+}
+
 pub struct RuntimeState {
     market: Option<MarketContext>,
     quotes: HashMap<TokenId, Quote>,
+    quote_history: HashMap<TokenId, QuoteRing>,
     trading_active: bool,
 }
 
@@ -126,6 +167,7 @@ impl RuntimeState {
         Self {
             market: None,
             quotes: HashMap::new(),
+            quote_history: HashMap::new(),
             trading_active: false,
         }
     }
@@ -133,6 +175,7 @@ impl RuntimeState {
     pub fn set_market(&mut self, market: MarketContext) {
         self.market = Some(market);
         self.quotes.clear();
+        self.quote_history.clear();
         self.trading_active = true;
     }
 
@@ -147,6 +190,7 @@ impl RuntimeState {
     pub fn mark_market_inactive(&mut self) {
         self.trading_active = false;
         self.quotes.clear();
+        self.quote_history.clear();
     }
 
     pub fn token_for_side(&self, side: OutcomeSide) -> Option<&TokenId> {
@@ -191,6 +235,15 @@ impl RuntimeState {
         if !self.trading_active || self.side_for_token(&token).is_none() {
             return false;
         }
+        let sample = QuoteHistorySample {
+            ts_us,
+            bid_ticks: bid.map(|p| p.ticks()),
+            ask_ticks: ask.map(|p| p.ticks()),
+        };
+        self.quote_history
+            .entry(token.clone())
+            .or_insert_with(QuoteRing::new)
+            .push(sample);
         self.quotes.insert(
             token,
             Quote {
@@ -212,6 +265,20 @@ impl RuntimeState {
     pub fn quote_for_token(&self, token: &TokenId) -> Option<&Quote> {
         self.side_for_token(token)?;
         self.quotes.get(token)
+    }
+
+    /// Oldest history sample at or after `cutoff_us` for this token. Used by
+    /// the runtime to compute Polymarket-side ask drift since the start of the
+    /// Binance signal window. Returns `None` if no sample is inside the
+    /// requested window.
+    pub fn quote_history_oldest_since(
+        &self,
+        token: &TokenId,
+        cutoff_us: i64,
+    ) -> Option<QuoteHistorySample> {
+        self.quote_history
+            .get(token)
+            .and_then(|ring| ring.oldest_since(cutoff_us))
     }
 }
 

@@ -47,11 +47,28 @@ Rust-first low-latency FAK trading bot for Polymarket 5-minute binary options.
 - UNKNOWN → stays WSS-matchable, blocks same-token BUY until stale expiry.
 - Accepted → does not blindly expire.
 
+### Adverse-Selection Gates (entry, post-signal)
+
+- After the Binance signal returns an intent, `RuntimeCore::on_binance_sample` runs four execution-aware gates before claiming. Each is configurable; `0` disables.
+- **RTT EWMA ceiling** (`MINIMAL_RTT_CEILING_US`): suppresses entries while the BUY `submit → outcome` EWMA exceeds the ceiling. The EWMA is fed by every BUY HTTP outcome off the hot path. Without this, FAK orders submitted at high RTT race against faster Polymarket-native HFTs and net-lose to the toxic residual book.
+- **Polymarket drift-up block** (`MINIMAL_POLY_DRIFT_BLOCK_UP_TICKS`): the side's ask has already lifted by ≥N ticks inside `MINIMAL_POLY_DRIFT_WINDOW_US`. Race lost — the lift is gone, what remains is the offers nobody else wanted to take.
+- **Polymarket drift-down block** (`MINIMAL_POLY_DRIFT_BLOCK_DOWN_TICKS`): the side's ask has dropped by ≥N ticks in the same window. Sellers are pressing — adverse.
+- **Drift-buffer edge sufficiency** (`MINIMAL_POLY_DRIFT_SAFETY_BPS`, `MINIMAL_POLY_DRIFT_MIN_CLEAN_EDGE_TICKS`): observed Polymarket ask speed × RTT EWMA × safety gives the expected drift during our flight; the signal `edge_ticks` must cover that plus a clean-profit floor.
+- Blocked entries emit `signal_blocked` at INFO with a `reason` tag (`rtt_ewma_high` / `poly_drift_up` / `poly_drift_down` / `edge_insufficient_for_drift`).
+- Polymarket BBO history feeding these gates is a small per-token ring inside `RuntimeState`, populated from market WSS frames — not the Binance hot path.
+
+### Fair-Value Calibration
+
+- `prob_yes` blends realised σ (Binance microprice volatility) with Polymarket-implied σ derived from the book mid via `Φ⁻¹`. The effective σ is `max(realised, implied)` — the model always defers to the wider variance estimate.
+- Polymarket-implied probability is the BBO mid normalised across YES/NO so the two legs sum to one, neutralising the venue spread carve-out.
+- Enabled by `MINIMAL_USE_IMPLIED_SIGMA` (default `true`). When disabled, `prob_yes` falls back to realised σ only.
+
 ### SELL Lifecycle
 
 - BUY MATCHED starts a bid tracker from WSS fill price and executable entry bid.
 - Exit wakes every 50ms: update peak bid, sell on fair-value failure confirmed by opposite Binance book pressure, an adverse stop below executable entry bid when the same model no longer supports holding, or a hold-time boundary only when fair value is weak/unavailable. A position is supported when `fair_ticks > bid + EXIT_EDGE_TICKS` and Binance pressure does not oppose the held side. Normal `value` / `drop` exits require both `fair_ticks <= bid + EXIT_EDGE_TICKS` and opposite pressure from the same move/OFI/imbalance terms used by entry. Mixed/weak pressure alone is not an exit before the hold boundary.
 - When exit fires: read sellable inventory, read bid, sign FAK SELL with configured SELL execution concession, submit, log.
+- The 50ms loop re-acquires the core lock immediately before signing each SELL and rebuilds the plan from the current WSS bid via `RuntimeCore::refresh_sell_plan`. A bid that drops between plan-time and sign-time produces a fresh, lower limit rather than a 400 (limit-too-high) and another doomed round-trip at the next falling bid.
 
 - Read sellable inventory → read bid → sign FAK SELL → submit → log.
 - Inventory remains WSS-owned; HTTP SELL responses do not mutate balance.
@@ -160,6 +177,9 @@ All must be true:
 - rotation occurs only at `end_ts - 5s`, forgets old state, clears signal ring
 - no periodic next-window promotion before the scheduled rotation deadline
 - no SDK order builder on signal path
+- entry adverse-selection gates active and fed: RTT EWMA from every BUY outcome, Polymarket drift gates from the per-token quote-history ring
+- exit SELL limit is re-derived from the current WSS bid at sign time (`refresh_sell_plan`)
+- TLS pool is pre-warmed with ≥ 2 idle connections at startup and on every maint tick
 - docs/tests/Graphify match runtime
 - `cargo fmt` + `cargo test` + `cargo clippy -D warnings` pass
 - stale-symbol grep clean

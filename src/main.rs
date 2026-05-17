@@ -257,9 +257,11 @@ async fn main() {
         );
     }
 
-    // Pre-warm TLS connection pool so the first BUY POST doesn't hit a cold connection.
+    // Pre-warm TLS connection pool so the first BUY POST never pays a cold
+    // handshake. We fire two in parallel: the entry submit and the exit loop
+    // can race for a connection, so a single warm slot is not enough.
     if let Some(ref sub) = submitter {
-        sub.warm_connection().await;
+        let _ = tokio::join!(sub.warm_connection(), sub.warm_connection());
     }
 
     // ==================================================================
@@ -473,6 +475,11 @@ async fn main() {
                                         &outcome,
                                         now_us(),
                                     );
+                                    // Feed the BUY round-trip back into the
+                                    // adaptive latency gate. Off the Binance
+                                    // hot path — only spawned submit tasks
+                                    // ever touch this.
+                                    c.record_rtt(rtt_us);
                                 }
 
                                 let accepted = outcome.is_accepted();
@@ -831,8 +838,18 @@ async fn main() {
                     c.plan_exits(now_us())
                 };
 
-                // Sign and fire sells outside the lock.
+                // Sign and fire sells outside the long-held planning lock.
+                // We do briefly re-acquire the core lock to refresh the bid
+                // immediately before signing — without this, a falling bid in
+                // the 50 ms tick gap between planning and signing turns into
+                // a venue 400 (limit too high → no match) and forces another
+                // round-trip at an even worse bid.
                 for exit in exits {
+                    let token = exit.plan.token.clone();
+                    let plan = match core.lock().ok().and_then(|c| c.refresh_sell_plan(&token)) {
+                        Some(p) => p,
+                        None => continue,
+                    };
                     let opposes = match exit.opposes {
                         Some(true) => "true",
                         Some(false) => "false",
@@ -844,7 +861,7 @@ async fn main() {
                         &[
                             Field {
                                 key: "token_id",
-                                value: &exit.plan.token.as_str(),
+                                value: &token.as_str(),
                             },
                             Field {
                                 key: "reason",
@@ -868,7 +885,7 @@ async fn main() {
                             },
                             Field {
                                 key: "sell_limit_ticks",
-                                value: &exit.plan.price.ticks(),
+                                value: &plan.price.ticks(),
                             },
                             Field {
                                 key: "fair_ticks",
@@ -888,8 +905,7 @@ async fn main() {
                             },
                         ],
                     );
-                    let token = exit.plan.token.clone();
-                    let prepared = match exit.plan.sign(
+                    let prepared = match plan.sign(
                         &sign,
                         SignInputs {
                             salt: sid.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -954,7 +970,7 @@ async fn main() {
                     let ticks = hb_ticks.swap(0, std::sync::atomic::Ordering::Relaxed);
                     let parse_errs = hb_parse_errs.swap(0, std::sync::atomic::Ordering::Relaxed);
                     let signals = hb_signals.swap(0, std::sync::atomic::Ordering::Relaxed);
-                    let (sellable, yes_bid, no_bid, trading) = {
+                    let (sellable, yes_bid, no_bid, trading, ewma_rtt_us) = {
                         let mut c = core.lock().unwrap();
                         let market = c.state_mut().market().cloned();
                         let sell = market
@@ -983,7 +999,8 @@ async fn main() {
                             .map(|b| b.ticks())
                             .unwrap_or(0);
                         let active = c.state_mut().trading_active();
-                        (sell, yb, nb, active)
+                        let rtt = c.current_ewma_rtt_us();
+                        (sell, yb, nb, active, rtt)
                     };
                     logline::log_event(
                         Level::Info,
@@ -1016,6 +1033,10 @@ async fn main() {
                             Field {
                                 key: "trading_active",
                                 value: &trading,
+                            },
+                            Field {
+                                key: "ewma_rtt_us",
+                                value: &ewma_rtt_us,
                             },
                         ],
                     );
@@ -1154,9 +1175,11 @@ async fn main() {
                 }
 
                 // Pre-warm HTTP connection pool every 10s so POST
-                // never hits a cold/expired TLS connection.
+                // never hits a cold/expired TLS connection. Two parallel
+                // probes keep ≥2 idle conns hot — entry submit and exit
+                // loop can race each other otherwise.
                 if let Some(ref sub) = maint_sub {
-                    sub.warm_connection().await;
+                    let _ = tokio::join!(sub.warm_connection(), sub.warm_connection());
                 }
             }
         })

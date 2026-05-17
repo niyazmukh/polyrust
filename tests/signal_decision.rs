@@ -45,6 +45,7 @@ fn cfg() -> SignalConfig {
         prob_floor: 0.02,
         prob_ceil: 0.98,
         max_samples: 128,
+        use_implied_sigma: false,
     }
 }
 
@@ -104,7 +105,7 @@ fn fair_ticks_for_side_requires_fresh_valid_window_strike_and_tte() {
     short_window.push(sample(28_900_000, 1, 99.0, 101.0, 1.0, 1.0));
     short_window.push(sample(29_000_000, 2, 101.0, 103.0, 3.0, 1.0));
     assert_eq!(
-        short_window.fair_ticks_for_side(OutcomeSide::Yes, TsUs(29_010_000), 60_000_000),
+        short_window.fair_ticks_for_side(OutcomeSide::Yes, TsUs(29_010_000), 60_000_000, None),
         None
     );
 
@@ -112,14 +113,14 @@ fn fair_ticks_for_side_requires_fresh_valid_window_strike_and_tte() {
     stale.set_strike(100.0, true);
     seed_window(&mut stale);
     assert_eq!(
-        stale.fair_ticks_for_side(OutcomeSide::Yes, TsUs(29_300_001), 60_000_000),
+        stale.fair_ticks_for_side(OutcomeSide::Yes, TsUs(29_300_001), 60_000_000, None),
         None
     );
 
     let mut missing_strike = SignalEngine::new(cfg());
     seed_window(&mut missing_strike);
     assert_eq!(
-        missing_strike.fair_ticks_for_side(OutcomeSide::Yes, TsUs(29_010_000), 60_000_000),
+        missing_strike.fair_ticks_for_side(OutcomeSide::Yes, TsUs(29_010_000), 60_000_000, None),
         None
     );
 
@@ -127,7 +128,7 @@ fn fair_ticks_for_side_requires_fresh_valid_window_strike_and_tte() {
     invalid_tte.set_strike(100.0, true);
     seed_window(&mut invalid_tte);
     assert_eq!(
-        invalid_tte.fair_ticks_for_side(OutcomeSide::Yes, TsUs(29_010_000), 0),
+        invalid_tte.fair_ticks_for_side(OutcomeSide::Yes, TsUs(29_010_000), 0, None),
         None
     );
 }
@@ -139,11 +140,11 @@ fn fair_ticks_for_side_matches_entry_probability_model() {
     seed_window(&mut engine);
 
     assert_eq!(
-        engine.fair_ticks_for_side(OutcomeSide::Yes, TsUs(29_010_000), 60_000_000),
+        engine.fair_ticks_for_side(OutcomeSide::Yes, TsUs(29_010_000), 60_000_000, None),
         Some(63)
     );
     assert_eq!(
-        engine.fair_ticks_for_side(OutcomeSide::No, TsUs(29_010_000), 60_000_000),
+        engine.fair_ticks_for_side(OutcomeSide::No, TsUs(29_010_000), 60_000_000, None),
         Some(37)
     );
 }
@@ -164,7 +165,7 @@ fn stale_entry_sample_still_refreshes_exit_fair_value_by_receive_time() {
     );
     assert_eq!(intent, None);
     assert_eq!(
-        engine.fair_ticks_for_side(OutcomeSide::Yes, TsUs(30_010_000), 60_000_000),
+        engine.fair_ticks_for_side(OutcomeSide::Yes, TsUs(30_010_000), 60_000_000, None),
         Some(63)
     );
 }
@@ -328,6 +329,31 @@ fn ofi_and_imbalance_must_confirm_up_move() {
         60_000_000,
     );
 
+    assert_eq!(intent, None);
+}
+
+#[test]
+fn implied_sigma_suppresses_overconfident_binance_signal() {
+    // Realised σ alone returns p_yes ≈ prob_ceil (0.98), giving an edge of
+    // ~46 ticks against a 0.50/0.51 book. With `use_implied_sigma=true`, the
+    // Polymarket book mid pins implied p_yes ≈ 0.50, which forces σ wider and
+    // pulls the model's p_yes back toward 0.5 — edge collapses below the
+    // configured `min_edge_ticks=5` and the signal is rejected.
+    let mut cfg = cfg();
+    cfg.use_implied_sigma = true;
+    let mut engine = SignalEngine::new(cfg);
+    engine.set_strike(100.0, true);
+    engine.push(sample(28_000_000, 1, 99.0, 101.0, 1.0, 1.0));
+    engine.push(sample(29_000_000, 2, 101.0, 103.0, 3.0, 1.0));
+
+    let intent = engine.on_sample(
+        sample(30_000_000, 3, 110.0, 112.0, 3.0, 1.0),
+        &market(),
+        quote(50, 51, 30_000_000),
+        quote(49, 50, 30_000_000),
+        TsUs(30_010_000),
+        60_000_000,
+    );
     assert_eq!(intent, None);
 }
 

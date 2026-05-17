@@ -6,17 +6,24 @@
 
 use crate::config::{Config, ConfigError};
 use crate::inventory::{Inventory, SubmitId, TradeState, TradeStatus, UserTrade};
+use crate::logline::{self, Field, Level};
 use crate::market::{MarketParseError, apply_market_events, parse_market_events};
 use crate::orders::{
     BuyCanonicalError, BuyCanonicalInput, canonical_buy_target_for_notional, canonical_sell_params,
 };
-use crate::signal::{BuyIntent, SignalEngine};
+use crate::signal::{BuyIntent, SignalEngine, implied_p_yes_for};
 use crate::signing::{OrderSigner, SignInputs, SignedFakOrderBody, SigningError};
 use crate::state::RuntimeState;
 use crate::submit::SubmitOutcome;
 use crate::types::{OrderId, OutcomeSide, PriceTick, Shares2, TokenId, TsUs};
 use crate::user::{UserMessage, UserParseError, parse_user_message};
 use std::collections::{HashMap, HashSet};
+
+/// Smoothing factor (1/2^RTT_EWMA_SHIFT) for the BUY submit→outcome RTT
+/// exponential moving average. `shift=3` weights each new sample at 1/8 so
+/// the EWMA stabilises over ~8 samples while reacting to a sustained latency
+/// regression within a couple of minutes.
+const RTT_EWMA_SHIFT: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeError {
@@ -155,6 +162,25 @@ impl SellPlan {
     }
 }
 
+/// Adverse-selection gates that run after the Binance signal returns a
+/// `BuyIntent`. All gates are configurable; setting a threshold to `0`
+/// disables the check. Internal to the runtime — callers configure these via
+/// `Config`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EntryGateConfig {
+    /// Hard ceiling on the BUY submit→outcome RTT EWMA (µs). When exceeded,
+    /// new entries are suppressed because the venue book has time to be lifted
+    /// by faster Polymarket-native HFTs before our POST arrives.
+    rtt_ceiling_us: i64,
+    /// Pre-trade Polymarket drift window (µs). Drift is measured against the
+    /// oldest history sample at or after `now − window`.
+    poly_drift_window_us: i64,
+    poly_drift_block_up_ticks: i32,
+    poly_drift_block_down_ticks: i32,
+    poly_drift_safety_bps: i32,
+    poly_drift_min_clean_edge_ticks: i32,
+}
+
 pub struct RuntimeCore {
     state: RuntimeState,
     inventory: Inventory,
@@ -167,6 +193,12 @@ pub struct RuntimeCore {
     exit_edge_ticks: i32,
     exit_hold_us: i64,
     exit_trackers: HashMap<TokenId, ExitTracker>,
+    entry_gates: EntryGateConfig,
+    /// Exponential moving average of recent BUY submit→outcome RTTs, in µs.
+    /// Updated by `record_rtt` after each accepted/rejected/unknown outcome.
+    /// Zero means "no samples yet" — every gate that consumes the EWMA must
+    /// treat zero as "skip".
+    rtt_ewma_us: i64,
 }
 
 impl RuntimeCore {
@@ -183,6 +215,15 @@ impl RuntimeCore {
             exit_edge_ticks: config.exit_edge_ticks,
             exit_hold_us: config.exit_hold_us,
             exit_trackers: HashMap::new(),
+            entry_gates: EntryGateConfig {
+                rtt_ceiling_us: config.rtt_ceiling_us,
+                poly_drift_window_us: config.poly_drift_window_us,
+                poly_drift_block_up_ticks: config.poly_drift_block_up_ticks,
+                poly_drift_block_down_ticks: config.poly_drift_block_down_ticks,
+                poly_drift_safety_bps: config.poly_drift_safety_bps,
+                poly_drift_min_clean_edge_ticks: config.poly_drift_min_clean_edge_ticks,
+            },
+            rtt_ewma_us: 0,
         })
     }
 
@@ -212,14 +253,117 @@ impl RuntimeCore {
         now: TsUs,
         tte_us: i64,
     ) -> Result<Option<BuyIntent>, RuntimeError> {
-        on_binance_sample(
+        let Some(intent) = on_binance_sample(
             sample,
             &mut self.signal,
             &self.state,
             &self.inventory,
             now,
             tte_us,
+        )?
+        else {
+            return Ok(None);
+        };
+        if let Some(reason) = self.entry_gate_block(&intent, now) {
+            log_signal_blocked(&intent, reason, self.rtt_ewma_us);
+            return Ok(None);
+        }
+        Ok(Some(intent))
+    }
+
+    /// Fold a fresh BUY-submit RTT sample into the EWMA. Called off the hot
+    /// path (inside the spawned submit task) once the HTTP outcome lands.
+    pub fn record_rtt(&mut self, rtt_us: i64) {
+        if rtt_us <= 0 {
+            return;
+        }
+        if self.rtt_ewma_us == 0 {
+            self.rtt_ewma_us = rtt_us;
+            return;
+        }
+        let delta = (rtt_us - self.rtt_ewma_us) >> RTT_EWMA_SHIFT;
+        // `>>` on negatives floors toward −∞, which is what we want for the
+        // EWMA recurrence; saturating add keeps us safe against i64 overflow
+        // on a pathological venue stall.
+        self.rtt_ewma_us = self.rtt_ewma_us.saturating_add(delta);
+    }
+
+    pub fn current_ewma_rtt_us(&self) -> i64 {
+        self.rtt_ewma_us
+    }
+
+    /// Recompute the SELL plan for a token at the *current* WSS bid, so the
+    /// signed FAK limit reflects whatever the book moved to between the
+    /// previous exit decision and the moment we are about to sign. Returns
+    /// `None` if sellable inventory has cleared or there is no executable
+    /// bid — the caller skips that exit cycle.
+    pub fn refresh_sell_plan(&self, token: &TokenId) -> Option<SellPlan> {
+        plan_sell_at_bid(
+            token,
+            &self.state,
+            &self.inventory,
+            self.sell_slippage_ticks,
         )
+    }
+
+    /// Apply the four execution-aware gates on top of the Binance fair-value
+    /// model: RTT ceiling, Polymarket pre-trade drift (block-up + block-down),
+    /// and the drift-buffer edge sufficiency check.
+    fn entry_gate_block(&self, intent: &BuyIntent, now: TsUs) -> Option<&'static str> {
+        let gates = &self.entry_gates;
+        // Pillar A: EWMA RTT ceiling.
+        if gates.rtt_ceiling_us > 0
+            && self.rtt_ewma_us > 0
+            && self.rtt_ewma_us > gates.rtt_ceiling_us
+        {
+            return Some("rtt_ewma_high");
+        }
+        if gates.poly_drift_window_us <= 0 {
+            return None;
+        }
+        let cutoff_us = now.micros() - gates.poly_drift_window_us;
+        let past = self
+            .state
+            .quote_history_oldest_since(&intent.token, cutoff_us)?;
+        let past_ask_ticks = past.ask_ticks?;
+        let current_ask = self
+            .state
+            .quote_for_token(&intent.token)
+            .and_then(|q| q.ask)?;
+        let drift_ticks = current_ask.ticks() - past_ask_ticks;
+        // Pillar C: directional drift blocks.
+        if gates.poly_drift_block_up_ticks > 0 && drift_ticks >= gates.poly_drift_block_up_ticks {
+            return Some("poly_drift_up");
+        }
+        if gates.poly_drift_block_down_ticks > 0
+            && drift_ticks <= -gates.poly_drift_block_down_ticks
+        {
+            return Some("poly_drift_down");
+        }
+        // Pillar B: empirical drift-buffer edge sufficiency.
+        if gates.poly_drift_safety_bps > 0 && self.rtt_ewma_us > 0 {
+            let dt_us = now.micros() - past.ts_us.micros();
+            if dt_us > 0 {
+                let drift_abs = i64::from(drift_ticks.abs());
+                // required_drift_during_rtt_ticks = ceil(
+                //     |drift_ticks| · rtt_ewma_us · safety_bps
+                //     / (dt_us · 10_000)
+                // )
+                let numer = drift_abs
+                    .saturating_mul(self.rtt_ewma_us)
+                    .saturating_mul(i64::from(gates.poly_drift_safety_bps));
+                let denom = dt_us.saturating_mul(10_000);
+                if denom > 0 {
+                    let required_drift = ((numer + denom - 1) / denom).min(i32::MAX as i64) as i32;
+                    let required_edge =
+                        required_drift.saturating_add(gates.poly_drift_min_clean_edge_ticks);
+                    if intent.edge_ticks < required_edge {
+                        return Some("edge_insufficient_for_drift");
+                    }
+                }
+            }
+        }
+        None
     }
 
     pub fn apply_market_raw(&mut self, raw: &[u8], ts_us: TsUs) -> Result<usize, RuntimeError> {
@@ -290,6 +434,12 @@ impl RuntimeCore {
             (market.yes_token.clone(), OutcomeSide::Yes),
             (market.no_token.clone(), OutcomeSide::No),
         ];
+        let yes_quote = self.state.quote_for_side(OutcomeSide::Yes).copied();
+        let no_quote = self.state.quote_for_side(OutcomeSide::No).copied();
+        let implied_hint = match (yes_quote, no_quote) {
+            (Some(y), Some(n)) => implied_p_yes_for(y, n),
+            _ => None,
+        };
         for (token, side) in tokens {
             let Some(position) = self.inventory.position(&token) else {
                 self.exit_trackers.remove(&token);
@@ -306,9 +456,9 @@ impl RuntimeCore {
                 .end_ts
                 .saturating_mul(1_000_000)
                 .saturating_sub(now_ts_us);
-            let fair_ticks = self
-                .signal
-                .fair_ticks_for_side(side, TsUs(now_ts_us), tte_us);
+            let fair_ticks =
+                self.signal
+                    .fair_ticks_for_side(side, TsUs(now_ts_us), tte_us, implied_hint);
             let opposes = self.signal.opposes_side(side, TsUs(now_ts_us));
             let Some(tracker) = self.exit_trackers.get_mut(&token) else {
                 continue;
@@ -374,6 +524,39 @@ impl RuntimeCore {
         self.inventory.release_market_scope(active.iter());
         self.exit_trackers.retain(|token, _| active.contains(token));
     }
+}
+
+fn log_signal_blocked(intent: &BuyIntent, reason: &'static str, ewma_rtt_us: i64) {
+    logline::log_event(
+        Level::Info,
+        "signal_blocked",
+        &[
+            Field {
+                key: "reason",
+                value: &reason,
+            },
+            Field {
+                key: "side",
+                value: &intent.side.as_str(),
+            },
+            Field {
+                key: "token_id",
+                value: &intent.token.as_str(),
+            },
+            Field {
+                key: "limit_ticks",
+                value: &intent.limit.ticks(),
+            },
+            Field {
+                key: "edge_ticks",
+                value: &intent.edge_ticks,
+            },
+            Field {
+                key: "ewma_rtt_us",
+                value: &ewma_rtt_us,
+            },
+        ],
+    );
 }
 
 pub fn on_binance_sample(

@@ -64,6 +64,36 @@ that depth is available, otherwise it falls back to best ask. `MINIMAL_ENTRY_SLI
 is added to that cutoff as the FAK execution cap; edge math charges half that
 cap rounded up as the expected fill debit.
 
+**Adverse-selection gates.** After the Binance fair-value signal returns a
+`BuyIntent`, four execution-aware gates run in `runtime::on_binance_sample`:
+
+- **RTT EWMA ceiling** (`MINIMAL_RTT_CEILING_US`). The runtime tracks a
+  per-submit exponential moving average of `submit → outcome` RTT. When the
+  EWMA exceeds the configured ceiling, new entries are suppressed — at high
+  HTTP latency, marketable FAK orders always lose the race against
+  Polymarket-native liquidity providers.
+- **Polymarket drift-up block** (`MINIMAL_POLY_DRIFT_BLOCK_UP_TICKS`). If the
+  side's ask has already lifted by ≥N ticks inside `MINIMAL_POLY_DRIFT_WINDOW_US`,
+  the race is lost; the residual book is the toxic subset other HFTs left
+  behind.
+- **Polymarket drift-down block** (`MINIMAL_POLY_DRIFT_BLOCK_DOWN_TICKS`).
+  If the side's ask has dropped by ≥N ticks in the same window, sellers are
+  fading the side; the signal is adverse.
+- **Drift-buffer edge sufficiency** (`MINIMAL_POLY_DRIFT_SAFETY_BPS`,
+  `MINIMAL_POLY_DRIFT_MIN_CLEAN_EDGE_TICKS`). The observed Polymarket ask
+  speed, scaled by the RTT EWMA, gives an expected drift during our flight
+  time; if the signal edge does not cover that drift plus a clean-profit
+  floor, the entry is suppressed.
+
+A rejected entry emits a `signal_blocked` log at INFO level with the gate
+reason so operators can attribute drops.
+
+**Polymarket-implied σ** (`MINIMAL_USE_IMPLIED_SIGMA`). When enabled, the
+`prob_yes` model treats the Polymarket book mid (normalised across YES/NO) as
+a lower-bound on σ via `σ = drift / Φ⁻¹(p_book)`. Whenever the venue book
+disagrees with the Binance microprice it pulls the model's `p_yes` toward 0.5
+— a "trust the book" guard against overconfident signals.
+
 **Exit is pressure-confirmed fair-value.** BUY MATCHED starts a per-token bid
 tracker from the WSS fill price and executable entry bid. The exit task wakes
 every 50ms, updates peak bid, and sells when the same Binance probability model
@@ -82,6 +112,12 @@ HTTP SELL responses never own balance. While exit logic fires and local
 inventory remains sellable, the 50ms exit loop may submit another FAK SELL even
 if an earlier SELL HTTP outcome is still unknown. SELL MATCHED clears inventory
 and stops further attempts.
+
+**Exit refreshes the SELL limit at sign time.** Each 50 ms exit tick briefly
+re-acquires the core lock and rebuilds the plan from the current WSS bid via
+`RuntimeCore::refresh_sell_plan` immediately before signing the FAK body, so a
+bid that fell between plan-time and sign-time does not trigger a 400
+(limit-too-high) and force another round-trip at a worse bid.
 
 **User WSS scoped to the active market.** `user_wss_trusted` starts false,
 set true after the auth frame with the active condition ID is successfully
